@@ -1,4 +1,4 @@
-# liviana-kernel
+# livia-kernel
 
 用 Zig 0.17 写的最小 RISC-V 64 位内核，运行在 QEMU `virt` 机器上，由 OpenSBI 引导，内核运行在 S 模式。
 
