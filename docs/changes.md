@@ -2,6 +2,12 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-11 提交前后 flush 磁盘；什么都没改的事务作废时不重走树
+
+- 修复：设备有写缓存时，文件系统的掉电安全没有保证：写完的块不一定按顺序落盘，超级块可能先于它指向的节点落盘。virtio 驱动协商 `VIRTIO_BLK_F_FLUSH`，新增 flush 请求（`virtio_disk.flush`）；`bio.Device` 多了 `flush`，`bio.flush()` 等之前写的块都落盘；`ctree.Volume.commit`（和 `format`）在写超级块前后各 flush 一次。启动日志的磁盘那一行末尾多了 `, flush`（设备不支持时是 `, write-through`）。
+- 改动：`Volume.abort` 在当前事务什么都没改过（`dirty` 为 false）时直接返回，不再重走整棵树重算空闲块。`mkdir` 已有的目录、`rm` 不存在的文件这类在查找阶段就失败的操作不再读遍所有节点。
+- 新增：ctree 的单元测试多了写缓存模式的掉电测试：上次 flush 之后的写在掉电时随机落盘或丢掉、顺序打乱。
+
 ## 2026-10-31 按需分页；内核栈的保护页；写脚本用的程序
 
 - 新增：按需分页。用户地址空间（`vm.Space`）记着程序的各个段、堆、栈从哪到哪，页表里只有访问过的页：`exec` 只读 ELF 的文件头和程序头，段里的页第一次被访问时才分配、从程序文件读进来（init 从内核里嵌着的字节读）；`.bss`、堆、栈的页用到才分配清零的页。U 模式的读、写、取指缺页都交给 `vm.fault`（写时复制也在这里）；内核替用户程序读写用户内存（`copyFromUser` 这些）时也按需分配。没内存时进程被结束（`out of memory (demand paging)`），读不出程序文件是 `cannot read the program file (demand paging)`。

@@ -132,7 +132,7 @@ fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
 
     // 找磁盘（要访问 MMIO，所以在开分页之后），PLIC 要知道它的中断号
     virtio_disk.init();
-    bio.init(if (virtio_disk.blocks > 0) .{ .blocks = virtio_disk.blocks, .transfer = virtio_disk.rw } else null);
+    bio.init(if (virtio_disk.blocks > 0) .{ .blocks = virtio_disk.blocks, .transfer = virtio_disk.rw, .flush = virtio_disk.flush } else null);
 
     plic.init(virtio_disk.irq);
     plic.initHart();

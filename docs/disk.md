@@ -31,7 +31,7 @@ QEMU 的 virtio-blk 设备 → 磁盘镜像文件
 启动日志（`zig build run` 的 Debug 构建；最后一行是第一个进程挂载文件系统时打印的，见 [fs.md](fs.md#接进内核fsyszig)）：
 
 ```
-[ok] virtio disk: 8192 blocks of 4 KiB (32 MiB), irq 1
+[ok] virtio disk: 8192 blocks of 4 KiB (32 MiB), irq 1, flush
 [ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs, disk
 [ok] file system: 6840 of 7168 blocks free, generation 27
 ```
@@ -64,7 +64,7 @@ virtio 是虚拟机里的“标准设备”：设备和驱动通过一组 MMIO �
 kmain 在开分页之后（要访问 MMIO）、`plic.init` 之前（PLIC 要知道中断号）调用。逐个槽位看 MagicValue 和 DeviceID，找到块设备后按规范 3.1.1 的顺序：
 
 1. Status 写 0（复位），置上 ACKNOWLEDGE（看到设备了）、DRIVER（知道怎么驱动它）。
-2. **协商特性**：只要 `VIRTIO_F_VERSION_1`（第 32 位，在第 1 组的第 0 位，现代接口必须有），别的一个都不要，第 0 组写 0。所以没有 event idx、间接描述符、多队列、只读盘这些。设备不提供 VERSION_1 就 panic。然后置上 FEATURES_OK，再读回来确认设备接受了。
+2. **协商特性**：第 1 组只要 `VIRTIO_F_VERSION_1`（第 32 位，在第 1 组的第 0 位，现代接口必须有）；第 0 组只要 `VIRTIO_BLK_F_FLUSH`（第 9 位），设备提供才要。别的一个都不要，所以没有 event idx、间接描述符、多队列、只读盘这些。设备不提供 VERSION_1 就 panic。然后置上 FEATURES_OK，再读回来确认设备接受了。QEMU 的 virtio-blk 提供 FLUSH，启动日志的那一行末尾是 `flush`；不提供的设备规范要求它写完就落盘（write-through），日志里是 `write-through`。
 3. **队列 0**：QueueSel = 0，确认它还没在用（QueueReady 为 0）、QueueNumMax 至少 16，QueueNum = 16，三部分的物理地址写进去，QueueReady = 1。
 4. 置上 DRIVER_OK，设备开始工作。
 5. 读容量：`capacity` 是 64 位，分两次读，前后读两次 ConfigGeneration，不一样就重读。扇区数除以 8 就是块数。
@@ -85,19 +85,25 @@ var queue: Queue align(4096) = undefined;
 
 - 现代接口的三部分只要求各自对齐（16、2、4），可以分开放；这里放在一个结构体里，一页对齐，好认。它在内核的 `.bss` 里，内核对物理内存是恒等映射，`@intFromPtr` 就是给设备的物理地址。
 - **一个请求是三个描述符串成的链**（块设备的请求格式，规范 5.2.6）：请求头 `{ type: 读 0 / 写 1, reserved, sector }`（设备读）→ 数据（4096 字节；读请求时设备往里写，带 `WRITE` 标志）→ 状态字节（设备写，0 是成功）。块号乘 8 就是扇区号。
-- `num = 16` 个描述符，一个请求用 3 个，最多同时 5 个请求在设备里。`free` 记哪些描述符空着，`alloc3` 一次拿三个。
+- **flush 请求**（类型 4，`VIRTIO_BLK_T_FLUSH`）没有数据，链上只有请求头和状态字节。它做完时，之前做完的写都已经落盘。
+- `num = 16` 个描述符，一个请求用 3 个，最多同时 5 个请求在设备里。`free` 记哪些描述符空着，`allocDescs(3)` 一次拿三个（flush 只用两个，第二个跟着一起分配、一起放回，省得两种请求分开算）。
 
-### 读写（`rw`）
+### 读写（`rw`、`flush`）
 
 ```zig
 pub fn rw(block: u64, data: *[block_size]u8, write: bool) void
+pub fn flush() void   // 协商到 FLUSH 才发请求，否则什么都不做
 ```
+
+两个都交给 `submit(类型, 扇区号, 数据或 null)`：
 
 1. 拿 `lock`。分配三个描述符，没有就 `proc.sleep(&free, &lock)`，等有请求做完放回描述符。
 2. 填请求头、状态字节（先写成 `0xff`）、三个描述符；`info[head].done = false`。
 3. 把链的第一个描述符的下标放进 `avail.ring[avail.idx % num]`，**`fence`**，`avail.idx += 1`，**`fence`**，写 QueueNotify。设备看到新的 `idx` 时，前面写的描述符和 ring 必须已经可见；写 QueueNotify（MMIO）之前，`idx` 也必须已经可见。
 4. `while (!info[head].done) proc.sleep(&info[head], &lock)`：进程睡着等，CPU 给别的进程。
 5. 醒来后看状态字节，不是 0 就 panic（QEMU 上只有内核给错了参数才会出现）；放回描述符，`wakeup(&free)`。
+
+**写缓存**：写请求做完只说明设备收到了数据。设备（真实的磁盘，或者 QEMU 背后宿主机的页缓存）可能还把它放在缓存里，掉电会丢，几次写落盘的先后也不保证。写时复制的文件系统恰恰依赖顺序（新节点先落盘、超级块后落盘，[btree.md](btree.md#事务和提交)），所以提交时在超级块前后各 `flush` 一次。
 
 队列结构通过 `*volatile Queue` 访问：设备在另一边改 `used`，编译器不能把读 `used.idx` 提到循环外面，也不能合并、省掉对描述符的写。
 
@@ -202,7 +208,8 @@ pub fn blockCount() u64
 
 ### 写和放开
 
-- `write` 要求拿着睡眠锁、`valid` 为 true，同步写回磁盘（write-through）：返回时数据已经交给设备了。
+- `write` 要求拿着睡眠锁、`valid` 为 true，同步写回磁盘（write-through）：返回时数据已经交给设备了，但设备有写缓存的话还不一定落盘。
+- `flush` 等之前 `write` 过的块都落盘（交给 `Device.flush`；为 null 的设备没有写缓存，什么都不做）。
 - `invalidate` 逐个桶拿锁，把 `refcnt` 为 0 的缓冲区都标成 `valid = false`，之后再读它们都要重新读盘。给 `scrub` 用：校验和只在读盘时核对，要核对磁盘上的内容就不能用缓存里的（[fs.md](fs.md#检查整个文件系统checkscrub)）。写都是同步的，缓存里没有还没写下去的内容，作废不会丢东西；`valid` 本来由缓冲区的睡眠锁保护，`refcnt` 为 0 说明没人拿着、也没人在等这把睡眠锁，所以拿着桶的锁改它也安全。
 - `release` 放开睡眠锁，拿桶的锁 `refcnt -= 1`；减到 0 就记下 `stamp`，有人在换块（`evicting` 不为 0）的话叫醒它。拿着睡眠锁时别人换不掉这个缓冲区，所以 `release` 用 `blockno` 算出来的桶就是它所在的桶。
 

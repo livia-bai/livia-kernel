@@ -130,7 +130,8 @@ pub const Volume = struct {
     /// 当前事务的事务号（generation + 1）和当前的根
     transid: u64 = 0,
     root: Root = undefined,
-    /// 当前事务开始以来改过东西没有（没改的话 commit 不写超级块）
+    /// 当前事务开始以来改过东西没有（没改的话 commit 不写超级块，abort 不用重走树）。
+    /// 分配、释放块（alloc、free）和换根的地方都要设它：改根之前总要先分配一个块，或者像 collapseRoot 那样自己设
     dirty: bool = false,
     /// 用着的块：当前的树、已提交的树、超级块。pending：已提交的树用着、当前的树不用了的块
     used: Bitmap = .{},
@@ -168,7 +169,9 @@ pub const Volume = struct {
         empty.valid = true;
         bio.write(empty);
         bio.release(empty);
+        bio.flush(); // 根节点先落盘，见 commit
         try writeSuper(.{ .csum = 0, .magic = magic, .generation = 1, .blocks = blocks, .root = root_block, .root_generation = 1, .root_level = 0 });
+        bio.flush();
     }
 
     /// 读两个超级块，用校验和对、事务号大的那个；走一遍树，算出用着的块。
@@ -207,8 +210,12 @@ pub const Volume = struct {
 
     /// 提交当前事务：新节点都已经写下去了，写一个超级块指向新的根。写完之后 pending 里的块才能再分配；
     /// 还有读者在读旧树的话，它们先进 limbo，等这些读者都读完。
+    ///
+    /// 设备可能有写缓存（bio.flush），超级块前后各 flush 一次：前一次保证超级块落盘时它指向的节点、数据块都已经在盘上；
+    /// 后一次保证 pending 里的块（旧树的）再被分配、改写之前，指向新树的超级块已经在盘上。
     pub fn commit(v: *Volume) Error!void {
         if (!v.dirty) return;
+        bio.flush();
         try writeSuper(.{
             .csum = 0,
             .magic = magic,
@@ -218,6 +225,7 @@ pub const Volume = struct {
             .root_generation = v.root.generation,
             .root_level = v.root.level,
         });
+        bio.flush();
         v.snap_lock.acquire();
         v.generation = v.transid;
         v.committed = v.root;
@@ -287,7 +295,10 @@ pub const Volume = struct {
     }
 
     /// 作废当前事务：退回已提交的树。当前事务新写的节点都在已提交的树没用的块上，不用管它们。
+    /// 什么都没改过（dirty 为 false：没分配、没释放过块，根也没变，和 commit 一样看它）就不用重走整棵树：
+    /// 查找阶段就失败的操作（Exists、NotFound……）最常见，不该每次都读遍所有节点。
     pub fn abort(v: *Volume) Error!void {
+        if (!v.dirty) return;
         v.root = v.committed;
         try v.rescan();
     }
@@ -790,8 +801,24 @@ var test_crashed = false;
 var test_writes: usize = 0;
 var test_vol: Volume = .{};
 
+/// 写缓存模式：模拟有写缓存的设备。写先进 test_cache，flush 时才按顺序落盘；掉电时上次 flush 之后的写
+/// 每一个都可能落盘、也可能丢掉，落盘的顺序也是乱的（由 test_cache_seed 决定）。为 false 时写完就落盘、按顺序。
+var test_cache_mode = false;
+var test_cache_seed: u64 = 0;
+var test_cache: std.ArrayListUnmanaged(struct { block: u64, data: [block_size]u8 }) = .empty;
+var test_flushes: usize = 0;
+
 fn testTransfer(block: u64, data: *[block_size]u8, write: bool) void {
     if (!write) {
+        // 设备的读能看到还在缓存里的写：从最新的往前找
+        var i = test_cache.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (test_cache.items[i].block == block) {
+                data.* = test_cache.items[i].data;
+                return;
+            }
+        }
         data.* = test_disk[block];
         return;
     }
@@ -800,12 +827,38 @@ fn testTransfer(block: u64, data: *[block_size]u8, write: bool) void {
     if (test_budget) |*left| {
         if (left.* == 0) {
             test_crashed = true;
-            @memcpy(test_disk[block][0..test_torn], data[0..test_torn]);
+            if (test_cache_mode) {
+                testLoseCache();
+            } else {
+                @memcpy(test_disk[block][0..test_torn], data[0..test_torn]);
+            }
             return;
         }
         left.* -= 1;
     }
-    test_disk[block] = data.*;
+    if (test_cache_mode) {
+        test_cache.append(std.testing.allocator, .{ .block = block, .data = data.* }) catch @panic("out of memory");
+    } else {
+        test_disk[block] = data.*;
+    }
+}
+
+fn testFlush() void {
+    test_flushes += 1;
+    if (test_crashed) return;
+    for (test_cache.items) |*w| test_disk[w.block] = w.data;
+    test_cache.clearRetainingCapacity();
+}
+
+/// 掉电时缓存里的写：随机挑一些、按随机的顺序落盘，其余的丢掉。
+fn testLoseCache() void {
+    var prng = std.Random.DefaultPrng.init(test_cache_seed);
+    const rng = prng.random();
+    rng.shuffle(@TypeOf(test_cache.items[0]), test_cache.items);
+    for (test_cache.items) |*w| {
+        if (rng.boolean()) test_disk[w.block] = w.data;
+    }
+    test_cache.clearRetainingCapacity();
 }
 
 /// 换一块全零的内存磁盘，格式化、挂载。
@@ -819,6 +872,8 @@ fn testSetup(blocks: usize) !void {
     test_torn = 0;
     test_crashed = false;
     test_writes = 0;
+    test_flushes = 0;
+    test_cache.clearRetainingCapacity();
     testReboot();
     try Volume.format(blocks);
     try test_vol.mount();
@@ -828,12 +883,16 @@ fn testSetup(blocks: usize) !void {
 fn testReboot() void {
     test_budget = null;
     test_crashed = false;
-    bio.init(.{ .blocks = test_disk.len, .transfer = testTransfer });
+    test_cache.clearRetainingCapacity(); // 没落盘的写随着掉电没了（掉电那一刻 testLoseCache 已经处理过）
+    bio.init(.{ .blocks = test_disk.len, .transfer = testTransfer, .flush = testFlush });
 }
 
 fn testFree() void {
     std.testing.allocator.free(test_disk);
     test_disk = &.{};
+    test_cache.deinit(std.testing.allocator);
+    test_cache = .empty;
+    test_cache_mode = false;
 }
 
 /// 测试用的键和数据：编号 id 的键是 (id % 37, id % 3, id)，各种字段都会参与比较；
@@ -1249,6 +1308,25 @@ fn crashAt(budget: usize, torn: usize) !void {
     for (0..5) |_| randomOp(v, &model, prng.random(), 40) catch |err| if (err != error.NoSpace) return err;
     try v.commit();
     _ = try v.check();
+}
+
+test "掉电（设备有写缓存）：上次 flush 之后的写可能丢、可能乱序，重新挂载后都是某个已提交的状态" {
+    defer testFree();
+    test_cache_mode = true;
+    var full: CrashRun = .{};
+    defer full.deinit();
+    try full.run(null, 0);
+    const total = test_writes;
+    try std.testing.expect(test_flushes > 2); // 每次提交前后各一次
+    for (0..total + 1) |budget| {
+        for (0..4) |seed| {
+            test_cache_seed = budget * 4 + seed;
+            crashAt(budget, 0) catch |err| {
+                std.debug.print("cached crash after {d} of {d} writes, seed {d}\n", .{ budget, total, test_cache_seed });
+                return err;
+            };
+        }
+    }
 }
 
 test "掉电：在每一次写之后掉电（包括只写了一半），重新挂载后都是某个已提交的状态" {

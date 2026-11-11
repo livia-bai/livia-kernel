@@ -6,6 +6,10 @@
 //! - 只支持现代（version 2）的 virtio-mmio 接口。QEMU 默认给的是旧版（legacy，version 1），
 //!   要加 -global virtio-mmio.force-legacy=false（build.zig 和 qemu_test.py 都加了）。
 //! - 一个请求是三个描述符串成的链：请求头（读还是写、扇区号）、数据（一个 4 KiB 的块）、设备写回的状态字节。
+//!   flush 请求没有数据，只有请求头和状态字节两个。
+//! - 设备有写缓存时，写请求做完只说明设备收到了数据，掉电还可能丢、落盘的顺序也不保证。协商 VIRTIO_BLK_F_FLUSH，
+//!   flush 请求做完之前写完的块才一定落盘（文件系统提交时靠它排顺序，见 ctree.Volume.commit）。设备不提供这个特性的话，
+//!   规范要求它写完就落盘（write-through），flush 什么都不做。
 //! - 发出请求的进程睡在这个请求上（rw），中断处理程序看到设备做完了就叫醒它（onInterrupt）。
 //!   描述符不够用时睡在 free 上，有请求做完、放回描述符时被叫醒。
 //! - 内核对物理内存是恒等映射，地址直接交给设备（DMA 用的是物理地址）。
@@ -67,9 +71,11 @@ const status_driver_ok: u32 = 4;
 const status_features_ok: u32 = 8;
 
 /// 特性位 VIRTIO_F_VERSION_1（第 32 位，在第 1 组特性的第 0 位）：现代接口必须协商它。
+/// VIRTIO_BLK_F_FLUSH（第 0 组的第 9 位）：设备提供就要，有了它才能让写缓存落盘。
 /// 别的特性一个都不要：不要只读盘（BLK_F_RO 这里不处理）、不要 event idx、不要间接描述符等。
 const feature_version_1_word = 1;
 const feature_version_1_bit: u32 = 1 << 0;
+const feature_flush_bit: u32 = 1 << 9;
 
 /// 描述符的个数（队列长度）。一个请求用三个，所以最多同时有 5 个请求在设备里。
 const num = 16;
@@ -107,6 +113,7 @@ const Request = extern struct {
 };
 const request_in: u32 = 0; // 读：设备 → 内存
 const request_out: u32 = 1; // 写：内存 → 设备
+const request_flush: u32 = 4; // 之前做完的写都落盘
 
 /// 设备通过 DMA 访问的内存。规范要求的对齐是 16（描述符表）、2（avail）、4（used），
 /// 整个放在一页里，不跨页（物理上本来就连续，只是好认）。
@@ -140,6 +147,8 @@ var base: usize = 0;
 pub var irq: u32 = 0;
 /// 磁盘有多少个 4 KiB 的块，没有设备时是 0
 pub var blocks: u64 = 0;
+/// 协商到了 VIRTIO_BLK_F_FLUSH
+var has_flush = false;
 
 fn reg(r: Reg) *volatile u32 {
     return @ptrFromInt(base + @backingInt(r));
@@ -158,8 +167,8 @@ pub fn init() void {
         }
         setup();
         irq = @intCast(i + 1);
-        uart.print("[ok] virtio disk: {d} blocks of {d} KiB ({d} MiB), irq {d}\n", .{
-            blocks, block_size / 1024, blocks * block_size >> 20, irq,
+        uart.print("[ok] virtio disk: {d} blocks of {d} KiB ({d} MiB), irq {d}, {s}\n", .{
+            blocks, block_size / 1024, blocks * block_size >> 20, irq, if (has_flush) "flush" else "write-through",
         });
         return;
     }
@@ -173,11 +182,13 @@ fn setup() void {
     status.* = status_acknowledge;
     status.* |= status_driver;
 
-    // 特性：只要 VERSION_1（第 1 组的第 0 位），第 0 组一个都不要
+    // 特性：第 1 组只要 VERSION_1（第 0 位），第 0 组只要 BLK_F_FLUSH（设备提供的话）
     reg(.device_features_sel).* = feature_version_1_word;
     if (reg(.device_features).* & feature_version_1_bit == 0) @panic("virtio disk: device does not offer VIRTIO_F_VERSION_1");
+    reg(.device_features_sel).* = 0;
+    has_flush = reg(.device_features).* & feature_flush_bit != 0;
     reg(.driver_features_sel).* = 0;
-    reg(.driver_features).* = 0;
+    reg(.driver_features).* = if (has_flush) feature_flush_bit else 0;
     reg(.driver_features_sel).* = feature_version_1_word;
     reg(.driver_features).* = feature_version_1_bit;
     status.* |= status_features_ok;
@@ -217,15 +228,15 @@ fn fence() void {
     asm volatile ("fence rw, rw" ::: .{ .memory = true });
 }
 
-/// 分配三个空闲的描述符，没有就返回 null。调用方拿着 lock。
-fn alloc3() ?[3]u16 {
-    var idx: [3]u16 = undefined;
-    var n: usize = 0;
+/// 分配 n 个空闲的描述符，没有就返回 null。调用方拿着 lock。
+fn allocDescs(comptime n: usize) ?[n]u16 {
+    var idx: [n]u16 = undefined;
+    var got: usize = 0;
     for (&free, 0..) |*f, i| {
         if (!f.*) continue;
-        idx[n] = @intCast(i);
-        n += 1;
-        if (n == 3) break;
+        idx[got] = @intCast(i);
+        got += 1;
+        if (got == n) break;
     } else return null;
     for (idx) |i| free[i] = false;
     return idx;
@@ -233,28 +244,40 @@ fn alloc3() ?[3]u16 {
 
 /// 读（write 为 false）或写一个块，做完才返回（这期间进程睡着，CPU 给别的进程用）。
 /// 只能由进程调用（要睡下）；data 在设备读写期间不能被别人碰，调用方拿着这个块的睡眠锁（bio.zig）。
-/// 设备报错（状态字节不为 0）就 panic：QEMU 上只有内核传错了参数才会出现。
 pub fn rw(block: u64, data: *[block_size]u8, write: bool) void {
     std.debug.assert(block < blocks);
+    submit(if (write) request_out else request_in, block * sectors_per_block, data);
+}
+
+/// 等之前做完的写都落盘（bio.Device.flush）。没协商到 flush 的设备是 write-through，不用做。
+pub fn flush() void {
+    if (has_flush) submit(request_flush, 0, null);
+}
+
+/// 发一个请求，等设备做完。data 为 null 的请求（flush）没有数据描述符。
+/// 设备报错（状态字节不为 0）就 panic：QEMU 上只有内核传错了参数才会出现。
+fn submit(kind: u32, sector: u64, data: ?*[block_size]u8) void {
     lock.acquire();
     defer lock.release();
     const idx = while (true) {
-        if (alloc3()) |idx| break idx;
+        if (allocDescs(3)) |idx| break idx;
         proc.sleep(&free, &lock);
     };
     const head = idx[0];
     const q: *volatile Queue = &queue;
 
-    q.requests[head] = .{ .type = if (write) request_out else request_in, .reserved = 0, .sector = block * sectors_per_block };
+    q.requests[head] = .{ .type = kind, .reserved = 0, .sector = sector };
     q.status[head] = 0xff; // 设备做完会写成 0（成功）
+    // 请求头 → [数据] → 状态字节。flush 没有数据，第二个描述符留着不用（一起分配、一起放回，简单）
+    const status_desc = if (data != null) idx[2] else idx[1];
     q.desc[idx[0]] = .{ .addr = @intFromPtr(&queue.requests[head]), .len = @sizeOf(Request), .flags = desc_next, .next = idx[1] };
-    q.desc[idx[1]] = .{
-        .addr = @intFromPtr(data),
+    if (data) |d| q.desc[idx[1]] = .{
+        .addr = @intFromPtr(d),
         .len = block_size,
-        .flags = desc_next | (if (write) 0 else desc_write),
+        .flags = desc_next | (if (kind == request_in) desc_write else 0),
         .next = idx[2],
     };
-    q.desc[idx[2]] = .{ .addr = @intFromPtr(&queue.status[head]), .len = 1, .flags = desc_write, .next = 0 };
+    q.desc[status_desc] = .{ .addr = @intFromPtr(&queue.status[head]), .len = 1, .flags = desc_write, .next = 0 };
     info[head].done = false;
 
     // 先把链放进 avail 环，再增加 idx：设备看到新的 idx 时，前面写的东西必须都已经可见
@@ -267,7 +290,7 @@ pub fn rw(block: u64, data: *[block_size]u8, write: bool) void {
     while (!info[head].done) proc.sleep(&info[head], &lock);
 
     const status = q.status[head];
-    if (status != 0) std.debug.panic("virtio disk: {s} of block {d} failed with status {d}", .{ if (write) "write" else "read", block, status });
+    if (status != 0) std.debug.panic("virtio disk: request type {d} at sector {d} failed with status {d}", .{ kind, sector, status });
     for (idx) |i| free[i] = true;
     proc.wakeup(&free);
 }

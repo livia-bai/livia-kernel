@@ -1056,7 +1056,7 @@ def check_boot(q, c, smp):
         r"\[ok\] page allocator: \d+ free pages",
         r"\[ok\] Sv39 paging enabled: .*, 80 stack guard pages unmapped\n",
         r"\[ok\] stack overflow check: hitting a guard page traps onto the trap stack\n",
-        r"\[ok\] virtio disk: 8192 blocks of 4 KiB \(32 MiB\), irq 1\n",
+        r"\[ok\] virtio disk: 8192 blocks of 4 KiB \(32 MiB\), irq 1, flush\n",
         rf"\[ok\] file system: \d+ of {FS_BLOCKS} blocks free, generation \d+\n",
         r"\[ok\] interrupt sources enabled: timer at 100 Hz, keyboard via UART \+ PLIC, IPIs, disk\n",
         rf"\[ok\] {smp} harts? running, booted on hart \d+\n",

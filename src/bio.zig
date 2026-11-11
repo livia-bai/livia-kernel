@@ -7,7 +7,8 @@
 //!   没人在用（refcnt 为 0）的缓冲区换掉，挪进新块的桶。
 //! - read 返回拿着睡眠锁的缓冲区，内容就是磁盘上的；改完调用 write 写回磁盘（同步：写完才返回）；
 //!   用完调用 release。拿着缓冲区的期间，别的进程要同一个块会睡着等。
-//! - 磁盘读写交给 Device（内核里是 virtio_disk，单元测试里是一块内存）。
+//! - 磁盘读写交给 Device（内核里是 virtio_disk，单元测试里是一块内存）。设备可能有写缓存：
+//!   write 返回只说明设备收到了，flush 返回之后之前写的块才一定落盘（文件系统提交时要靠它排好顺序，ctree.zig）。
 //!
 //! 锁：
 //! - 每个桶的 lock（自旋锁）保护桶里的链表，和桶里每个缓冲区的 refcnt、blockno、stamp。
@@ -31,10 +32,13 @@ const nbucket = 13;
 /// 还没装过块的缓冲区的 blockno（check 不让任何块号等于它）
 const no_block = std.math.maxInt(u64);
 
-/// 磁盘：有多少块，怎么读写一块（同步，做完才返回，可以睡）。
+/// 磁盘：有多少块，怎么读写一块（同步，做完才返回，可以睡），怎么让写过的块都落盘。
 pub const Device = struct {
     blocks: u64,
     transfer: *const fn (block: u64, data: *[block_size]u8, write: bool) void,
+    /// 让之前写完的块都真正落到盘上（设备有写缓存时，写完的块可能还在缓存里，掉电会丢、落盘的顺序也不定）。
+    /// null：设备没有写缓存，写完就落盘了（mkfs、大部分单元测试）
+    flush: ?*const fn () void = null,
 };
 
 pub const Buf = struct {
@@ -221,6 +225,11 @@ pub fn invalidate() void {
 pub fn write(b: *Buf) void {
     std.debug.assert(b.lock.holding() and b.valid);
     device.?.transfer(b.blockno, b.data, true);
+}
+
+/// 等之前写的块（write 返回过的）都落盘。只能由进程调用（要睡着等设备）。
+pub fn flush() void {
+    if (device.?.flush) |f| f();
 }
 
 /// 用完了：放开睡眠锁。没人用了就记下现在的时刻（LRU），有进程在等空闲缓冲区的话叫醒它。

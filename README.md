@@ -28,7 +28,7 @@ SBI: OpenSBI, spec v1.0 | hart 0 | device tree at 0x87e00000
 [ok] page allocator: 31526 free pages (126104 KiB)
 [ok] Sv39 paging enabled: kernel mapped 1:1, text r-x, rodata r--, data rw-, 80 stack guard pages unmapped
 [ok] stack overflow check: hitting a guard page traps onto the trap stack
-[ok] virtio disk: 8192 blocks of 4 KiB (32 MiB), irq 1
+[ok] virtio disk: 8192 blocks of 4 KiB (32 MiB), irq 1, flush
 [ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs, disk
 [ok] 4 harts running, booted on hart 0
 [ok] file system: 6422 of 7168 blocks free, generation 59
