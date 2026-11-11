@@ -180,67 +180,66 @@ pub fn readLimit(f: *const File, len: usize) usize {
     };
 }
 
-/// 从 f 读最多 len 个字节到用户地址空间 space 的 ptr，返回读到的字节数，0 表示读到了结尾。
-/// 调用方先检查过 [ptr, ptr+len) 可写（见 syscall.read）。
-pub fn read(f: *File, space: *vm.Space, ptr: usize, len: usize) Error!usize {
+/// 从 f 读最多 dst.len 个字节到用户内存 dst（调用方 pin 好的，见 syscall.read），返回读到的字节数，0 表示读到了结尾。
+pub fn read(f: *File, dst: vm.PinnedDst) Error!usize {
     if (!f.readable) return error.NotReadable;
     return switch (f.kind) {
         .none => unreachable,
-        .console => consoleRead(space, ptr, len),
-        .pipe => pipe.read(f.pipe, space, ptr, len),
-        .inode => inodeRead(f, space, ptr, len),
+        .console => consoleRead(dst),
+        .pipe => pipe.read(f.pipe, dst),
+        .inode => inodeRead(f, dst),
         .device => switch (f.major) {
-            .console => consoleRead(space, ptr, len),
+            .console => consoleRead(dst),
             .null => 0,
-            .zero => zeroRead(space, ptr, len),
+            .zero => zeroRead(dst),
             _ => unreachable, // openDevice 不会打开不认识的设备
         },
     };
 }
 
-/// 把用户地址空间 space 里 [ptr, ptr+len) 的字节写进 f，返回写出的字节数。
-/// 遇到坏地址时停下，返回已经写出的字节数；一个字节都没写出才返回 BadAddress。
-pub fn write(f: *File, space: *vm.Space, ptr: usize, len: usize) Error!usize {
+/// 把用户要写的 len 个字节写进 f，返回写出的字节数。src 是调用方 pin 好的开头那一段（vm.pinSrcPrefix），
+/// 比 len 短说明后面是坏地址：串口、管道写出 src 这一段、返回写了多少，一个字节都没有才是 BadAddress；
+/// 文件的一次写是一个事务，不全就是 BadAddress、什么都不写。
+pub fn write(f: *File, src: vm.PinnedSrc, len: usize) Error!usize {
     if (!f.writable) return error.NotWritable;
+    // 写什么都丢掉，也不看用户内存（和 Linux 的 /dev/null 一样）
+    if (f.kind == .device and (f.major == .null or f.major == .zero)) return len;
+    if (src.len == 0 and len > 0) return error.BadAddress;
     return switch (f.kind) {
         .none => unreachable,
-        .console => consoleWrite(space, ptr, len),
-        .pipe => pipe.write(f.pipe, space, ptr, len),
-        .inode => inodeWrite(f, space, ptr, len),
+        .console => consoleWrite(src),
+        .pipe => pipe.write(f.pipe, src),
+        .inode => if (src.len < len) error.BadAddress else inodeWrite(f, src),
         .device => switch (f.major) {
-            .console => consoleWrite(space, ptr, len),
-            // 写什么都丢掉，也不看用户内存（和 Linux 的 /dev/null 一样）
-            .null, .zero => len,
-            _ => unreachable,
+            .console => consoleWrite(src),
+            else => unreachable,
         },
     };
 }
 
 const zero_page: [page.size]u8 = @splat(0);
 
-/// /dev/zero：把 len 个 0 写进用户内存。调用方先检查过目标可写。
-fn zeroRead(space: *vm.Space, ptr: usize, len: usize) Error!usize {
+/// /dev/zero：把 dst 整个填成 0。
+fn zeroRead(dst: vm.PinnedDst) Error!usize {
     var done: usize = 0;
-    while (done < len) {
-        const n = @min(zero_page.len, len - done);
-        vm.copyToUser(space, ptr + done, zero_page[0..n]) catch unreachable;
+    while (done < dst.len) {
+        const n = @min(zero_page.len, dst.len - done);
+        dst.copyOut(done, zero_page[0..n]);
         done += n;
     }
-    return len;
+    return dst.len;
 }
 
-/// 用户内存先分块复制到内核缓冲区再输出，每块都经过 vm.copyFromUser 检查。
-/// 每块都不跨页：一块失败就说明这一页整个不能读，前面的字节都已经写出去了。
-/// 整个 write 拿着串口的输出锁，所以一次 write 的内容不会和别的 hart 的输出交错。
-fn consoleWrite(space: *vm.Space, ptr: usize, len: usize) Error!usize {
+/// 用户内存先分块复制到内核缓冲区再输出。整个 write 拿着串口的输出锁，所以一次 write 的内容不会和别的 hart 的输出交错；
+/// 拿着锁不能缺页，src 是 pin 好的。
+fn consoleWrite(src: vm.PinnedSrc) Error!usize {
     const out = uart.lockOutput();
     defer out.unlock();
     var buf: [128]u8 = undefined;
     var done: usize = 0;
-    while (done < len) {
-        const va = ptr + done;
-        const chunk = buf[0..@min(buf.len, len - done, page.size - va % page.size)];
-        vm.copyFromUser(space, chunk, va) catch return if (done == 0) error.BadAddress else done;
+    while (done < src.len) {
+        const chunk = buf[0..@min(buf.len, src.len - done)];
+        src.copyIn(done, chunk);
         out.write(chunk);
         done += chunk.len;
     }
@@ -249,20 +248,20 @@ fn consoleWrite(space: *vm.Space, ptr: usize, len: usize) Error!usize {
 
 /// 从文件当前的位置读，位置往后挪读到的字节数。读目录是 IsDir（列目录用 readdir 系统调用）。
 /// 在快照上读，不挡着别人读写文件系统。
-fn inodeRead(f: *File, space: *vm.Space, ptr: usize, len: usize) Error!usize {
+fn inodeRead(f: *File, dst: vm.PinnedDst) Error!usize {
     f.pos_lock.acquire();
     defer f.pos_lock.release();
     var r = try fsys.reader();
     defer r.end();
-    const n = try r.fs.read(f.ino, f.off, len, fsys.UserOut{ .space = space, .ptr = ptr });
+    const n = try r.fs.read(f.ino, f.off, dst.len, dst);
     f.off += n;
     return n;
 }
 
 /// 写到文件当前的位置（open_append 的是文件末尾），位置挪到写完的地方。整个写是一个事务：
-/// 用户内存中途读不出来、磁盘满了，什么都不写，位置也不动。
+/// 磁盘满了，什么都不写，位置也不动（用户内存 pin 好了，中途不会读不出来）。
 /// 查文件末尾和写拿着同一次文件系统的写锁，几个进程同时往末尾追加不会写到同一个位置上。
-fn inodeWrite(f: *File, space: *vm.Space, ptr: usize, len: usize) Error!usize {
+fn inodeWrite(f: *File, src: vm.PinnedSrc) Error!usize {
     f.pos_lock.acquire();
     defer f.pos_lock.release();
     const root = try fsys.writer();
@@ -271,7 +270,7 @@ fn inodeWrite(f: *File, space: *vm.Space, ptr: usize, len: usize) Error!usize {
     try fsys.beginModify(f.ino);
     defer fsys.endModify();
     const off = if (f.append) (try root.stat(f.ino)).size else f.off;
-    const n = try root.run(fsys.Fs.write, .{ f.ino, off, len, fsys.UserIn{ .space = space, .ptr = ptr } });
+    const n = try root.run(fsys.Fs.write, .{ f.ino, off, src.len, src });
     f.off = off + n;
     return n;
 }
@@ -314,7 +313,8 @@ const ctrl_d = 0x04;
 /// 从键盘缓冲区读最多 len 个字节。缓冲区为空时睡在 uart.rx_chan 上，串口中断叫醒它。
 /// 读到 Ctrl-D 就停下：它前面有字符的话先返回这些字符，Ctrl-D 留到下一次 read，
 /// 那一次读掉它、返回 0。所以单独按一次 Ctrl-D，read 返回 0。
-fn consoleRead(space: *vm.Space, ptr: usize, len: usize) Error!usize {
+fn consoleRead(dst: vm.PinnedDst) Error!usize {
+    const len = dst.len;
     if (len == 0) return 0;
     uart.rx_lock.acquire();
     defer uart.rx_lock.release();
@@ -336,7 +336,7 @@ fn consoleRead(space: *vm.Space, ptr: usize, len: usize) Error!usize {
             buf[n] = uart.read().?;
         }
         if (n == 0) break;
-        vm.copyToUser(space, ptr + done, buf[0..n]) catch unreachable; // 调用方检查过了
+        dst.copyOut(done, buf[0..n]);
         done += n;
     }
     return done;

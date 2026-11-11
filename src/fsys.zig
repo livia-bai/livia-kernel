@@ -21,7 +21,6 @@ const fs = @import("fs.zig");
 const ctree = @import("ctree.zig");
 const bio = @import("bio.zig");
 const uart = @import("uart.zig");
-const vm = @import("vm.zig");
 const Sleeplock = @import("sleeplock.zig").Sleeplock;
 const Spinlock = @import("spinlock.zig").Spinlock;
 
@@ -89,26 +88,6 @@ pub const KernelOut = struct {
     buf: []u8,
     pub fn put(o: KernelOut, at: usize, bytes: []const u8) error{}!void {
         @memcpy(o.buf[at..][0..bytes.len], bytes);
-    }
-};
-
-/// fs.read 的 out：写进用户地址空间 space 的 ptr 开始的地方。
-pub const UserOut = struct {
-    space: *vm.Space,
-    ptr: usize,
-    pub fn put(o: UserOut, at: usize, bytes: []const u8) error{BadAddress}!void {
-        const va = std.math.add(usize, o.ptr, at) catch return error.BadAddress;
-        try vm.copyToUser(o.space, va, bytes);
-    }
-};
-
-/// fs.write 的 in：从用户地址空间 space 的 ptr 开始的地方取。
-pub const UserIn = struct {
-    space: *vm.Space,
-    ptr: usize,
-    pub fn get(i: UserIn, at: usize, dst: []u8) error{BadAddress}!void {
-        const va = std.math.add(usize, i.ptr, at) catch return error.BadAddress;
-        try vm.copyFromUser(i.space, dst, va);
     }
 };
 

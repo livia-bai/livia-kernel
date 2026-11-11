@@ -181,23 +181,19 @@ fn installFd(f: *file.File) ?usize {
 }
 
 /// 写 fd。中途遇到坏地址就停下，返回已经写出的字节数；一个字节都没写出才返回错误（见 file.write）。
-/// 用户内存是拿着锁（串口的输出锁、管道的锁、文件系统的写锁）复制的，那时读不了盘：
-/// 来源在程序文件的页里（比如字符串常量）、还没读进来的话，先读好（vm.prefault）。
+/// 用户内存是拿着锁（串口的输出锁、管道的锁、文件系统的写锁）复制的，那时不能缺页：先 pin 好能读的开头那一段。
 fn write(fd: usize, ptr: usize, len: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
-    vm.prefault(space(), ptr, len);
-    return file.write(f, space(), ptr, len) catch |err| failWith(err);
+    return file.write(f, vm.pinSrcPrefix(space(), ptr, len), len) catch |err| failWith(err);
 }
 
-/// 读 fd。先检查整个目标范围可写：从串口的缓冲区取出来的字符放不回去，不能取出来之后才发现写不进去。
-/// 检查时顺便把还没分配的页都分配好（按需分页），之后拿着锁写进去时不用再读盘。
-/// 检查之前先按文件的种类把 len 截到这一次最多能读到的量（file.readLimit）：只分配真会写到的页。
+/// 读 fd。先 pin 整个目标范围（检查可写、准备好每一页）：从串口的缓冲区取出来的字符放不回去，不能取出来之后才发现写不进去；
+/// 之后拿着锁写进去时也不能缺页。pin 之前先按文件的种类把 len 截到这一次最多能读到的量（file.readLimit）：只准备真会写到的页。
 fn read(fd: usize, ptr: usize, len: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
     if (len == 0) return 0;
-    const n = file.readLimit(f, len);
-    vm.checkUser(space(), ptr, n, true) catch return abi.fail(.fault);
-    return file.read(f, space(), ptr, n) catch |err| failWith(err);
+    const dst = vm.pinDst(space(), ptr, file.readLimit(f, len)) catch |err| return failWith(err);
+    return file.read(f, dst) catch |err| failWith(err);
 }
 
 fn close(fd: usize) usize {
@@ -218,8 +214,8 @@ fn dup(fd: usize) usize {
 
 /// 创建管道，把读端、写端的 fd 写进 fds_ptr（两个 u32）。任何一步失败都把已经做了的撤销掉。
 fn pipe(fds_ptr: usize) usize {
-    // 先检查能写：fd 装进 fd 表以后再失败，就要再一个个撤销
-    vm.checkUser(space(), fds_ptr, 2 * @sizeOf(u32), true) catch return abi.fail(.fault);
+    // 先 pin 好：fd 装进 fd 表以后再失败，就要再一个个撤销
+    const dst = vm.pinDst(space(), fds_ptr, 2 * @sizeOf(u32)) catch |err| return failWith(err);
     const r, const w = file.openPipe() catch |err| return failWith(err);
     const files = &proc.current().?.files;
     const rfd = installFd(r) orelse {
@@ -234,7 +230,7 @@ fn pipe(fds_ptr: usize) usize {
         return abi.fail(.mfile);
     };
     const fds = [2]u32{ @intCast(rfd), @intCast(wfd) };
-    vm.copyToUser(space(), fds_ptr, std.mem.asBytes(&fds)) catch unreachable; // 上面检查过了
+    dst.copyOut(0, std.mem.asBytes(&fds));
     return 0;
 }
 
@@ -250,23 +246,24 @@ fn rawBlock(blockno: usize) error{ NoDevice, InvalidArgument }!u64 {
     return fsys.raw_base + blockno;
 }
 
-/// 读原始区域的一块到用户内存。先检查整个目标范围可写（顺便复制好写时复制的页），之后的 copyToUser 一定成功。
+/// 读原始区域的一块到用户内存。拿着缓冲区的睡眠锁复制，所以先 pin 好目标。
 fn readBlock(blockno: usize, ptr: usize) usize {
-    vm.checkUser(space(), ptr, abi.block_size, true) catch return abi.fail(.fault);
+    const dst = vm.pinDst(space(), ptr, abi.block_size) catch |err| return failWith(err);
     const n = rawBlock(blockno) catch |err| return failWith(err);
     const b = bio.read(n) catch unreachable; // rawBlock 检查过了
     defer bio.release(b);
-    vm.copyToUser(space(), ptr, b.data) catch unreachable;
+    dst.copyOut(0, b.data);
     return 0;
 }
 
-/// 用户内存的一块写到磁盘。整块覆盖，不用先读；先检查来源可读，复制到一半失败的话缓冲区里会留下半新半旧的内容。
+/// 用户内存的一块写到磁盘。整块覆盖，不用先读；先 pin 好来源：拿着缓冲区的睡眠锁复制，而且复制到一半失败的话
+/// 缓冲区里会留下半新半旧的内容。
 fn writeBlock(blockno: usize, ptr: usize) usize {
-    vm.checkUser(space(), ptr, abi.block_size, false) catch return abi.fail(.fault);
+    const src = vm.pinSrc(space(), ptr, abi.block_size) catch |err| return failWith(err);
     const n = rawBlock(blockno) catch |err| return failWith(err);
     const b = bio.get(n) catch unreachable; // rawBlock 检查过了
     defer bio.release(b);
-    vm.copyFromUser(space(), b.data, ptr) catch unreachable;
+    src.copyIn(0, b.data);
     b.valid = true;
     bio.write(b);
     return 0;
@@ -489,7 +486,7 @@ fn fstat(fd: usize, ptr: usize) usize {
 fn readdir(fd: usize, ptr: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
     if (f.kind != .inode) return abi.fail(.notdir);
-    vm.prefault(space(), ptr, @sizeOf(abi.Dirent)); // 下面拿着 pos_lock 写进用户内存，那时读不了盘
+    const dst = vm.pinDst(space(), ptr, @sizeOf(abi.Dirent)) catch |err| return failWith(err); // 下面拿着 pos_lock 写
     f.pos_lock.acquire();
     defer f.pos_lock.release();
     var r = fsys.reader() catch return abi.fail(.nodev);
@@ -502,7 +499,7 @@ fn readdir(fd: usize, ptr: usize) usize {
     ent.name_len = @intCast(d.name_len);
     ent._pad = @splat(0);
     @memset(ent.name[d.name_len..], 0);
-    vm.copyToUser(space(), ptr, std.mem.asBytes(&ent)) catch return abi.fail(.fault);
+    dst.copyOut(0, std.mem.asBytes(&ent));
     f.off = d.next;
     return 1;
 }
@@ -510,7 +507,7 @@ fn readdir(fd: usize, ptr: usize) usize {
 /// 检查整个文件系统（fs.Fs.check）。先作废缓冲区缓存：要核对的是磁盘上的内容，校验和只在读盘时核对。
 /// 拿着文件系统的写锁：没有做到一半的修改，当前的树就是已提交的树。读者照常读（它们只会把块读进缓存）。
 fn scrub(ptr: usize) usize {
-    vm.checkUser(space(), ptr, @sizeOf(abi.ScrubInfo), true) catch return abi.fail(.fault);
+    const dst = vm.pinDst(space(), ptr, @sizeOf(abi.ScrubInfo)) catch |err| return failWith(err);
     const root = fsys.writer() catch return abi.fail(.nodev);
     defer fsys.unlock();
     bio.invalidate();
@@ -528,7 +525,7 @@ fn scrub(ptr: usize) usize {
         .blocks = root.vol.blocks,
         .generation = root.vol.generation,
     };
-    vm.copyToUser(space(), ptr, std.mem.asBytes(&info)) catch unreachable; // 上面检查过了
+    dst.copyOut(0, std.mem.asBytes(&info)); // 拿着写锁
     return 0;
 }
 
@@ -562,10 +559,11 @@ fn exec(path_ptr: usize, path_len: usize, argv_ptr: usize, argc: usize) usize {
 }
 
 /// 等子进程结束，把结束状态写进 status_ptr（不为 0 时），回收它，返回它的 pid（见 proc.wait）。
-/// 写状态失败时不回收，返回 -EFAULT：子进程还在，可以再 wait 一次。
+/// 状态是拿着锁写的，所以先 pin 好；写不进去就是 -EFAULT，什么都没回收：子进程还在，可以再 wait 一次。
 fn wait(pid: usize, status_ptr: usize, options: usize) usize {
     if (options & ~abi.wait_nohang != 0) return abi.fail(.inval);
-    const found = proc.wait(pid, options & abi.wait_nohang != 0, status_ptr) catch |err| return failWith(err);
+    const status = if (status_ptr == 0) null else vm.pinDst(space(), status_ptr, @sizeOf(u32)) catch |err| return failWith(err);
+    const found = proc.wait(pid, options & abi.wait_nohang != 0, status) catch |err| return failWith(err);
     return found orelse 0;
 }
 

@@ -32,7 +32,7 @@ pub const Rank = enum(u8) {
     bucket,
     /// 每个进程的锁
     proc,
-    /// 串口的输出锁：consoleWrite 拿着它从用户内存复制（缺页时要分配页），所以比页分配器低
+    /// 串口的输出锁：拿着进程锁、条件的锁时都可能打印
     uart_out,
     /// 叶子锁：拿着它们不再拿别的锁。页分配器（每个 hart 一把）、File.lock、fsys.text_lock
     leaf,

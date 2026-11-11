@@ -2,6 +2,11 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-11 拿着锁读写用户内存要先 pin
+
+- 改动：拿着锁读写用户内存只能通过 `vm.PinnedSrc` / `vm.PinnedDst`：拿锁之前用 `vm.pinSrc`、`pinSrcPrefix`、`pinDst` 把范围里的页都准备好，拿着锁时 `copyIn` / `copyOut` 不缺页、不会失败。`copyFromUser`、`copyToUser` 拿着锁调用直接 panic。`vm.prefault`、`vm.checkUser`、`fsys.UserIn`/`UserOut` 去掉了；`vm.fault` 去掉了 `may_sleep` 参数和 `WouldSleep`。`write`、`read`、`readdir`、`wait`、`pipe`、`readblock`、`writeblock`、`scrub` 改成先 pin；`file.read`/`write`、`pipe.read`/`write`、`proc.wait` 接收 pin 好的范围。拿着锁时不再为用户内存分配页。
+- 改动：`wait` 的结束状态地址写不进去时，在等子进程之前就返回 `-EFAULT`（原来是等到有子进程结束才发现）。子进程照样没被回收。
+
 ## 2026-11-11 加锁顺序由等级检查
 
 - 新增：每把自旋锁、睡眠锁创建时给一个等级（`spinlock.Rank`：`wait`、`cond`、`bucket`、`proc`、`uart_out`、`leaf`；`sleeplock.Rank`：`file_pos`、`fs_write`、`buf`）。拿锁时已经拿着的锁的等级都必须更低（只有 `bucket`、`buf` 两级允许同时拿几把），违反了就 panic：`lock order: acquiring X (等级) while holding Y (等级)`。每个 hart 记着自己拿着哪些自旋锁，每个进程记着自己拿着每一级的睡眠锁各几把（`Process.sleeplocks` 换成了 `sleeplock.Held`）。

@@ -263,8 +263,9 @@ fn wait(pid: usize, status_ptr: usize, options: usize) usize {
 ```zig
 pub fn copyFromUser(s: *Space, dst: []u8, src: usize) error{BadAddress}!void
 pub fn copyToUser(s: *Space, dst: usize, src: []const u8) error{BadAddress}!void
-pub fn checkUser(s: *Space, va: usize, len: usize, write: bool) error{BadAddress}!void
-pub fn prefault(s: *Space, va: usize, len: usize) void
+pub fn pinSrc(s: *Space, va: usize, len: usize) error{BadAddress}!PinnedSrc   // 拿锁之前准备好，见下面
+pub fn pinSrcPrefix(s: *Space, va: usize, len: usize) PinnedSrc
+pub fn pinDst(s: *Space, va: usize, len: usize) error{BadAddress}!PinnedDst
 ```
 
 系统调用拿到的指针完全由用户程序控制，可能是：没有映射的地址、内核的地址（比如 `hello` 故意传的 `0x8020_0000`）、跨越地址空间末尾的范围、或者让 `src + len` 溢出的长度。`copyFromUser` 对每一页：
@@ -286,9 +287,24 @@ pub fn prefault(s: *Space, va: usize, len: usize) void
 - 也不能改写自己的只读页：硬件不会替内核检查这一点（内核的映射可写，S 模式写的是物理地址的恒等映射），不检查的话，用户程序可以让 `read` 把输入写进自己的代码段。
 - **写时复制的页**（`fork` 之后和别的进程共用、还没写过的页）W 也是 0，但它本来是可写的：`copyToUser` 先 `vm.breakCow` 给这个进程复制一份，再往复制出来的页里写。不这样做的话，`wait` 写回的结束状态、`read` 读到的字符会直接写进共用的物理页，同时改掉另一个进程的内存。复制时内存不够就是 `BadAddress`（`-EFAULT`），和 Linux 一样（[paging.md](paging.md#写时复制)）。
 
-**拿着锁时不能读盘**：按需分页的页有两种。堆、栈、`.bss` 的页是清零的，随时都能分配（只拿页分配器的锁）；段里来自程序文件的页要读盘、睡着等，拿着自旋锁不能睡，拿着睡眠锁（可能是缓冲区的锁）也不行。所以这三个函数在拿着锁的时候（`canSleep()` 为 false）不读盘，碰到那样的页就是 `BadAddress`。拿着锁复制用户内存的系统调用先调用 `prefault`，把范围里来自程序文件的页读好：`write`（写串口拿着输出锁、写管道拿着管道锁、写文件拿着文件系统的写锁和缓冲区的锁）、`readdir`（拿着读写位置的锁）、`wait`（拿着进程的锁写状态）。只拿着文件系统快照的（`readlink`、`getcwd`、`lstat`、`fstat`）可以直接读盘：再拿一个快照不用等谁。`t_demand` 检查了这些路径（[testing.md](testing.md#回归测试程序)）。
+**拿着锁时不能缺页**：按需分页的页可能要从程序文件读、睡着等，拿着自旋锁不能睡，拿着睡眠锁（可能是缓冲区的锁）也不行。所以 `copyFromUser`、`copyToUser` 一开始就检查没有拿着锁，拿着的话直接 panic（`copyFromUser while holding a lock (pin the range first)`）。只拿着文件系统快照的（`readlink`、`getcwd`、`lstat`、`fstat`）可以直接调用：快照不是锁，再拿一个快照不用等谁。
 
-`copyToUser` 逐页写，中途遇到坏页时前面的页已经写进去了。需要“要么全写、要么不写”的调用方先用 `checkUser` 检查整个范围（`read` 就是这样）。`checkUser` 逐页查页表，`len = 0` 时不检查，`va + len - 1` 溢出是 `BadAddress`；检查时顺便把范围里还没分配的页都分配好、（检查可写时）写时复制页都复制好，所以检查通过之后的 `copyToUser` 一定成功（分配、复制要内存，放到检查之后才做的话，取走的输入可能又写不进去）。这几个函数在 `vm.zig` 里有单元测试（跨页、只读页、没有映射、溢出、按需分配）。
+要拿着锁读写用户内存的系统调用分两步：**拿锁之前 pin**，把范围里的每一页都准备好（还没分配的分配好、程序文件的页读进来、要写的话写时复制的页复制好），得到一个 `vm.PinnedSrc`（要读的）或 `vm.PinnedDst`（要写的）；**拿着锁时**用它的 `copyIn` / `copyOut` 复制。它们只走页表、不缺页、不会失败，返回 `void`，所以调用的地方不用 `catch unreachable`。`Pinned*` 只能由 pin 函数造出来，拿着锁的复制又只能通过它们，“先准备再拿锁”就从一条要人记住的约定变成了类型：
+
+| 系统调用 | 拿着什么锁复制 | pin 什么 |
+| --- | --- | --- |
+| `write` | 串口的输出锁、管道锁、文件系统的写锁和缓冲区的锁 | `pinSrcPrefix`：开头能读的那一段。串口、管道写出这一段、返回写了多少（部分写）；文件的一次写是一个事务，不全就是 `-EFAULT` |
+| `read` | 串口的输入锁、管道锁、读写位置的锁 | `pinDst` 整个范围（先按 `readLimit` 截短）：取出来的字符放不回去，写不进去的话要在取之前知道 |
+| `readdir` | 读写位置的锁 | `pinDst` 一个 `Dirent` |
+| `wait` | `wait_lock` 和子进程的锁 | `pinDst` 一个 `u32`；写不进去在等之前就是 `-EFAULT`，子进程还在 |
+| `readblock`、`writeblock` | 缓冲区的睡眠锁 | 整块 |
+| `scrub`、`pipe` | 文件系统的写锁；不拿锁，但 fd 装进 fd 表之后再失败要一个个撤销 | 整个结果 |
+
+`PinnedSrc` 还实现了 `fs.write` 要的 `in.get`，`PinnedDst` 实现了 `fs.read` 要的 `out.put`，文件系统直接从 pin 好的用户内存读写，不用再包一层。
+
+这样做成立的前提是：pin 好之后，只有这个进程自己会改它的地址空间（没有线程、不换出页），而它正在这个系统调用里。以后加了线程或者换页，pin 就要真的把页钉住。原来这里是一条约定：拿锁之前 `vm.prefault`（或者 `checkUser`），拿着锁的复制碰到程序文件的页时返回 `-EFAULT`；漏了 `prefault` 的系统调用平时都对，只有那一页恰好还没读进来时才出错。
+
+`copyToUser` 逐页写，中途遇到坏页时前面的页已经写进去了。需要“要么全写、要么不写”的调用方先 pin（`pipe` 就是这样）。pin 逐页查页表，`len = 0` 时不检查，`va + len` 溢出算作溢出之后的地址都不行。这几个函数在 `vm.zig` 里有单元测试（跨页、只读页、没有映射、溢出、按需分配、只要开头能读的一段）。
 
 ## 用户态封装
 

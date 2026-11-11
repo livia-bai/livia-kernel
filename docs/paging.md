@@ -230,8 +230,8 @@ pub fn allocUserPage(root: *PageTable, va: usize, perm: Perm) MapError!*align(pa
 
 ```zig
 pub const Access = enum { read, write, exec };
-pub const FaultError = error{ BadAddress, OutOfMemory, CowOutOfMemory, IoError, WouldSleep };
-pub fn fault(s: *Space, va: usize, access: Access, may_sleep: bool) FaultError!void
+pub const FaultError = error{ BadAddress, OutOfMemory, CowOutOfMemory, IoError };
+pub fn fault(s: *Space, va: usize, access: Access) FaultError!void
 ```
 
 用户地址 `va` 那一页还没有、或者不允许这样访问时调用。返回之后重新执行那次访问就能成功；返回错误的话，那次访问本来就不该成功，或者没法让它成功：
@@ -242,17 +242,16 @@ pub fn fault(s: *Space, va: usize, access: Access, may_sleep: bool) FaultError!v
    - 要写、是写时复制的页：`breakCow`（[写时复制](#写时复制)），没内存复制是 `CowOutOfMemory`。
    - 别的（写只读的页、执行不可执行的页）：`BadAddress`。
 3. **没有这一页**：`regionOf` 找它在哪个区域，不在任何区域里、或者区域的权限不允许这次访问（写代码段、执行数据段、执行堆和栈）是 `BadAddress`，什么都不分配。
-4. 这一页有来自程序文件的内容、而 `may_sleep` 是 false：`WouldSleep`，什么都不改（读盘要睡着等，见下面）。
-5. `page.alloc()` 一页清零的页（没有是 `OutOfMemory`），把文件里的那部分读进来（`Backing.read`：`.bytes` 直接复制，`.file` 是 `fsys.readText`，读不出来是 `IoError`），按区域的权限加 U 位映射上（要新的页表、没有内存时把这一页还回去，`OutOfMemory`），最后刷新这一页的 TLB。读盘时进程睡着，但只有它自己会改自己的地址空间，醒来时这一页还是没有，`map` 不会 `AlreadyMapped`。
+4. `page.alloc()` 一页清零的页（没有是 `OutOfMemory`），把文件里的那部分读进来（`Backing.read`：`.bytes` 直接复制，`.file` 是 `fsys.readText`，读不出来是 `IoError`），按区域的权限加 U 位映射上（要新的页表、没有内存时把这一页还回去，`OutOfMemory`），最后刷新这一页的 TLB。读盘要睡着等，所以调用的时候不能拿着锁（见下面）。读盘时进程睡着，但只有它自己会改自己的地址空间，醒来时这一页还是没有，`map` 不会 `AlreadyMapped`。
 
 **谁调用它**：
 
-- **用户程序访问**：陷阱处理程序收到 U 模式的 `load_page_fault`、`store_page_fault`、`instruction_page_fault` 时调用（`may_sleep = true`，这时什么锁都没拿），失败时结束进程，原因按错误不同（[trap.md](trap.md#分发)）。
-- **内核替用户程序访问**：`copyFromUser`、`copyToUser`、`checkUser` 翻译不了一页时调用（[内核访问用户内存](#内核访问用户内存)）。
+- **用户程序访问**：陷阱处理程序收到 U 模式的 `load_page_fault`、`store_page_fault`、`instruction_page_fault` 时调用（这时什么锁都没拿），失败时结束进程，原因按错误不同（[trap.md](trap.md#分发)）。
+- **内核替用户程序访问**：`copyFromUser`、`copyToUser`、`pinSrc`/`pinDst` 翻译不了一页时调用（[内核访问用户内存](#内核访问用户内存)）。
 
 **为什么这样记区域**：和 xv6 的 lazy allocation 实验一样，只是多了从文件读的段。Linux 用 VMA（`vm_area_struct`）记同样的东西，每个区域有自己的缺页处理；这里只有三种区域，用一个固定大小的结构体就够了，`fork` 时整个复制（`cloneUserSpace`）。
 
-单元测试（`vm.zig` 末尾，用一段 6000 字节的“程序镜像”和两个段）检查了：一开始只有根页表；读代码段的第 2 页只分配这一页和它的页表，文件之外的部分是 0；数据段开头来自镜像、后面是 0、可写，`.bss` 的页整页是 0；写代码段、执行数据段返回 `BadAddress` 并且不分配；同一页缺两次只分配一次；堆的 `brk` 所在页整页能用、下一页不行；栈的两端能用、保护页不行；段不能重叠、最多 8 个；`backing` 是文件、不能睡时返回 `WouldSleep` 不分配，清零的页照常分配；释放后不漏页。
+单元测试（`vm.zig` 末尾，用一段 6000 字节的“程序镜像”和两个段）检查了：一开始只有根页表；读代码段的第 2 页只分配这一页和它的页表，文件之外的部分是 0；数据段开头来自镜像、后面是 0、可写，`.bss` 的页整页是 0；写代码段、执行数据段返回 `BadAddress` 并且不分配；同一页缺两次只分配一次；堆的 `brk` 所在页整页能用、下一页不行；栈的两端能用、保护页不行；段不能重叠、最多 8 个；`backing` 是文件、读不出来（单元测试里没挂文件系统）时返回 `IoError`、分配的页还回去，清零的页照常分配；释放后不漏页。
 
 ### 内核访问用户内存
 
@@ -261,20 +260,18 @@ fn translateUser(root: *PageTable, va: usize, write: bool) ?usize
 fn userPage(s: *Space, va: usize, write: bool) ?usize
 pub fn copyFromUser(s: *Space, dst: []u8, src: usize) error{BadAddress}!void
 pub fn copyToUser(s: *Space, dst: usize, src: []const u8) error{BadAddress}!void
-pub fn checkUser(s: *Space, va: usize, len: usize, write: bool) error{BadAddress}!void
-pub fn prefault(s: *Space, va: usize, len: usize) void
+pub fn pinSrc(s: *Space, va: usize, len: usize) error{BadAddress}!PinnedSrc
+pub fn pinSrcPrefix(s: *Space, va: usize, len: usize) PinnedSrc
+pub fn pinDst(s: *Space, va: usize, len: usize) error{BadAddress}!PinnedDst
 ```
 
-`translateUser` 用软件走一遍页表，把用户虚拟地址翻译成物理地址；要求地址在用户区里，叶子有效、带 U 位、可读（`write` 为 true 时还要可写），否则返回 null。`userPage` 翻译不了时先按缺页处理（`fault`：按需分配、写时复制的页复制一份）再翻译一次，处理不了就是 null。`copyFromUser` / `copyToUser` 在此基础上逐页翻译、逐页复制，是系统调用读写用户内存的唯一途径；`checkUser` 只检查整个范围、不复制，顺便把范围里的页都分配好、写时复制的页都复制好，所以检查通过之后拿着锁再复制这个范围一定成功。详见 [syscalls.md](syscalls.md#访问用户内存)。
+`translateUser` 用软件走一遍页表，把用户虚拟地址翻译成物理地址；要求地址在用户区里，叶子有效、带 U 位、可读（`write` 为 true 时还要可写），否则返回 null。`userPage` 翻译不了时先按缺页处理（`fault`：按需分配、写时复制的页复制一份）再翻译一次，处理不了就是 null。`copyFromUser` / `copyToUser` 在此基础上逐页翻译、逐页复制，是系统调用读写用户内存的途径之一；它们可能缺页、读盘，所以不能拿着锁调用（一开始就检查）。
 
-**拿着锁的时候读不了盘**：内核有不少地方是拿着锁复制用户内存的：写管道拿着管道的锁、写串口拿着输出锁（自旋锁），写文件拿着文件系统的写锁（睡眠锁，而且 `fs.write` 从用户内存取数据时还拿着缓冲区的睡眠锁），`readdir` 拿着读写位置的锁，`wait` 拿着进程的锁写结束状态。这时碰到还没有的页：
+**拿着锁访问用户内存要先 pin**：内核有不少地方是拿着锁复制用户内存的：写管道拿着管道的锁、写串口拿着输出锁（自旋锁），写文件拿着文件系统的写锁（睡眠锁，而且 `fs.write` 从用户内存取数据时还拿着缓冲区的睡眠锁），`readdir` 拿着读写位置的锁，`wait` 拿着进程的锁写结束状态。这时不能缺页：段里来自程序文件的页要读盘、睡着等，拿着自旋锁不能睡；拿着缓冲区的睡眠锁再去拿别的缓冲区，可能和别的进程互相等。所以这些地方在拿锁之前 pin（`pinSrc`、`pinSrcPrefix`、`pinDst`）：逐页 `userPage`，把页都准备好（写的话写时复制的页也复制好），得到一个 `PinnedSrc` / `PinnedDst`；拿着锁时用它的 `copyIn` / `copyOut`，只调用 `translateUser`，不缺页、不分配，返回 `void`。哪个系统调用 pin 什么见 [syscalls.md](syscalls.md#访问用户内存)。
 
-- 堆、栈、`.bss` 的页（清零的页）：就地分配，只拿页分配器的锁（叶子锁），可以。
-- 段里来自程序文件的页：要读盘、睡着等，拿着自旋锁不能睡；拿着缓冲区的睡眠锁再去拿别的缓冲区，可能和别的进程互相等。所以 `canSleep()`（没拿着自旋锁、也没拿着睡眠锁）为 false 时，`userPage` 传 `may_sleep = false`，`fault` 返回 `WouldSleep`，复制失败（`BadAddress`）。拿着文件系统的快照（读者）不算：再拿一个快照不用等谁，`readlink`、`fstat` 这些可以直接按需读。
+所以拿着锁时内核不会再为用户内存分配页（以前拿着管道锁、串口的锁复制时碰到清零的页会就地分配，加锁顺序里因此有“`Pipe.lock` → 页分配器”这样的边），`vm.fault` 也不再需要“现在能不能睡”的参数（原来的 `may_sleep` 和 `WouldSleep`）。
 
-这些系统调用在拿锁之前先调用 `prefault(space, 地址, 长度)`：把范围里**来自程序文件、还没读进来**的页都读好（只看段里有文件内容的页，`len` 再大也只走几页；尽力而为，读不了的页就停下，之后复制到那里时照常失败）。现在调用它的有 `write`（所有种类的 fd）、`readdir`、`wait`；`read`、`pipe` 等本来就先 `checkUser` 检查整个目标范围（同时也就分配好了）。拿着锁的复制碰到清零的页还会就地分配，所以加锁顺序里多了“`Pipe.lock`、`uart.tx_lock`、`uart.rx_lock` → 页分配器的锁”（[process.md](process.md#锁)）。
-
-单元测试检查了 `copyFromUser` 只读得到 U 模式可读的用户页（不可读的、没映射也不在区域里的、内核的、地址溢出的都是 `BadAddress`），`copyToUser` 只写得进可写的页，`checkUser` 检查整个范围。`t_demand` 在 QEMU 里检查了 `write` 管道、串口、文件的来源是没读进来的只读数据，`read`、`fstat`、`readdir`、`wait` 写进没读进来的数据页，都成功（[testing.md](testing.md#回归测试程序)）。
+单元测试检查了 `copyFromUser` 只读得到 U 模式可读的用户页（不可读的、没映射也不在区域里的、内核的、地址溢出的都是 `BadAddress`），`copyToUser` 只写得进可写的页，pin 检查整个范围（`pinSrcPrefix` 只要开头能读的一段），pin 好之后 `copyIn` / `copyOut` 跨页读写。`t_demand` 在 QEMU 里检查了 `write` 管道、串口、文件的来源是没读进来的只读数据，`read`、`fstat`、`readdir`、`wait` 写进没读进来的数据页，都成功（[testing.md](testing.md#回归测试程序)）。
 
 ### 堆的增长和缩小
 
@@ -334,7 +331,7 @@ pub fn breakCow(root: *PageTable, va: usize) CowError!void
 
 谁调用它：
 
-- `fault` 发现要写的是已经有的 `cow` 页时调用它：用户程序写 `cow` 页触发 `store_page_fault`，成功就回到原来那条写指令重新执行，内存不够时结束这个进程（`out of memory (copy-on-write)`，[trap.md](trap.md#分发)）；内核往用户内存里写（`copyToUser`、`write` 为 true 的 `checkUser`）也经过 `fault`，内存不够时返回 `BadAddress`，系统调用返回 `-EFAULT`（Linux 的 `copy_to_user` 在这种情况下也是返回 `-EFAULT`）。
+- `fault` 发现要写的是已经有的 `cow` 页时调用它：用户程序写 `cow` 页触发 `store_page_fault`，成功就回到原来那条写指令重新执行，内存不够时结束这个进程（`out of memory (copy-on-write)`，[trap.md](trap.md#分发)）；内核往用户内存里写（`copyToUser`、`pinDst`）也经过 `fault`，内存不够时返回 `BadAddress`，系统调用返回 `-EFAULT`（Linux 的 `copy_to_user` 在这种情况下也是返回 `-EFAULT`）。
 
 几点说明：
 
@@ -343,7 +340,7 @@ pub fn breakCow(root: *PageTable, va: usize) CowError!void
 - 用户栈和全局变量在 `fork` 之后也是共用的：父子进程从系统调用一返回就会写栈，各自复制一两页。
 - `vm.zig` 只有这里、`fault` 和 `cloneUserSpace` 执行 `sfence.vma`（`flushTlb`），单元测试在主机上运行时跳过；其他函数都不执行特权指令。
 
-单元测试（`vm.zig` 末尾）检查：`fork` 只分配了 4 张页表；两边的可写页都变成 `cow`，代码页不是；子进程先写时复制一份，父进程的不变；父进程再写时这一页只剩它在用，不复制、还是原来那一页；代码页、没映射的页、已经复制过的页 `breakCow` 返回 `NotCow`；`checkUser` 检查可写时把 `cow` 页复制好；三方共用之后依次释放不漏页；`cloneUserSpace` 内存不够时不漏页；没有内存复制时 `breakCow` 返回 `OutOfMemory`、`fault` 返回 `CowOutOfMemory`、`copyToUser`/`checkUser` 返回 `BadAddress`，两边的页表项都不变；`fork` 之后两边都没访问过的页各自按需分配，内容都来自程序镜像。
+单元测试（`vm.zig` 末尾）检查：`fork` 只分配了 4 张页表；两边的可写页都变成 `cow`，代码页不是；子进程先写时复制一份，父进程的不变；父进程再写时这一页只剩它在用，不复制、还是原来那一页；代码页、没映射的页、已经复制过的页 `breakCow` 返回 `NotCow`；`pinDst` 把 `cow` 页复制好；三方共用之后依次释放不漏页；`cloneUserSpace` 内存不够时不漏页；没有内存复制时 `breakCow` 返回 `OutOfMemory`、`fault` 返回 `CowOutOfMemory`、`copyToUser`/`pinDst` 返回 `BadAddress`，两边的页表项都不变；`fork` 之后两边都没访问过的页各自按需分配，内容都来自程序镜像。
 
 ## 调试技巧
 

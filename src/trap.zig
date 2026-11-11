@@ -227,12 +227,11 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
                     .store_page_fault => .write,
                     else => .exec,
                 };
-                vm.fault(&proc.current().?.space, stval, access, true) catch |err| switch (err) {
+                vm.fault(&proc.current().?.space, stval, access) catch |err| switch (err) {
                     error.BadAddress => killForFault(frame, exception),
                     error.OutOfMemory => proc.killCurrent("out of memory (demand paging) at 0x{x}, stval=0x{x}", .{ frame.sepc, stval }),
                     error.CowOutOfMemory => proc.killCurrent("out of memory (copy-on-write) at 0x{x}, stval=0x{x}", .{ frame.sepc, stval }),
                     error.IoError => proc.killCurrent("cannot read the program file (demand paging) at 0x{x}, stval=0x{x}", .{ frame.sepc, stval }),
-                    error.WouldSleep => unreachable, // may_sleep 是 true
                 };
             },
             else => killForFault(frame, exception),

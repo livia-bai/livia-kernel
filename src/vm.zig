@@ -479,19 +479,17 @@ pub const FaultError = error{
     CowOutOfMemory,
     /// 从程序文件读页时读不出来
     IoError,
-    /// 要读盘，但调用方不能睡（拿着锁，见 copyFromUser）
-    WouldSleep,
 };
 
 /// 缺页：用户地址 va 那一页还没有、或者不允许这样访问。处理完返回之后，重新执行那次访问就能成功（按需分页）；
 /// 返回错误的话，那次访问本来就不该成功（用户程序访问的是坏地址，结束它），或者没法让它成功（没内存、读不出来）。
 /// - 没有映射：看它落在哪个区域里（Space.regionOf），区域允许这样访问的话分配一页，段里的页从程序文件读内容，
-///   再按区域的权限映射上。读盘要睡着等，may_sleep 为 false 时返回 WouldSleep，什么都不改。
+///   再按区域的权限映射上。段里的页要读盘、睡着等，所以调用方不能拿着锁（拿着锁要访问用户内存的，先 pin，见下面）。
 /// - 映射了、但是写时复制的页，要写它：breakCow。
 /// - 映射了、权限也够：什么都不做（不会发生，除非 TLB 里留着旧的项）。
-/// 用户程序访问时由陷阱处理程序调用（may_sleep 为 true），内核替用户程序访问用户内存时由 copyFromUser 这些调用。
+/// 用户程序访问时由陷阱处理程序调用，内核替用户程序访问用户内存时由 copyFromUser、pin 这些调用。
 /// 改的是当前 hart 正在用的地址空间（或者还没用过的新地址空间），最后刷新这一页的 TLB。
-pub fn fault(s: *Space, va: usize, access: Access, may_sleep: bool) FaultError!void {
+pub fn fault(s: *Space, va: usize, access: Access) FaultError!void {
     if (va < user_base or va >= user_end) return error.BadAddress;
     const base = std.mem.alignBackward(usize, va, page.size);
     if (leafOf(s.root, base)) |pte| {
@@ -507,7 +505,6 @@ pub fn fault(s: *Space, va: usize, access: Access, may_sleep: bool) FaultError!v
     }
     const r = s.regionOf(base) orelse return error.BadAddress;
     if (!allows(r.perm, access)) return error.BadAddress;
-    if (r.file_len > 0 and s.backing == .file and !may_sleep) return error.WouldSleep;
     if (r.file_len > 0) kstat.inc(.faults_file) else kstat.inc(.faults_zero);
     const p = try page.alloc(); // 清零的：段里文件之外的部分（.bss）、堆、栈都是 0
     errdefer page.free(p);
@@ -529,13 +526,11 @@ fn allows(perm: Perm, access: Access) bool {
     };
 }
 
-/// 内核替用户程序访问用户内存时（copyFromUser 这些），能不能为了按需分页读盘、睡着等：
-/// 拿着自旋锁不能睡；拿着睡眠锁也不行：可能正拿着缓冲区的睡眠锁（fs.write 从用户内存取数据时），
-/// 再去拿别的缓冲区就可能和别的进程互相等。拿着文件系统的快照（读者）可以：再拿一个快照不用等谁。
-/// 单元测试里没有进程，也不会用到文件。
-fn canSleep() bool {
-    if (comptime !builtin.cpu.arch.isRISCV()) return false;
-    return spinlock.heldCount() == 0 and proc.sleeplocksHeld() == 0;
+/// 内核替用户程序访问用户内存时（copyFromUser、pin 这些）可能缺页，缺页可能要读盘、睡着等，所以调用方不能拿着锁：
+/// 拿着自旋锁不能睡；拿着睡眠锁也不行：可能正拿着缓冲区的睡眠锁，再去拿别的缓冲区就可能和别的进程互相等。
+/// 拿着文件系统的快照（读者）可以：再拿一个快照不用等谁。要拿着锁访问用户内存的，先 pin，拿着锁时用 Pinned* 复制。
+fn assertMaySleep(comptime what: []const u8) void {
+    if (spinlock.heldCount() != 0 or proc.sleeplocksHeld() != 0) std.debug.panic(what ++ " while holding a lock (pin the range first)", .{});
 }
 
 /// 按页表把用户地址 va 翻译成物理地址。要求这一页是 U 模式可读的（write 为 true 时还要可写），
@@ -557,19 +552,19 @@ fn translateUser(root: *PageTable, va: usize, write: bool) ?usize {
 }
 
 /// translateUser，翻译不了的话先按缺页处理（fault：按需分配、复制写时复制的页）再翻译一次。
-/// 处理不了（坏地址、没内存、读不出来、要读盘但不能睡）返回 null（和 Linux 一样，系统调用返回 -EFAULT）。
+/// 处理不了（坏地址、没内存、读不出来）返回 null（和 Linux 一样，系统调用返回 -EFAULT）。
 fn userPage(s: *Space, va: usize, write: bool) ?usize {
     if (translateUser(s.root, va, write)) |pa| return pa;
-    fault(s, va, if (write) .write else .read, canSleep()) catch return null;
+    fault(s, va, if (write) .write else .read) catch return null;
     return translateUser(s.root, va, write);
 }
 
 /// 从用户地址 src 复制 dst.len 个字节到内核缓冲区 dst。
-/// 系统调用收到的指针都要经过这里：每一页都检查是否属于用户空间、是否允许 U 模式读，
+/// 系统调用收到的指针都要经过这里（或者 pin）：每一页都检查是否属于用户空间、是否允许 U 模式读，
 /// 用户程序就没法借系统调用读到内核的内存。sstatus.SUM 始终为 0，内核不会直接解引用用户指针。
-/// 还没分配的页和用户程序自己访问一样按需分配（fault）；程序文件里的页要读盘，拿着锁的时候读不了，
-/// 这样的调用方先用 prefault 读好。
+/// 还没分配的页和用户程序自己访问一样按需分配（fault），可能读盘，所以不能拿着锁调用。
 pub fn copyFromUser(s: *Space, dst: []u8, src: usize) error{BadAddress}!void {
+    assertMaySleep("copyFromUser");
     var done: usize = 0;
     while (done < dst.len) {
         const va = std.math.add(usize, src, done) catch return error.BadAddress;
@@ -583,8 +578,9 @@ pub fn copyFromUser(s: *Space, dst: []u8, src: usize) error{BadAddress}!void {
 /// 把内核缓冲区 src 复制到用户地址 dst。每一页都要求 U 模式可读可写：
 /// 用户程序不能借系统调用改写内核的内存，也不能改写自己的只读页（比如代码段）。
 /// 写时复制的页先复制一份（breakCow），和用户程序自己写它一样，不会改到共用这一页的别的进程。
-/// 中途失败时，前面的页已经写进去了；需要“要么全写、要么不写”的调用方先用 checkUser 检查。
+/// 中途失败时，前面的页已经写进去了；需要“要么全写、要么不写”的调用方先用 pinDst 检查。不能拿着锁调用。
 pub fn copyToUser(s: *Space, dst: usize, src: []const u8) error{BadAddress}!void {
+    assertMaySleep("copyToUser");
     var done: usize = 0;
     while (done < src.len) {
         const va = std.math.add(usize, dst, done) catch return error.BadAddress;
@@ -595,37 +591,98 @@ pub fn copyToUser(s: *Space, dst: usize, src: []const u8) error{BadAddress}!void
     }
 }
 
-/// 检查用户地址 [va, va+len) 是否都是 U 模式可读的（write 为 true 时还要可写）。
-/// 顺便把范围里还没分配的页都分配好、写时复制的页（write 为 true 时）都复制好，所以检查通过之后，
-/// 拿着锁再 copyToUser / copyFromUser 这个范围一定成功。
-/// 中途失败时，前面已经分配、复制好的页留着（内容没变）。
-pub fn checkUser(s: *Space, va: usize, len: usize, write: bool) error{BadAddress}!void {
-    if (len == 0) return;
-    const last = std.math.add(usize, va, len - 1) catch return error.BadAddress;
-    var addr = va;
-    while (true) {
-        _ = userPage(s, addr, write) orelse return error.BadAddress;
-        const next = std.mem.alignBackward(usize, addr, page.size) + page.size;
-        if (next > last) return;
-        addr = next;
-    }
-}
+// ---- 先准备好、再拿着锁复制：Pinned ----
+//
+// 系统调用常常要拿着锁读写用户内存：写串口拿着输出锁、读写管道拿着管道锁、读写文件拿着缓冲区的睡眠锁……
+// 拿着锁时不能缺页（可能要读盘、睡着等），所以要先把范围里的页都准备好，再拿锁复制。原来这是一条约定
+// （先 vm.prefault 或者 checkUser，再 copyFromUser），漏了的话只有那一页恰好还没读进来时才出错，测试很难撞到。
+// 现在拿着锁的复制只能通过 PinnedSrc / PinnedDst（copyFromUser 这些拿着锁调用会 panic）：它们只能由 pinSrc / pinDst 造出来，造的时候（不拿锁）
+// 把页都准备好；它们的复制不缺页、不会失败，不用 catch unreachable。
+//
+// 这成立的前提：准备好之后，只有这个进程自己会改它的地址空间（没有线程、不换出页），而它正在这个系统调用里。
+// 以后加了线程或者换页，pin 就要真的把页钉住（记一个引用，不许换出、不许 unmap）。
 
-/// 把 [va, va+len) 里来自程序文件、还没读进来的页都读进来（要读盘，调用方不能拿着锁）。
-/// 之后要拿着锁 copyFromUser / copyToUser 的系统调用先调用它（write 写管道、文件，readdir、wait）：
-/// 拿着锁时只能分配清零的页，读不了盘（见 canSleep）。尽力而为：读不了的页（坏地址、没内存）就停下，
-/// 之后复制到那里时照常失败。只看段里有文件内容的页，所以 len 再大也只走几页。
-pub fn prefault(s: *Space, va: usize, len: usize) void {
-    if (len == 0 or s.backing != .file) return;
-    const end = std.math.add(usize, va, len) catch std.math.maxInt(usize);
-    for (s.segments[0..s.nsegments]) |seg| {
-        const file_end = seg.start + std.mem.alignForward(usize, @intCast(seg.file_size), page.size);
-        var addr = @max(std.mem.alignBackward(usize, va, page.size), seg.start);
-        while (addr < @min(end, file_end)) : (addr += page.size) {
-            if (leafOf(s.root, addr) != null) continue;
-            fault(s, addr, .read, true) catch return;
+/// 一段准备好了、可以读的用户内存（pinSrc 给的）：拿着锁时用 copyIn 读它。
+pub const PinnedSrc = struct {
+    space: *Space,
+    va: usize,
+    len: usize,
+
+    /// 从这段的 off 处复制 dst.len 个字节到 dst。超出这段是内核的错。
+    pub fn copyIn(p: PinnedSrc, off: usize, dst: []u8) void {
+        std.debug.assert(off <= p.len and dst.len <= p.len - off);
+        var done: usize = 0;
+        while (done < dst.len) {
+            const va = p.va + off + done;
+            const pa = translateUser(p.space.root, va, false) orelse std.debug.panic("pinned page 0x{x} is gone", .{va});
+            const n = @min(dst.len - done, page.size - va % page.size);
+            @memcpy(dst[done..][0..n], @as([*]const u8, @ptrFromInt(pa))[0..n]);
+            done += n;
         }
     }
+
+    /// fs.write 的 in
+    pub fn get(p: PinnedSrc, at: usize, dst: []u8) error{}!void {
+        p.copyIn(at, dst);
+    }
+};
+
+/// 一段准备好了、可以写的用户内存（pinDst 给的，写时复制的页已经复制好了）：拿着锁时用 copyOut 写它。
+pub const PinnedDst = struct {
+    space: *Space,
+    va: usize,
+    len: usize,
+
+    /// 把 src 复制到这段的 off 处。超出这段是内核的错。
+    pub fn copyOut(p: PinnedDst, off: usize, src: []const u8) void {
+        std.debug.assert(off <= p.len and src.len <= p.len - off);
+        var done: usize = 0;
+        while (done < src.len) {
+            const va = p.va + off + done;
+            const pa = translateUser(p.space.root, va, true) orelse std.debug.panic("pinned page 0x{x} is gone", .{va});
+            const n = @min(src.len - done, page.size - va % page.size);
+            @memcpy(@as([*]u8, @ptrFromInt(pa))[0..n], src[done..][0..n]);
+            done += n;
+        }
+    }
+
+    /// fs.read 的 out
+    pub fn put(p: PinnedDst, at: usize, bytes: []const u8) error{}!void {
+        p.copyOut(at, bytes);
+    }
+};
+
+/// 准备好 [va, va+len) 从头开始、能准备好的最长的一段，返回它的长度：每一页都要 U 模式可读（write 为 true 时还要可写），
+/// 还没分配的页分配好、程序文件的页读进来、写时复制的页（write 为 true 时）复制好。碰到坏地址、没内存就停下。
+/// 前面已经准备好的页留着（内容没变）。可能读盘，不能拿着锁调用。
+fn prepare(s: *Space, va: usize, len: usize, write: bool) usize {
+    assertMaySleep("pin");
+    if (len == 0) return 0;
+    const end = std.math.add(usize, va, len) catch std.math.maxInt(usize);
+    var addr = va;
+    while (addr < end) {
+        _ = userPage(s, addr, write) orelse break;
+        addr = std.math.add(usize, std.mem.alignBackward(usize, addr, page.size), page.size) catch return end - va;
+    }
+    return @min(addr, end) - va;
+}
+
+/// 准备好整个 [va, va+len) 用来读，有一个字节不行就是 BadAddress（之后拿着锁读它一定成功）。
+pub fn pinSrc(s: *Space, va: usize, len: usize) error{BadAddress}!PinnedSrc {
+    if (prepare(s, va, len, false) < len) return error.BadAddress;
+    return .{ .space = s, .va = va, .len = len };
+}
+
+/// 和 pinSrc 一样，但只要开头能读的那一段（可能是 0 字节）：write 系统调用写串口、管道时遇到坏地址，
+/// 写出前面的部分、返回写了多少。
+pub fn pinSrcPrefix(s: *Space, va: usize, len: usize) PinnedSrc {
+    return .{ .space = s, .va = va, .len = prepare(s, va, len, false) };
+}
+
+/// 准备好整个 [va, va+len) 用来写，有一个字节不行就是 BadAddress。
+pub fn pinDst(s: *Space, va: usize, len: usize) error{BadAddress}!PinnedDst {
+    if (prepare(s, va, len, true) < len) return error.BadAddress;
+    return .{ .space = s, .va = va, .len = len };
 }
 
 /// 测试用的“物理内存”：页分配器管理这块数组，页表就建在里面。
@@ -700,7 +757,7 @@ test "copyFromUser 只读得到 U 模式可读的用户页，用户空间释放�
     try std.testing.expectEqual(before, page.freePages());
 }
 
-test "copyToUser 只写得进 U 模式可写的用户页，checkUser 检查整个范围" {
+test "copyToUser 只写得进 U 模式可写的用户页；pin 检查整个范围，之后 Pinned 的复制不会失败" {
     testInit();
     kernel_root = @ptrCast(try page.alloc());
     const before = page.freePages();
@@ -719,12 +776,23 @@ test "copyToUser 只写得进 U 模式可写的用户页，checkUser 检查整�
     try std.testing.expectError(error.BadAddress, copyToUser(&space, user_base + 2 * page.size, "a")); // 只读
     try std.testing.expectError(error.BadAddress, copyToUser(&space, user_base + 3 * page.size, "a")); // 没有映射
 
-    try checkUser(&space, user_base, 2 * page.size, true);
-    try checkUser(&space, user_base, 3 * page.size, false);
-    try checkUser(&space, 0, 0, true); // 长度为 0：不检查地址
-    try std.testing.expectError(error.BadAddress, checkUser(&space, user_base, 2 * page.size + 1, true));
-    try std.testing.expectError(error.BadAddress, checkUser(&space, user_base + 1, 3 * page.size, false));
-    try std.testing.expectError(error.BadAddress, checkUser(&space, user_base, std.math.maxInt(usize), false));
+    _ = try pinDst(&space, user_base, 2 * page.size);
+    _ = try pinSrc(&space, user_base, 3 * page.size);
+    _ = try pinDst(&space, 0, 0); // 长度为 0：不检查地址
+    try std.testing.expectError(error.BadAddress, pinDst(&space, user_base, 2 * page.size + 1));
+    try std.testing.expectError(error.BadAddress, pinSrc(&space, user_base + 1, 3 * page.size));
+    try std.testing.expectError(error.BadAddress, pinSrc(&space, user_base, std.math.maxInt(usize)));
+    // 只要开头能读的一段：前 3 页可读，第 4 页没有映射
+    try std.testing.expectEqual(3 * page.size - 10, pinSrcPrefix(&space, user_base + 10, 5 * page.size).len);
+    try std.testing.expectEqual(0, pinSrcPrefix(&space, user_base + 3 * page.size, 10).len);
+    try std.testing.expectEqual(0, pinSrcPrefix(&space, 0x8020_0000, 10).len);
+    try std.testing.expectEqual(page.size, pinSrcPrefix(&space, user_end - page.size, std.math.maxInt(usize)).len); // 溢出
+    // 拿着锁时用 Pinned 复制：不缺页、不会失败
+    const dst = try pinDst(&space, user_base + page.size - 2, 4);
+    dst.copyOut(0, "PQRS");
+    var got: [4]u8 = undefined;
+    (try pinSrc(&space, user_base + page.size - 2, 4)).copyIn(0, &got);
+    try std.testing.expectEqualStrings("PQRS", &got);
 }
 
 /// 按需分页测试用的程序镜像：第 i 个字节是 i % 251
@@ -773,11 +841,11 @@ test "按需分页：段、堆、栈的页第一次访问时才分配；段的�
     // 权限按区域：代码段不能写、数据段不能执行；没分配过的页也不会因为越权的访问被分配
     const pages = page.freePages();
     try std.testing.expectError(error.BadAddress, copyToUser(&s, user_base, "x"));
-    try std.testing.expectError(error.BadAddress, fault(&s, user_base, .write, true));
-    try std.testing.expectError(error.BadAddress, fault(&s, user_base + 2 * page.size, .exec, true));
+    try std.testing.expectError(error.BadAddress, fault(&s, user_base, .write));
+    try std.testing.expectError(error.BadAddress, fault(&s, user_base + 2 * page.size, .exec));
     try std.testing.expectEqual(pages, page.freePages());
-    try fault(&s, user_base, .exec, true);
-    try fault(&s, user_base, .exec, true); // 已经有了：什么都不做
+    try fault(&s, user_base, .exec);
+    try fault(&s, user_base, .exec); // 已经有了：什么都不做
     try std.testing.expectEqual(pages - 1, page.freePages());
 
     // 堆：brk 所在的那一页整页都能用，再往后不行；栈：[stack_limit, stack_top)，下面的保护页不行
@@ -786,19 +854,19 @@ test "按需分页：段、堆、栈的页第一次访问时才分配；段的�
     try copyToUser(&s, stack_top - 1, "s");
     try copyToUser(&s, stack_limit, "s");
     try std.testing.expectError(error.BadAddress, copyToUser(&s, stack_limit - 1, "s"));
-    try std.testing.expectError(error.BadAddress, fault(&s, heap_limit, .read, true));
-    try std.testing.expectError(error.BadAddress, fault(&s, user_base - 1, .read, true));
-    try std.testing.expectError(error.BadAddress, fault(&s, user_end, .read, true));
+    try std.testing.expectError(error.BadAddress, fault(&s, heap_limit, .read));
+    try std.testing.expectError(error.BadAddress, fault(&s, user_base - 1, .read));
+    try std.testing.expectError(error.BadAddress, fault(&s, user_end, .read));
 
-    // checkUser 也按需分配；整个范围都在区域里才通过
-    try checkUser(&s, s.heap_start, page.size, true);
-    try std.testing.expectError(error.BadAddress, checkUser(&s, s.heap_start, page.size + 1, false));
+    // pin 也按需分配；整个范围都在区域里才通过
+    _ = try pinDst(&s, s.heap_start, page.size);
+    try std.testing.expectError(error.BadAddress, pinSrc(&s, s.heap_start, page.size + 1));
 
     destroyUserSpace(&s);
     try std.testing.expectEqual(before, page.freePages());
 }
 
-test "按需分页：段不能重叠，最多 max_segments 个；程序文件的页拿着锁时读不了（WouldSleep），什么都不改" {
+test "按需分页：段不能重叠，最多 max_segments 个；程序文件的页读不出来时什么都不改" {
     testInit();
     kernel_root = @ptrCast(try page.alloc());
     const before = page.freePages();
@@ -808,14 +876,14 @@ test "按需分页：段不能重叠，最多 max_segments 个；程序文件的
     for (2..max_segments) |i| try s.addSegment(.{ .start = user_base + (10 + i) * page.size, .end = user_base + (11 + i) * page.size, .perm = rx, .file_off = 0, .file_size = 0 });
     try std.testing.expectError(error.TooMany, s.addSegment(.{ .start = user_base + 100 * page.size, .end = user_base + 101 * page.size, .perm = rx, .file_off = 0, .file_size = 0 }));
 
-    // 换成“文件系统里的程序文件”：要读盘的页，不能睡时不分配；堆、.bss 这些清零的页照常分配
+    // 换成“文件系统里的程序文件”：单元测试里没有挂载文件系统，读不出来，分配的页还回去；堆、.bss 这些清零的页照常分配
     s.backing = .{ .file = 1234 };
     const pages = page.freePages();
-    try std.testing.expectError(error.WouldSleep, fault(&s, user_base, .read, false));
+    try std.testing.expectError(error.IoError, fault(&s, user_base, .read));
     try std.testing.expectEqual(pages, page.freePages());
     var buf: [4]u8 = undefined;
-    try std.testing.expectError(error.BadAddress, copyFromUser(&s, &buf, user_base)); // 单元测试里不能睡
-    try fault(&s, user_base + 3 * page.size, .write, false); // .bss
+    try std.testing.expectError(error.BadAddress, copyFromUser(&s, &buf, user_base));
+    try fault(&s, user_base + 3 * page.size, .write); // .bss
     try copyToUser(&s, s.heap_start, "heap");
     s.backing = .none; // 没有真的占用程序文件
     destroyUserSpace(&s);
@@ -865,8 +933,8 @@ test "cloneUserSpace 写时复制：只建页表、共用页；谁先写谁复�
     try std.testing.expectError(error.NotCow, breakCow(dst.root, user_base + 2 * page.size));
     try std.testing.expectError(error.NotCow, breakCow(dst.root, user_base)); // 已经复制过了
     try std.testing.expectError(error.BadAddress, copyFromUser(&dst, &buf, user_base + 2 * page.size));
-    // checkUser 检查可写时把 cow 页复制好
-    try checkUser(&dst, user_end - page.size, page.size, true);
+    // pinDst 把 cow 页复制好
+    _ = try pinDst(&dst, user_end - page.size, page.size);
     try std.testing.expect(leafOf(dst.root, user_end - page.size).?.w);
     try std.testing.expect(leafOf(src.root, user_end - page.size).?.cow);
 
@@ -929,10 +997,10 @@ test "cloneUserSpace、写时复制内存不够时不漏页，什么都不坏" {
     for (0..4) |_| page.free(@ptrCast(@alignCast(hoard.popFirst().?)));
     var dst = try cloneUserSpace(&src);
     try std.testing.expectEqual(0, page.freePages());
-    try std.testing.expectError(error.CowOutOfMemory, fault(&dst, user_base + page.size, .write, true));
+    try std.testing.expectError(error.CowOutOfMemory, fault(&dst, user_base + page.size, .write));
     try std.testing.expectError(error.OutOfMemory, breakCow(dst.root, user_base + page.size));
     try std.testing.expectError(error.BadAddress, copyToUser(&dst, user_base + page.size, "x"));
-    try std.testing.expectError(error.BadAddress, checkUser(&dst, user_base, 2 * page.size, true));
+    try std.testing.expectError(error.BadAddress, pinDst(&dst, user_base, 2 * page.size));
     try std.testing.expect(leafOf(dst.root, user_base + page.size).?.cow);
     try std.testing.expectEqual(leafOf(src.root, user_base + page.size).?.ppn, leafOf(dst.root, user_base + page.size).?.ppn);
     destroyUserSpace(&dst);
@@ -975,11 +1043,11 @@ test "按需分配的堆：shrinkUser 只释放分配过的页和空出来的页
     s.brk = heap + 10 * page.size;
     var hoard: std.SinglyLinkedList = .{};
     while (page.freePages() > 0) hoard.prepend(@ptrCast(try page.alloc()));
-    try std.testing.expectError(error.OutOfMemory, fault(&s, heap, .write, true));
+    try std.testing.expectError(error.OutOfMemory, fault(&s, heap, .write));
     try std.testing.expectError(error.BadAddress, copyToUser(&s, heap, "z"));
     page.free(@ptrCast(@alignCast(hoard.popFirst().?)));
     // 只剩一页：页分到了，装它的第 0 级页表分不到，这一页也要还回去
-    try std.testing.expectError(error.OutOfMemory, fault(&s, heap, .write, true));
+    try std.testing.expectError(error.OutOfMemory, fault(&s, heap, .write));
     try std.testing.expectEqual(1, page.freePages());
     while (hoard.popFirst()) |n| page.free(@ptrCast(@alignCast(n)));
     destroyUserSpace(&s);

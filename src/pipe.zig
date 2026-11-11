@@ -32,7 +32,7 @@ comptime {
     std.debug.assert(@sizeOf(Pipe) <= page.size);
 }
 
-pub const Error = error{ BadAddress, BrokenPipe };
+pub const Error = error{BrokenPipe};
 
 pub fn create() error{OutOfMemory}!*Pipe {
     const p: *Pipe = @ptrCast(try page.alloc());
@@ -56,10 +56,11 @@ pub fn close(p: *Pipe, writable: bool) void {
     if (unused) page.free(@ptrCast(@alignCast(p)));
 }
 
-/// 把用户地址空间 space 里 [ptr, ptr+len) 的字节写进管道，写满了就等。返回写进去的字节数：
-/// 正常情况下是 len；中途读端关了、遇到坏地址、被 kill 了，返回已经写进去的字节数
-/// （一个字节都没写进去时返回对应的错误，被 kill 时返回 0）。
-pub fn write(p: *Pipe, space: *vm.Space, ptr: usize, len: usize) Error!usize {
+/// 把用户内存 src（pin 好的：拿着管道锁复制，不能缺页）写进管道，写满了就等。返回写进去的字节数：
+/// 正常情况下是 src.len；中途读端关了、被 kill 了，返回已经写进去的字节数
+/// （一个字节都没写进去时读端关了是 BrokenPipe，被 kill 是 0）。
+pub fn write(p: *Pipe, src: vm.PinnedSrc) Error!usize {
+    const len = src.len;
     p.lock.acquire();
     defer p.lock.release();
     var done: usize = 0;
@@ -74,21 +75,20 @@ pub fn write(p: *Pipe, space: *vm.Space, ptr: usize, len: usize) Error!usize {
             proc.sleep(&p.nwrite, &p.lock);
             continue;
         }
-        // 一次复制一段：不超过缓冲区的空位、不越过缓冲区末尾（环形）、不跨用户页
-        // （跨页的话，一段复制失败时说不清前面写进去了多少）
-        const va = ptr + done;
+        // 一次复制一段：不超过缓冲区的空位、不越过缓冲区末尾（环形）
         const start = p.nwrite % size;
-        const n = @min(len - done, size - (p.nwrite - p.nread), size - start, page.size - va % page.size);
-        vm.copyFromUser(space, p.data[start..][0..n], va) catch return if (done == 0) error.BadAddress else done;
+        const n = @min(len - done, size - (p.nwrite - p.nread), size - start);
+        src.copyIn(done, p.data[start..][0..n]);
         p.nwrite += n;
         done += n;
     }
     return done;
 }
 
-/// 从管道读最多 len 个字节到用户地址空间 space 的 ptr。缓冲区空着、写端还开着时等；
-/// 有多少读多少，不等凑满 len。返回 0 表示读到结尾（或者被 kill 了）。
-pub fn read(p: *Pipe, space: *vm.Space, ptr: usize, len: usize) Error!usize {
+/// 从管道读最多 dst.len 个字节到用户内存 dst（pin 好的）。缓冲区空着、写端还开着时等；
+/// 有多少读多少，不等凑满。返回 0 表示读到结尾（或者被 kill 了）。
+pub fn read(p: *Pipe, dst: vm.PinnedDst) Error!usize {
+    const len = dst.len;
     p.lock.acquire();
     defer p.lock.release();
     while (p.nread == p.nwrite and p.write_open) {
@@ -100,8 +100,7 @@ pub fn read(p: *Pipe, space: *vm.Space, ptr: usize, len: usize) Error!usize {
     while (done < len and p.nread != p.nwrite) {
         const start = p.nread % size;
         const n = @min(len - done, p.nwrite - p.nread, size - start);
-        // 复制成功了才算读走：失败的这一段留在管道里
-        vm.copyToUser(space, ptr + done, p.data[start..][0..n]) catch return if (done == 0) error.BadAddress else done;
+        dst.copyOut(done, p.data[start..][0..n]);
         p.nread += n;
         done += n;
     }
@@ -122,35 +121,42 @@ test "管道：环形缓冲区回绕、读到结尾、读端关了写返回 Brok
     const buf = try vm.allocUserPage(space.root, vm.user_base, .{ .r = true, .w = true });
     const before = page.freePages();
 
+    // 测试里拿用户地址空间的第一页当缓冲区，src/dst 是 pin 好的一段
+    const Range = struct {
+        space: *vm.Space,
+        fn src(r: @This(), off: usize, len: usize) vm.PinnedSrc {
+            return vm.pinSrc(r.space, vm.user_base + off, len) catch unreachable;
+        }
+        fn dst(r: @This(), off: usize, len: usize) vm.PinnedDst {
+            return vm.pinDst(r.space, vm.user_base + off, len) catch unreachable;
+        }
+    };
+    const u: Range = .{ .space = space };
+
     const p = try create();
     // 写 1500 字节、读 1000 字节，再写 1500 字节：第二次写越过了缓冲区末尾
     for (buf[0..1500], 0..) |*b, i| b.* = @truncate(i);
-    try expectEqual(1500, try write(p, space, vm.user_base, 1500));
-    try expectEqual(1000, try read(p, space, vm.user_base + 2000, 1000));
-    try expectEqual(1500, try write(p, space, vm.user_base, 1500));
+    try expectEqual(1500, try write(p, u.src(0, 1500)));
+    try expectEqual(1000, try read(p, u.dst(2000, 1000)));
+    try expectEqual(1500, try write(p, u.src(0, 1500)));
     try expectEqual(2000, p.nwrite - p.nread);
-    // 有多少读多少：剩下的 500 + 1500 字节，要 3000 也只给 2000
-    try expectEqual(2000, try read(p, space, vm.user_base + 2000, 2000 + 1000));
+    // 有多少读多少：剩下的 500 + 1500 字节，要 2096 也只给 2000
+    try expectEqual(2000, try read(p, u.dst(2000, 2096)));
     try std.testing.expectEqualSlices(u8, buf[1000..1500], buf[2000..2500]);
     try std.testing.expectEqualSlices(u8, buf[0..1500], buf[2500..4000]);
 
-    // 坏地址：一个字节都没读写，返回 BadAddress，管道里的数据不动
-    try expectEqual(error.BadAddress, write(p, space, vm.user_base + page.size, 10));
-    try expectEqual(10, try write(p, space, vm.user_base, 10));
-    try expectEqual(error.BadAddress, read(p, space, 0x8020_0000, 10));
-    try expectEqual(10, p.nwrite - p.nread);
-
     // 写端关了：先读完剩下的，再读到结尾
+    try expectEqual(10, try write(p, u.src(0, 10)));
     close(p, true);
-    try expectEqual(10, try read(p, space, vm.user_base, 100));
-    try expectEqual(0, try read(p, space, vm.user_base, 100));
+    try expectEqual(10, try read(p, u.dst(0, 100)));
+    try expectEqual(0, try read(p, u.dst(0, 100)));
     close(p, false);
     try expectEqual(before, page.freePages());
 
     // 读端关了，写返回 BrokenPipe
     const q = try create();
     close(q, false);
-    try expectEqual(error.BrokenPipe, write(q, space, vm.user_base, 1));
+    try expectEqual(error.BrokenPipe, write(q, u.src(0, 1)));
     close(q, true);
     try expectEqual(before, page.freePages());
     vm.destroyUserSpace(space);

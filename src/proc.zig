@@ -690,25 +690,22 @@ fn reparent(p: *Process, init: *Process) void {
     }
 }
 
-pub const WaitError = error{ NoChildren, BadAddress };
+pub const WaitError = error{NoChildren};
 
 /// 等一个子进程结束并回收它（对应 xv6 的 wait），返回它的 pid。pid 为 abi.wait_any 时等任意一个子进程，
-/// 否则只等这一个。status_ptr 不为 0 时先把结束状态写进当前进程的这个地址，写不进去就返回 BadAddress，
-/// 不回收（子进程还在，可以再 wait 一次）。
+/// 否则只等这一个。status 不为 null 时把结束状态写进去（用户内存，调用方 pin 好的：写不进去的地址在 pin 时就是
+/// EFAULT，那时还没回收，子进程还在，可以再 wait 一次）。
 /// 有子进程但都还没结束时，拿着 wait_lock 睡在自己身上，等子进程的 finish 叫醒；nohang 时不等，返回 null。
 /// 被 kill 了也返回 null，回到陷阱处理程序后结束。
-pub fn wait(pid: usize, nohang: bool, status_ptr: usize) WaitError!?usize {
+pub fn wait(pid: usize, nohang: bool, status: ?vm.PinnedDst) WaitError!?usize {
     const p = current().?;
-    // 结束状态是拿着锁写进去的：status_ptr 在程序文件的页里、还没读进来的话，先读好（vm.prefault）
-    vm.prefault(&p.space, status_ptr, @sizeOf(u32));
     wait_lock.acquire();
     defer wait_lock.release();
     while (true) {
         if (try findZombieChild(p, pid)) |c| {
             defer c.lock.release();
-            if (status_ptr != 0) {
-                vm.copyToUser(&p.space, status_ptr, std.mem.asBytes(&c.xstatus)) catch return error.BadAddress;
-            }
+            // 拿着锁写进用户内存，所以 status 是调用方 pin 好的
+            if (status) |dst| dst.copyOut(0, std.mem.asBytes(&c.xstatus));
             const child_pid = c.pid;
             reap(c);
             return child_pid;

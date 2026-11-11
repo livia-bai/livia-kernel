@@ -767,10 +767,10 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
   | `cond` | `timer.lock`、`Pipe.lock`、`uart.rx_lock`、`virtio_disk.lock`、`bio.evict_lock`、`Volume.snap_lock`、`Sleeplock.lk` | 保护等待条件的锁：`sleep` 拿着它去拿进程锁，改条件的一方拿着它调用 `wakeup`、`isKilled`（拿进程锁）。它们之间不嵌套 |
   | `bucket` | `bio` 的桶的锁 | `evict_lock`（`cond`）之后拿；`takeOldest` 同时拿两个桶，所以这一级允许同时拿几把：只有拿着 `evict_lock` 的才这样做，不会互相等 |
   | `proc` | `Process.lock` | 一次只拿一个进程的锁（`sleep` 里交接时拿着自己的进程锁和条件的锁，两者不同级） |
-  | `uart_out` | `uart.tx_lock` | 拿着它打印；`consoleWrite` 拿着它复制用户内存，缺页时要分配页，所以比叶子低 |
+  | `uart_out` | `uart.tx_lock` | 拿着进程锁、条件的锁时都可能打印，所以比它们高；打印时不再拿别的锁 |
   | `leaf` | `page.Pool.lock`、`File.lock`、`fsys.text_lock` | 拿着它们不再拿别的锁。`fork` 拿着 `wait_lock` 和子进程的锁调用 `file.dup`，`reap` 拿着锁释放页 |
 
-  只有 `bucket` 一级允许同时拿几把；别的同一级的锁不嵌套：`file.close` 先放开 `File.lock` 再去关管道，页分配器从别的 hart 拿页（`steal`）时先放开别人的链表的锁再拿自己的，`file.alloc` 一个槽位一个槽位地拿锁。按需分页让条件的锁、串口输出锁之后会拿页分配器的锁：拿着它们替用户程序复制内存（`copyFromUser`、`copyToUser`）时，碰到还没分配的页就地分配一页清零的页（[paging.md](paging.md#内核访问用户内存)）。
+  只有 `bucket` 一级允许同时拿几把；别的同一级的锁不嵌套：`file.close` 先放开 `File.lock` 再去关管道，页分配器从别的 hart 拿页（`steal`）时先放开别人的链表的锁再拿自己的，`file.alloc` 一个槽位一个槽位地拿锁。拿着锁复制用户内存的地方都先 pin 好（[paging.md](paging.md#内核访问用户内存)），拿着锁时不会再缺页、分配页。
 
   每个 hart 记着自己拿着哪些锁（`held[hart.id()]`，按拿的顺序，最多 16 把），`acquire` 拿它和要拿的锁比等级，`release` 把锁从里面去掉（放的顺序不一定和拿的相反：`sleep` 先拿进程锁、再放条件的锁）。原来顺序只写在文档里，违反了的代码大多数时候不会死锁，要两个 hart 恰好交叉才会；现在一次正常的运行就能发现。整个 QEMU 测试跑下来没有违反的地方。
 
