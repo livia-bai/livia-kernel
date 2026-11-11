@@ -135,7 +135,8 @@ while (used_idx != used.idx) {
 ```zig
 pub const Sleeplock = struct {
     name: []const u8,
-    lk: Spinlock,                  // 保护 locked、holder
+    rank: Rank,                    // 等级：file_pos、fs_write、buf，检查加锁顺序
+    lk: Spinlock,                  // 保护 locked、holder（等级 cond）
     locked: bool = false,
     holder: ?*proc.Process = null, // 拿着它的进程
     pub fn acquire(l: *Sleeplock) void
@@ -147,11 +148,12 @@ pub const Sleeplock = struct {
 和 xv6 的一样：`acquire` 拿着 `lk` 检查 `locked`，被别人拿着就 `proc.sleep(l, &lk)` 睡下，`release` 清掉 `locked` 再 `wakeup(l)`。和自旋锁的区别：
 
 - **等锁时睡着**，不占 CPU 空转。拿着锁的进程可能正在等磁盘，拿着自旋锁等的话，别的 hart 上要同一把锁的进程都得陪着转。
-- **拿着它可以睡觉**（等磁盘、等别的睡眠锁）。自旋锁不行：`sched` 只允许拿着自己的进程锁。反过来，拿睡眠锁之前不能拿着自旋锁。
+- **拿着它可以睡觉**（等磁盘、等别的睡眠锁）。自旋锁不行：`sched` 只允许拿着自己的进程锁。反过来，拿睡眠锁之前不能拿着自旋锁（`acquire` 一开始就检查，原来要等到真的睡下、`sched` 发现时才 panic）。
+- **有等级**（`Rank`）：`file_pos` → `fs_write` → `buf`，只能从低往高拿，`buf` 可以同时拿几把（[process.md](process.md#锁)）。
 - **只有进程能拿**：要能睡下。调度器、`kmain`、中断处理程序都不能拿，所以磁盘也只能由进程读写（`kmain` 不读盘）。
 - 记下的是拿着它的进程（`holder`，指针），不是 pid：读 pid 要拿进程锁。
 - 自己再拿一次是死锁，直接 panic（`acquire: sleeplock buf is already held by this process`）；放开不是自己拿的锁也 panic。
-- **回到 U 模式时不能拿着睡眠锁**：每个进程记着自己拿着几把（`Process.sleeplocks`，只有自己改，不用加锁），`handleTrap` 末尾和 `forkretC` 检查它是 0（`proc.assertNoLocksHeld`，和检查自旋锁放在一起）。
+- **回到 U 模式时不能拿着睡眠锁**：每个进程记着自己拿着每一级的几把（`Process.sleeplocks`，只有自己改，不用加锁），`handleTrap` 末尾和 `forkretC` 检查它们都是 0（`proc.assertNoLocksHeld`，和检查自旋锁放在一起）。
 
 ## 缓冲区缓存（`bio.zig`）
 

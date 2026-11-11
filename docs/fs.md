@@ -107,7 +107,7 @@ pub fn run(fs: *Fs, comptime op: anytype, args: anytype) Error!...
 var vol: ctree.Volume = .{};   // 唯一的一个卷
 var root: fs.Fs = undefined;   // 挂载好的文件系统（修改的一方用）
 pub var mounted = false;
-var write_lock: Sleeplock = .init("fs write");
+var write_lock: Sleeplock = .init("fs write", .fs_write);
 pub var raw_base: u64 = 0;     // 原始区域：文件系统之后的块
 pub var raw_count: u64 = 0;
 
@@ -190,7 +190,7 @@ pub fn readText(ino: u64, off: u64, dst: []u8) error{IoError}!void
 **记账**（`fsys.zig` 末尾）：
 
 ```zig
-var text_lock: Spinlock = .init("fs text");                   // 叶子锁
+var text_lock: Spinlock = .init("fs text", .leaf);                   // 叶子锁
 var texts: [2 * abi.max_procs]struct { ino: u64 = 0, refs: u32 = 0 } = @splat(.{});
 var modifying: u64 = 0;                                       // 修改的一方正在改的 inode
 ```

@@ -50,6 +50,7 @@ const fsys = @import("fsys.zig");
 const canary = @import("canary.zig");
 const kstack = @import("kstack.zig");
 const kstat = @import("kstat.zig");
+const sleeplock = @import("sleeplock.zig");
 const Spinlock = spinlock.Spinlock;
 
 /// 内核里只嵌着 init（见 build.zig）：第一个进程要在挂载文件系统之前加载。别的程序都从文件系统的 /bin 加载（exec）。
@@ -79,7 +80,7 @@ pub const State = abi.ProcState;
 
 pub const Process = struct {
     /// 保护下面标着“lock”的字段。槽位一直在，锁也一直在：回收时不能连锁一起清掉（见 fill）
-    lock: Spinlock = .init("proc"),
+    lock: Spinlock = .init("proc", .proc),
     /// lock
     state: State = .unused,
     /// lock。state 为 running 时，它在哪个 hart 上运行（kill 要给那个 hart 发核间中断）
@@ -104,8 +105,8 @@ pub const Process = struct {
     ticks: u64 = 0,
     /// 打开的文件，下标就是 fd
     files: [abi.max_fds]?*file.File = @splat(null),
-    /// 拿着几把睡眠锁（sleeplock.zig）。只有自己改；回到 U 模式时必须是 0
-    sleeplocks: u32 = 0,
+    /// 拿着每一级的睡眠锁各几把（sleeplock.zig，检查加锁顺序）。只有自己改；回到 U 模式时必须都是 0
+    sleeplocks: sleeplock.Held = .{},
     /// 当前目录的 inode 号，相对路径从这里开始找。fork 继承，exec 不变；只有自己读写
     cwd: u64 = fs.root_ino,
 };
@@ -114,7 +115,7 @@ pub const Process = struct {
 pub var table: [max_procs]Process = @splat(.{});
 
 /// 保护所有进程的 parent 字段（xv6 的 wait_lock）。见文件开头的加锁顺序。
-var wait_lock: Spinlock = .init("wait");
+var wait_lock: Spinlock = .init("wait", .wait);
 
 /// 每个 hart 自己的状态（xv6 的 struct cpu），按 hart 编号下标。只有这个 hart 自己读写自己那一项。
 const Cpu = struct {
@@ -464,21 +465,20 @@ fn forkretC() callconv(.c) void {
 /// 回到 U 模式之前调用：这时不能拿着任何自旋锁，当前进程也不能拿着睡眠锁。
 pub fn assertNoLocksHeld() void {
     spinlock.assertNoneHeld();
-    const n = current().?.sleeplocks;
+    const n = current().?.sleeplocks.total();
     if (n != 0) std.debug.panic("{d} sleeplock(s) still held", .{n});
 }
 
 /// 当前进程拿着几把睡眠锁，没有当前进程（单元测试、调度器）时是 0。vm 按需分页时用它判断能不能读盘。
 pub fn sleeplocksHeld() u32 {
     const p = current() orelse return 0;
-    return p.sleeplocks;
+    return p.sleeplocks.total();
 }
 
-/// 当前进程拿着的睡眠锁多了（delta = 1）或者少了（-1）一把。由 sleeplock.zig 调用；
-/// 单元测试里没有当前进程，什么也不做。
-pub fn countSleeplock(delta: i2) void {
-    const p = current() orelse return;
-    if (delta > 0) p.sleeplocks += 1 else p.sleeplocks -= 1;
+/// 当前进程拿着的睡眠锁（sleeplock.zig 拿、放时记下来，检查顺序）。单元测试里没有当前进程，是 null。
+pub fn heldSleeplocks() ?*sleeplock.Held {
+    const p = current() orelse return null;
+    return &p.sleeplocks;
 }
 
 /// 调度器（对应 xv6 的 scheduler()）。每个 hart 初始化完之后调用，在这个 hart 的启动栈 boot_stack 上永远循环
@@ -1199,11 +1199,11 @@ test "wait 只找自己的子进程，按 pid 挑；子进程结束时交给 ini
 }
 
 test "fill 换掉除了锁以外的所有字段" {
-    var p: Process = .{ .state = .zombie, .pid = 7, .name = .init("x"), .ticks = 3, .sleeplocks = 2 };
+    var p: Process = .{ .state = .zombie, .pid = 7, .name = .init("x"), .ticks = 3, .sleeplocks = .{ .counts = .{ 0, 1, 2 } } };
     p.lock.acquire();
     fill(&p, .{});
     try std.testing.expect(p.lock.holding());
     try std.testing.expectEqual(.unused, p.state);
-    try std.testing.expectEqual(0, p.pid + p.ticks + p.sleeplocks);
+    try std.testing.expectEqual(0, p.pid + p.ticks + p.sleeplocks.total());
     p.lock.release();
 }

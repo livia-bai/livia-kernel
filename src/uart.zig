@@ -47,7 +47,7 @@ fn putc(c: u8) void {
 }
 
 /// 保护输出：拿着它输出的一段不会和别的 hart 的输出交错。
-var tx_lock: Spinlock = .init("uart tx");
+var tx_lock: Spinlock = .init("uart tx", .uart_out);
 
 /// 拿着输出锁的一段输出，由 lockOutput 开始，unlock 结束。
 pub const Output = struct {
@@ -94,7 +94,7 @@ pub const rx_capacity = rx_buf.len - 1;
 
 /// 保护接收缓冲区。中断处理程序也要拿它：拿着它的代码都关着中断，同一个 hart 上不会被中断打断，
 /// 所以不会自己等自己；多核时串口中断可能在另一个 hart 上处理。
-pub var rx_lock: Spinlock = .init("uart rx");
+pub var rx_lock: Spinlock = .init("uart rx", .cond);
 
 /// 等键盘输入的进程睡在这个通道上，收到字符后陷阱处理程序用它 proc.wakeup。
 pub const rx_chan: *const anyopaque = &rx_buf;

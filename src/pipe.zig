@@ -19,7 +19,7 @@ const Spinlock = @import("spinlock.zig").Spinlock;
 pub const size = 2048;
 
 pub const Pipe = struct {
-    lock: Spinlock = .init("pipe"),
+    lock: Spinlock = .init("pipe", .cond),
     nread: usize = 0,
     nwrite: usize = 0,
     /// 读端、写端是否还开着（对应的 File 的引用数还没减到 0）

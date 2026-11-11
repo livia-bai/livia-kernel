@@ -7,7 +7,9 @@
 //! - 不能拿着锁回到 U 模式。切换进程（sched）时只能拿着这个进程自己的锁（proc.zig），别的锁都要先放开；
 //!   要拿着锁等待的，用 proc.sleep(chan, lock)：它在睡下之后放开锁，醒来再重新拿上。
 //! - 同一个 hart 重复拿同一把锁是死锁，直接 panic。
-//! - 要同时拿几把锁时按固定的顺序拿，见 docs/process.md 的“锁”一节。
+//! - **加锁顺序由等级（Rank）检查**：每把锁在创建时给一个等级，拿一把锁时，这个 hart 已经拿着的锁的等级都必须更低
+//!   （只有 bucket 这一级允许同时拿几把，见 Rank）。违反了就 panic，说出是哪两把锁。所以一次正常的运行就能发现
+//!   顺序错误，不用等两个 hart 恰好交叉、真的死锁。等级怎么分、为什么这样分见 docs/process.md 的“锁”一节。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,23 +19,58 @@ const kstat = @import("kstat.zig");
 
 const no_hart = std.math.maxInt(usize);
 
-/// 每个 hart 拿着几把锁。只有这个 hart 自己读写自己那一项。
-var held: [hart.max]usize = @splat(0);
+/// 锁的等级，从低到高。拿着一把锁时只能再拿等级更高的锁。
+pub const Rank = enum(u8) {
+    /// proc.wait_lock：父子关系。它在最前面：拿着它要看、要改各个进程（进程锁），还要叫醒父进程
+    wait,
+    /// 保护某个等待条件、拿着它 proc.sleep / proc.wakeup 的锁：管道、timer.lock、uart.rx_lock、virtio_disk.lock、
+    /// bio.evict_lock、Volume.snap_lock、睡眠锁里的自旋锁。sleep 拿着它再拿进程锁，wakeup 拿着它扫进程锁，
+    /// 所以都比进程锁低；它们之间不嵌套
+    cond,
+    /// bio 的桶。换块的一方拿着 evict_lock（cond）找最久没用的缓冲区时，会同时拿着两个桶的锁：
+    /// 只有拿着 evict_lock 的才这样做，所以同一等级拿几把也不会互相等
+    bucket,
+    /// 每个进程的锁
+    proc,
+    /// 串口的输出锁：consoleWrite 拿着它从用户内存复制（缺页时要分配页），所以比页分配器低
+    uart_out,
+    /// 叶子锁：拿着它们不再拿别的锁。页分配器（每个 hart 一把）、File.lock、fsys.text_lock
+    leaf,
+
+    /// 同一等级的锁能不能同时拿几把
+    fn nests(r: Rank) bool {
+        return r == .bucket;
+    }
+};
+
+/// 一个 hart 同时最多拿几把锁（wait_lock、进程锁、叶子锁……实际最深五六把）
+const max_held = 16;
+
+/// 每个 hart 拿着的锁，按拿的顺序。只有这个 hart 自己读写自己那一项
+const Held = struct {
+    locks: [max_held]*Spinlock = undefined,
+    n: usize = 0,
+};
+var held: [hart.max]Held = @splat(.{});
 
 pub const Spinlock = struct {
     /// 调试用的名字，panic 信息里会打印
     name: []const u8,
+    rank: Rank,
     locked: std.atomic.Value(bool) = .init(false),
     /// 拿着锁的 hart，用来发现重复加锁。只在拿着锁时写，所以不用原子操作
     hart: usize = no_hart,
 
-    pub fn init(name: []const u8) Spinlock {
-        return .{ .name = name };
+    pub fn init(name: []const u8, rank: Rank) Spinlock {
+        return .{ .name = name, .rank = rank };
     }
 
     pub fn acquire(l: *Spinlock) void {
         assertInterruptsOff();
         if (l.holding()) std.debug.panic("acquire: lock {s} is already held by this hart", .{l.name});
+        if (orderViolation(l)) |other| std.debug.panic("lock order: acquiring {s} ({s}) while holding {s} ({s})", .{
+            l.name, @tagName(l.rank), other.name, @tagName(other.rank),
+        });
         // amoswap.w.aq：换进 true，换出来的是 false 才算拿到。acquire 语义保证临界区里的访存
         // 不会被提前到拿到锁之前。等锁时顺便看看是不是有别的 hart 在 panic：
         // 锁可能在已经停下的 hart 手里，永远等不到
@@ -45,13 +82,16 @@ pub const Spinlock = struct {
             }
         }
         l.hart = hart.id();
-        held[hart.id()] += 1;
+        const h = &held[hart.id()];
+        if (h.n == max_held) @panic("acquire: too many spinlocks held");
+        h.locks[h.n] = l;
+        h.n += 1;
     }
 
     pub fn release(l: *Spinlock) void {
         if (!l.holding()) std.debug.panic("release: lock {s} is not held by this hart", .{l.name});
         l.hart = no_hart;
-        held[hart.id()] -= 1;
+        forget(l);
         // release 语义保证临界区里的访存都在放开锁之前完成
         l.locked.store(false, .release);
     }
@@ -63,14 +103,41 @@ pub const Spinlock = struct {
     }
 };
 
+/// 拿 l 会违反加锁顺序的话，返回当前 hart 拿着的、挡住它的那把锁（等级不比 l 低）。
+fn orderViolation(l: *const Spinlock) ?*Spinlock {
+    const h = &held[hart.id()];
+    for (h.locks[0..h.n]) |other| {
+        const o = @backingInt(other.rank);
+        const r = @backingInt(l.rank);
+        if (o > r or (o == r and !l.rank.nests())) return other;
+    }
+    return null;
+}
+
+/// 从这个 hart 拿着的锁里去掉 l。放锁的顺序不一定和拿的相反（sleep 先拿进程锁、再放条件的锁），从后往前找。
+fn forget(l: *Spinlock) void {
+    const h = &held[hart.id()];
+    var i = h.n;
+    while (i > 0) {
+        i -= 1;
+        if (h.locks[i] == l) {
+            std.mem.copyForwards(*Spinlock, h.locks[i .. h.n - 1], h.locks[i + 1 .. h.n]);
+            h.n -= 1;
+            return;
+        }
+    }
+    unreachable; // holding() 说拿着
+}
+
 /// 当前 hart 拿着几把锁。
 pub fn heldCount() usize {
-    return held[hart.id()];
+    return held[hart.id()].n;
 }
 
 /// 回到 U 模式之前调用：这时不能拿着任何锁。
 pub fn assertNoneHeld() void {
-    if (heldCount() != 0) std.debug.panic("{d} spinlock(s) still held", .{heldCount()});
+    const h = &held[hart.id()];
+    if (h.n != 0) std.debug.panic("{d} spinlock(s) still held, the first is {s}", .{ h.n, h.locks[0].name });
 }
 
 fn assertInterruptsOff() void {
@@ -81,15 +148,43 @@ fn assertInterruptsOff() void {
 }
 
 test "拿锁、放锁，记录拿着几把锁" {
-    var a = Spinlock.init("a");
-    var b = Spinlock.init("b");
+    var a = Spinlock.init("a", .cond);
+    var b = Spinlock.init("b", .leaf);
     const before = heldCount();
     a.acquire();
     b.acquire();
     try std.testing.expect(a.holding() and b.holding());
     try std.testing.expectEqual(before + 2, heldCount());
-    b.release();
+    // 不按相反的顺序放也行
     a.release();
-    try std.testing.expect(!a.holding());
+    try std.testing.expect(!a.holding() and b.holding());
+    b.release();
     try std.testing.expectEqual(before, heldCount());
+}
+
+test "加锁顺序：只能往更高的等级拿；同一等级只有 bucket 能拿几把" {
+    var wait = Spinlock.init("wait", .wait);
+    var cond = Spinlock.init("cond", .cond);
+    var proc = Spinlock.init("proc", .proc);
+    var proc2 = Spinlock.init("proc2", .proc);
+    var b1 = Spinlock.init("b1", .bucket);
+    var b2 = Spinlock.init("b2", .bucket);
+
+    wait.acquire();
+    proc.acquire();
+    try std.testing.expectEqual(&proc, orderViolation(&cond).?); // cond 比 proc 低
+    try std.testing.expectEqual(&proc, orderViolation(&proc2).?); // 两把进程锁
+    try std.testing.expectEqual(null, orderViolation(&Spinlock.init("leaf", .leaf)));
+    proc.release();
+    try std.testing.expectEqual(null, orderViolation(&cond));
+    cond.acquire();
+    b1.acquire();
+    try std.testing.expectEqual(null, orderViolation(&b2)); // bucket 可以同时拿两把
+    b2.acquire();
+    var cond2 = Spinlock.init("cond2", .cond);
+    try std.testing.expectEqual(&cond, orderViolation(&cond2).?); // 挡住它的第一把
+    b2.release();
+    b1.release();
+    cond.release();
+    wait.release();
 }

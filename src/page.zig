@@ -22,7 +22,7 @@ pub const Page = [size]u8;
 /// 一个 hart 的空闲页
 const Pool = struct {
     /// 保护 list 和 count。分配、释放拿自己的，steal 拿别人的；一次只拿一把
-    lock: Spinlock = .init("page"),
+    lock: Spinlock = .init("page", .leaf),
     list: std.SinglyLinkedList = .{},
     count: usize = 0,
 };

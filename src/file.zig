@@ -35,7 +35,7 @@ pub const Kind = enum { none, console, pipe, inode, device };
 
 pub const File = struct {
     /// 保护 ref
-    lock: Spinlock = .init("file"),
+    lock: Spinlock = .init("file", .leaf),
     /// 引用数：有多少个 fd 指向它。为 0 表示这个槽位空着
     ref: u32 = 0,
     kind: Kind = .none,
@@ -50,7 +50,7 @@ pub const File = struct {
     /// open_append：每次写之前先把 off 挪到文件末尾
     append: bool = false,
     /// 保护 off，见文件开头
-    pos_lock: Sleeplock = .init("file pos"),
+    pos_lock: Sleeplock = .init("file pos", .file_pos),
 
     /// 刚分配到的槽位：除了两把锁和 ref，字段都回到初始值。不写成 f.* = .{...}：那会连锁一起覆盖掉，
     /// 而别的 hart 可能正拿着这个槽位的 lock 在看它的 ref（alloc 逐个槽位看）

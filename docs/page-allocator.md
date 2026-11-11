@@ -27,7 +27,7 @@ pub fn isExclusive(page: *align(size) Page) bool       // 引用数是不是 1�
 
 ```zig
 const Pool = struct {
-    lock: Spinlock = .init("page"),
+    lock: Spinlock = .init("page", .leaf),
     list: std.SinglyLinkedList = .{},
     count: usize = 0,
 };

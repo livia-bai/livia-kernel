@@ -2,6 +2,11 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-11 加锁顺序由等级检查
+
+- 新增：每把自旋锁、睡眠锁创建时给一个等级（`spinlock.Rank`：`wait`、`cond`、`bucket`、`proc`、`uart_out`、`leaf`；`sleeplock.Rank`：`file_pos`、`fs_write`、`buf`）。拿锁时已经拿着的锁的等级都必须更低（只有 `bucket`、`buf` 两级允许同时拿几把），违反了就 panic：`lock order: acquiring X (等级) while holding Y (等级)`。每个 hart 记着自己拿着哪些自旋锁，每个进程记着自己拿着每一级的睡眠锁各几把（`Process.sleeplocks` 换成了 `sleeplock.Held`）。
+- 改动：`Sleeplock.acquire` 一开始就检查没有拿着自旋锁；回到 U 模式时还拿着自旋锁的 panic 信息说出第一把是哪个。
+
 ## 2026-11-11 内核的计数器（kstat）；panic 时打印调用栈；进程内核栈调到 24 KiB
 
 - 新增：内核的计数器（`src/kstat.zig`）：系统调用、上下文切换、时钟中断、核间中断、`wakeup`（调用、真扫了进程表、叫醒的进程）、自旋锁要等的次数、三种缺页、TLB 全量刷新、缓冲区缓存的命中和没命中、磁盘的读写和 flush、文件系统的提交和作废。每个 hart 一份，名字是 `abi.Counters` 的字段名。系统调用 `kstat`（39）返回它们和栈的高水位，用户程序 `kstat` 打印出来。

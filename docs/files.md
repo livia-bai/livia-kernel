@@ -105,7 +105,7 @@ fn consoleRead(space: *vm.PageTable, ptr: usize, len: usize) Error!usize
 pub const size = 2048;
 
 pub const Pipe = struct {
-    lock: Spinlock = .init("pipe"),
+    lock: Spinlock = .init("pipe", .cond),
     nread: usize = 0,        // 读走的总字节数
     nwrite: usize = 0,       // 写进的总字节数
     read_open: bool = true,  // 读端还开着

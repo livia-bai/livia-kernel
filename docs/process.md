@@ -39,7 +39,7 @@ pub const State = abi.ProcState;       // procinfo 原样交给用户程序
 pub const ProcState = enum(u8) { unused, runnable, running, sleeping, zombie };   // abi.zig
 
 pub const Process = struct {
-    lock: Spinlock = .init("proc"),    // 保护下面标着 lock 的字段，见“锁”
+    lock: Spinlock = .init("proc", .proc),    // 保护下面标着 lock 的字段，见“锁”
     state: State = .unused,            // lock
     hart: usize = 0,                   // lock。running 时在哪个 hart 上运行（kill 发核间中断用）
     pid: usize = 0,                    // lock
@@ -52,12 +52,12 @@ pub const Process = struct {
     xstatus: u32 = 0,                  // lock。zombie 的结束状态，父进程 wait 时取走
     ticks: u64 = 0,                    // lock。在 U 模式运行期间来过的时钟中断数
     files: [abi.max_fds]?*file.File = @splat(null),  // 打开的文件，下标就是 fd
-    sleeplocks: u32 = 0,               // 拿着几把睡眠锁，回到 U 模式时必须是 0
+    sleeplocks: sleeplock.Held = .{},  // 拿着每一级的睡眠锁各几把，回到 U 模式时必须都是 0
     cwd: u64 = fs.root_ino,            // 当前目录的 inode 号（chdir），fork 继承，exec 不变
 };
 
 pub var table: [max_procs]Process = @splat(.{});
-var wait_lock: Spinlock = .init("wait");           // 保护所有进程的 parent
+var wait_lock: Spinlock = .init("wait", .wait);           // 保护所有进程的 parent
 var next_pid: std.atomic.Value(usize) = .init(1);  // 每次创建进程加 1（fetchAdd），从不复用
 var init_proc: ?*Process = null;                   // 孤儿交给它；userinit 设置后不再改
 var foreground: std.atomic.Value(usize) = .init(0);  // 前台进程的 pid（setfg），按 Ctrl-C 时杀掉它
@@ -759,28 +759,27 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 
 - **拿着锁时中断必须关着**，`acquire` 检查这一点。不然中断处理程序在同一个 hart 上去拿同一把锁（比如串口中断拿 `rx_lock`），就会永远自旋。内核本来就全程关着中断，所以 `acquire` 只检查、不负责关中断（xv6 用 `push_off`/`pop_off` 计数）。
 - **切换进程时只能拿着这个进程自己的锁**（`sched` 检查 `heldCount() == 1` 且拿着的就是它），**回到 U 模式时什么锁都不能拿着**（`handleTrap` 末尾和 `forkretC` 检查 `heldCount() == 0`）。要拿着锁等待的，用 `sleep(chan, lock)`。
-- **加锁顺序**（只按这个方向嵌套，就不会死锁）：
+- **加锁顺序由等级检查**：每把锁创建时给一个等级（`spinlock.Rank`），只能从低往高拿：拿一把锁时，这个 hart 已经拿着的锁的等级都必须更低，否则 `acquire` 直接 panic，说出是哪两把锁（`lock order: acquiring proc (proc) while holding wait (leaf)`，这是把 `wait_lock` 故意标成 `leaf` 实测的）。等级从低到高：
 
-  ```
-  wait_lock → Process.lock → page.Pool.lock、File.lock、uart.tx_lock、fsys.text_lock
-  bio.evict_lock → bio 的桶的锁
-  timer.lock、Pipe.lock、uart.rx_lock、virtio_disk.lock、bio.evict_lock、Volume.snap_lock、Sleeplock.lk → Process.lock
-  Pipe.lock、uart.tx_lock、uart.rx_lock → page.Pool.lock
-  ```
+  | 等级 | 锁 | 为什么在这一级 |
+  | --- | --- | --- |
+  | `wait` | `proc.wait_lock` | `fork`、`finish`、`wait`、`interruptForeground`、`info` 拿着它看、改各个进程（拿进程锁），`finish` 还拿着它叫醒父进程 |
+  | `cond` | `timer.lock`、`Pipe.lock`、`uart.rx_lock`、`virtio_disk.lock`、`bio.evict_lock`、`Volume.snap_lock`、`Sleeplock.lk` | 保护等待条件的锁：`sleep` 拿着它去拿进程锁，改条件的一方拿着它调用 `wakeup`、`isKilled`（拿进程锁）。它们之间不嵌套 |
+  | `bucket` | `bio` 的桶的锁 | `evict_lock`（`cond`）之后拿；`takeOldest` 同时拿两个桶，所以这一级允许同时拿几把：只有拿着 `evict_lock` 的才这样做，不会互相等 |
+  | `proc` | `Process.lock` | 一次只拿一个进程的锁（`sleep` 里交接时拿着自己的进程锁和条件的锁，两者不同级） |
+  | `uart_out` | `uart.tx_lock` | 拿着它打印；`consoleWrite` 拿着它复制用户内存，缺页时要分配页，所以比叶子低 |
+  | `leaf` | `page.Pool.lock`、`File.lock`、`fsys.text_lock` | 拿着它们不再拿别的锁。`fork` 拿着 `wait_lock` 和子进程的锁调用 `file.dup`，`reap` 拿着锁释放页 |
 
-  最后一行是按需分页带来的：拿着这些锁替用户程序复制内存（`copyFromUser`、`copyToUser`）时，碰到还没分配的页就地分配一页清零的页（[paging.md](paging.md#内核访问用户内存)）。页分配器的锁是叶子，所以没有环。
+  只有 `bucket` 一级允许同时拿几把；别的同一级的锁不嵌套：`file.close` 先放开 `File.lock` 再去关管道，页分配器从别的 hart 拿页（`steal`）时先放开别人的链表的锁再拿自己的，`file.alloc` 一个槽位一个槽位地拿锁。按需分页让条件的锁、串口输出锁之后会拿页分配器的锁：拿着它们替用户程序复制内存（`copyFromUser`、`copyToUser`）时，碰到还没分配的页就地分配一页清零的页（[paging.md](paging.md#内核访问用户内存)）。
 
-  另外有**睡眠锁**（[disk.md](disk.md#睡眠锁sleeplockzig)：打开的文件的 `File.pos_lock`、文件系统的写锁 `fsys.write_lock`、缓冲区缓存的每一块）：拿着它可以睡觉，所以拿它之前不能拿着任何自旋锁；拿着它可以再去拿自旋锁（读写磁盘时拿 `virtio_disk.lock`）。回到 U 模式时也不能拿着睡眠锁（`proc.assertNoLocksHeld`）。睡眠锁之间的顺序是 `File.pos_lock` → `fsys.write_lock` → 缓冲区的睡眠锁（[fs.md](fs.md#接进内核fsyszig)）。同时拿着好几个缓冲区的只有修改文件系统的一方（一次一个，`write_lock`）；文件系统的读者、`readblock`、`writeblock` 一次只拿一个，拿着的时候不等别的缓冲区，所以不会互相等（[disk.md](disk.md#找缓冲区get)）。
+  每个 hart 记着自己拿着哪些锁（`held[hart.id()]`，按拿的顺序，最多 16 把），`acquire` 拿它和要拿的锁比等级，`release` 把锁从里面去掉（放的顺序不一定和拿的相反：`sleep` 先拿进程锁、再放条件的锁）。原来顺序只写在文档里，违反了的代码大多数时候不会死锁，要两个 hart 恰好交叉才会；现在一次正常的运行就能发现。整个 QEMU 测试跑下来没有违反的地方。
 
-  文件系统的读者拿着的**快照**不是锁，但修改的一方可能睡着等旧树的读者读完（[btree.md](btree.md#快照读者)），所以它也算在顺序里：`File.pos_lock` → 快照，拿着快照时不去等 `pos_lock`、`write_lock`。
+  另外有**睡眠锁**（[disk.md](disk.md#睡眠锁sleeplockzig)：打开的文件的 `File.pos_lock`、文件系统的写锁 `fsys.write_lock`、缓冲区缓存的每一块）：拿着它可以睡觉，所以拿它之前不能拿着任何自旋锁（`Sleeplock.acquire` 一开始就检查）；拿着它可以再去拿自旋锁（读写磁盘时拿 `virtio_disk.lock`）。回到 U 模式时也不能拿着睡眠锁（`proc.assertNoLocksHeld`）。睡眠锁也有等级（`sleeplock.Rank`）：`file_pos`（`File.pos_lock`）→ `fs_write`（`fsys.write_lock`）→ `buf`（缓冲区），每个进程记着自己拿着每一级的几把（`Process.sleeplocks`），拿的时候一样检查。`buf` 一级允许同时拿几把：同时拿着好几个缓冲区的只有修改文件系统的一方（一次一个，`write_lock`）；文件系统的读者、`readblock`、`writeblock` 一次只拿一个，拿着的时候不等别的缓冲区，所以不会互相等（[disk.md](disk.md#找缓冲区get)）。
 
-  - `wait_lock` 在进程锁前面：`fork`、`finish`、`wait`、`interruptForeground`、`info` 都是先拿 `wait_lock` 再拿进程锁。
-  - 等待条件的锁在进程锁前面：`sleep` 拿着 `lock` 去拿进程锁；改条件的一方拿着 `lock` 调用 `wakeup`、`isKilled`，它们拿进程锁。`wait_lock` 也是这种用法。
-  - 页分配器、`File`、串口输出、`fsys.text_lock` 的锁是“叶子”：拿着它们时不再拿别的锁（串口输出锁例外：拿着它复制用户内存时可能拿页分配器的锁，见上面最后一行）。`fork` 拿着 `wait_lock` 和子进程的锁时调用 `file.dup`（拿 `File.lock`），`reap` 拿着锁释放页（拿当前 hart 的 `Pool.lock`），各处拿着锁打印（拿 `uart.tx_lock`）。
-  - 同一层的锁不嵌套：`file.close` 先放开 `File.lock` 再去关管道（拿 `Pipe.lock`）；一次只拿一个进程的锁（`sleep` 里交接时拿着自己的进程锁和 `lock`，两者不同层）；页分配器从别的 hart 拿页（`steal`）时先放开别人的链表的锁再拿自己的；`file.alloc` 一个槽位一个槽位地拿锁；缓冲区缓存的两把桶的锁只有拿着 `evict_lock` 时才同时拿。
+  文件系统的读者拿着的**快照**不是锁，但修改的一方可能睡着等旧树的读者读完（[btree.md](btree.md#快照读者)），所以它也算在顺序里：`File.pos_lock` → 快照，拿着快照时不去等 `pos_lock`、`write_lock`。这一条没有检查。
 - 同一个 hart 重复拿同一把锁直接 panic（`holding()` 比较锁里记的 hart 编号和 `hart.id()`）。
 - 等锁时每转一圈看一眼是不是有别的 hart 在 panic（`hart.checkPanic`）：锁可能在已经停下的 hart 手里，永远等不到。
 
-每个 hart 记着自己拿着几把锁（`held[hart.id()]`）。进程锁在调度器和进程之间交接（调度器拿、进程放，或者反过来），但交接的两边总在同一个 hart 上：调度器切到的进程就在这个 hart 上接着运行，进程切回的也是这个 hart 的调度器。所以每个 hart 的计数都对得上。
+进程锁在调度器和进程之间交接（调度器拿、进程放，或者反过来），但交接的两边总在同一个 hart 上：调度器切到的进程就在这个 hart 上接着运行，进程切回的也是这个 hart 的调度器。所以每个 hart 记着的“拿着哪些锁”都对得上。
 
 **页表和 TLB**：每个进程同一时刻只在一个 hart 上运行（没有线程），用户页表只在这个 hart 的 TLB 里。进程换到另一个 hart 时，调度器 `vm.activate` 会 `sfence.vma`；离开时调度器切回内核页表也 `sfence.vma`。`sbrk` 缩小、`exec` 换地址空间时只刷当前 hart 的 TLB 就够了，不用跨 hart 刷（TLB shootdown）。内核页表启动后不再改，所有 hart 共用。

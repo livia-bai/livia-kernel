@@ -42,7 +42,7 @@ fn putRaw(c: u8) void {
 }
 fn putc(c: u8) void { hart.checkPanic(); if (c == '\n') putRaw('\r'); putRaw(c); }
 
-var tx_lock: Spinlock = .init("uart tx");
+var tx_lock: Spinlock = .init("uart tx", .uart_out);
 pub const Output = struct {        // 拿着 tx_lock 的一段输出
     locked: bool,                  // panic 的 hart 不拿锁
     pub fn write(o: Output, bytes: []const u8) void
@@ -79,7 +79,7 @@ pub fn print(comptime fmt: []const u8, args: anytype) void    // 同上，中间
 var rx_buf: [256]u8 = undefined;
 var rx_head: u8 = 0;  // 中断处理程序写入的位置
 var rx_tail: u8 = 0;  // read 系统调用读出的位置
-pub var rx_lock: Spinlock = .init("uart rx");   // 保护上面三个
+pub var rx_lock: Spinlock = .init("uart rx", .cond);   // 保护上面三个
 
 pub const rx_chan: *const anyopaque = &rx_buf;  // 等输入的进程睡在这个通道上
 
@@ -175,7 +175,7 @@ pub const tick_hz = 100;                  // 每秒 100 次，也就是每 10 ms
 var timebase_hz: u64 = undefined;         // time CSR 每秒增加多少，来自设备树
 var deadline: [hart.max]u64 = undefined;  // 每个 hart 的下一次中断预约在 time CSR 的哪个值
 var timekeeper: usize = undefined;        // 由哪个 hart 给 ticks 加 1
-pub var lock: Spinlock = .init("ticks");  // 保护 ticks（xv6 的 tickslock）
+pub var lock: Spinlock = .init("ticks", .cond);  // 保护 ticks（xv6 的 tickslock）
 pub var ticks: u64 = 0;
 ```
 

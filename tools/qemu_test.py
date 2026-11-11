@@ -1172,7 +1172,7 @@ def symbolize(kernel, text):
     r = subprocess.run([tool, "--functions=none", "-e", kernel] + m.group(1).split(),
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     lines = [os.path.relpath(l, ROOT) if l.startswith(ROOT) else l for l in r.stdout.splitlines() if l.strip()]
-    return "\n" + indent("\n".join(lines))
+    return "".join("\n      | " + line for line in lines)
 
 
 def run_mode(mode, names, smps):

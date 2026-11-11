@@ -135,7 +135,7 @@ const Info = struct {
 };
 
 /// 保护队列、描述符的分配、info 和 used_idx。加锁顺序：lock → 进程锁（睡下、叫醒）。
-var lock: Spinlock = .init("virtio disk");
+var lock: Spinlock = .init("virtio disk", .cond);
 var free: [num]bool = @splat(true);
 var info: [num]Info = @splat(.{});
 /// 驱动看到哪儿了：used 环里 [used_idx, used.idx) 是还没处理的

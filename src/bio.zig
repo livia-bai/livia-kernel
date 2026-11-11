@@ -44,7 +44,7 @@ pub const Device = struct {
 
 pub const Buf = struct {
     /// 保护 valid 和 data，拿着它才能读写磁盘
-    lock: Sleeplock = .init("buf"),
+    lock: Sleeplock = .init("buf", .buf),
     /// 所在的桶的锁。有几个人拿着（或者在等）这个缓冲区；为 0 时可以换成别的块
     refcnt: u32 = 0,
     /// 所在的桶的锁。装的是哪个块，决定了在哪个桶里
@@ -59,7 +59,7 @@ pub const Buf = struct {
 };
 
 const Bucket = struct {
-    lock: Spinlock = .init("bcache bucket"),
+    lock: Spinlock = .init("bcache bucket", .bucket),
     list: std.DoublyLinkedList = .{},
 
     /// 桶里装着块 blockno 的缓冲区。调用方拿着 lock。
@@ -74,7 +74,7 @@ const Bucket = struct {
 };
 
 var buckets: [nbucket]Bucket = @splat(.{});
-var evict_lock: Spinlock = .init("bcache evict");
+var evict_lock: Spinlock = .init("bcache evict", .cond);
 var bufs: [nbuf]Buf = undefined;
 var datas: [nbuf][block_size]u8 align(4096) = undefined;
 /// LRU 的时钟：每次有缓冲区变成没人用时加 1，记进它的 stamp

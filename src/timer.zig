@@ -23,7 +23,7 @@ var deadline: [hart.max]u64 = undefined;
 var timekeeper: usize = undefined;
 
 /// 保护 ticks（xv6 的 tickslock）。sleep 系统调用拿着它检查时间、睡在 &ticks 上。
-pub var lock: Spinlock = .init("ticks");
+pub var lock: Spinlock = .init("ticks", .cond);
 /// 开机以来的 tick 数。读写都要拿着 lock。
 pub var ticks: u64 = 0;
 

@@ -145,7 +145,7 @@ pub const Volume = struct {
     limbo: Bitmap = .{},
     limbo_count: u64 = 0,
     /// 保护 generation、committed（修改的一方写、读者读）和下面两个读者计数
-    snap_lock: Spinlock = .init("fs snapshot"),
+    snap_lock: Spinlock = .init("fs snapshot", .cond),
     /// 读着最新的已提交的树（generation）的读者个数，和读着更早的树的读者个数
     readers: usize = 0,
     old_readers: usize = 0,

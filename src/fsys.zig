@@ -33,7 +33,7 @@ var vol: ctree.Volume = .{};
 var root: fs.Fs = undefined;
 pub var mounted = false;
 /// 修改的一方拿着它（见文件开头），也保护 root.next_ino
-var write_lock: Sleeplock = .init("fs write");
+var write_lock: Sleeplock = .init("fs write", .fs_write);
 
 /// 原始区域：磁盘上文件系统之后的块
 pub var raw_base: u64 = 0;
@@ -123,7 +123,7 @@ pub const UserIn = struct {
 // 占住之前开始的修改要么还没 endModify（exec 失败），要么已经提交了（快照里看得到）。
 
 /// 保护 texts、modifying。叶子锁
-var text_lock: Spinlock = .init("fs text");
+var text_lock: Spinlock = .init("fs text", .leaf);
 /// 一个地址空间占一份。地址空间最多是每个进程一个，再加上正在 exec 的进程新建的那个
 var texts: [2 * abi.max_procs]struct { ino: u64 = 0, refs: u32 = 0 } = @splat(.{});
 /// 修改的一方正在改的 inode，0 表示没有。修改都拿着 write_lock，同一时刻只有一个
