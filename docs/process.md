@@ -1,6 +1,6 @@
 # 进程：创建、调度和结束
 
-涉及文件：`src/proc.zig`（以及 `src/trap.zig` 的 `trapExit`、`src/vm.zig` 的用户地址空间函数、`src/spinlock.zig`、`src/hart.zig`、`src/ipi.zig`；调用方：`src/main.zig`、`src/trap.zig`、`src/syscall.zig`、`src/file.zig`、`src/pipe.zig`、`src/timer.zig`）
+涉及文件：`src/proc.zig`、`src/loader.zig`（ELF 加载器、命令行参数）（以及 `src/trap.zig` 的 `trapExit`、`src/vm.zig` 的用户地址空间函数、`src/spinlock.zig`、`src/hart.zig`、`src/ipi.zig`；调用方：`src/main.zig`、`src/trap.zig`、`src/syscall.zig`、`src/file.zig`、`src/pipe.zig`、`src/timer.zig`）
 
 进程表里最多同时有 64 个进程，在所有 hart 上按时间片轮转（round-robin）抢占式调度。进程的创建、调度、结束和加锁都照搬 [xv6](https://github.com/mit-pdos/xv6-riscv)（`kernel/proc.c`）的结构：
 
@@ -120,10 +120,12 @@ pub fn current() ?*Process              // cpus[hart.id()].proc
 
 ## ELF 加载器
 
+加载器在 `src/loader.zig`：它只依赖 `vm.Space` 和读文件的那一点（`Source`），不碰进程表，所以能完整地在主机上测。原来它和命令行参数的压栈（`pushArgs`）都在 `proc.zig` 里，`proc.zig` 现在只管进程的生命周期，`exec`、`userinit` 调用 `loader.loadImage`。
+
 ```zig
-fn load(space: *vm.Space, src: Source) LoadError!usize          // 记下各个段，设好堆的起点，返回入口地址
+pub fn load(space: *vm.Space, src: Source) LoadError!usize      // 记下各个段，设好堆的起点，返回入口地址
 fn loadSegment(space: *vm.Space, src: Source, phdr: elf.Elf64.Phdr) LoadError!void
-const LoadError = error{ BadElf, OutOfMemory, IoError };
+pub const LoadError = error{ BadElf, OutOfMemory, IoError };
 ```
 
 ELF 来自文件系统，任何人都能往里写一个文件再去运行它，所以加载器按“输入可能是坏的”来写，每个字段都检查，坏的 ELF 只会得到 `BadElf`，不会让内核读写到不该碰的地方（读文件本身出错是 `IoError`）。头部结构用 `std.elf.Elf64.Ehdr` / `Elf64.Phdr`（0.17 里字段是带类型的枚举和 packed struct，旧的 `Elf64_Ehdr` 已弃用）：文件头和每个程序头各读一次到栈上（64、56 字节），用 `std.mem.bytesToValue` 从字节复制出来。
@@ -162,7 +164,7 @@ ELF 来自文件系统，任何人都能往里写一个文件再去运行它，�
 
 堆的起点（`space.heap_start`，`brk` 一开始也是它）是**所有段的末尾按页向上取整后的最大值**。段的最后一页整页属于段（权限是那个段的，比如只读），堆从下一页开始，堆里的页都是 `RW-`，不会和段的权限混在一起。
 
-单元测试（`src/proc.zig` 末尾）加载真正的 `hello`：加载完只多用了根页表这一页；再把每个段的每一页都读一遍（按需分配），读到的第一个字节和 ELF 文件里 `p_offset` 处的一样；栈的两端读得到，保护页、空的堆读不到；释放后不漏页。
+单元测试（`src/loader.zig` 末尾）加载真正的 `hello`：加载完只多用了根页表这一页；再把每个段的每一页都读一遍（按需分配），读到的第一个字节和 ELF 文件里 `p_offset` 处的一样；栈的两端读得到，保护页、空的堆读不到；释放后不漏页。
 
 ## 按需分页
 

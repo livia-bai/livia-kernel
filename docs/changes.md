@@ -2,6 +2,10 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-11 ELF 加载器搬进 loader.zig
+
+- 改动：ELF 加载器（`Source`、`Image`、`load`、`loadSegment`、`loadImage`）和命令行参数的压栈（`pushArgs`）从 `proc.zig` 搬到新文件 `src/loader.zig`，单元测试跟着搬过去。`proc.zig` 只管进程的生命周期。
+
 ## 2026-11-11 CSR 的位用 packed struct
 
 - 改动：`riscv.zig` 的 `sstatus`、`sie`/`sip`、`scause`、`satp` 读写的是 `packed struct(u64)`（`Sstatus`、`Interrupts`、`Scause`、`Satp`），`read` 的返回类型、`write`/`set`/`clear` 的参数类型由 CSR 决定；原来的 `sstatus_sie`、`sie_stie`、`satp_sv39` 等掩码常量去掉了。`TrapFrame.sstatus` 的类型是 `riscv.Sstatus`。新增 `riscv.interruptsEnabled`、`riscv.bits`。

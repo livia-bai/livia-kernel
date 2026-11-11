@@ -222,7 +222,7 @@ pub const heap_limit = stack_limit - page.size;
 /// 一个程序最多几个要加载的段（ELF 的 PT_LOAD）。user/linker.ld 链接出来的是 3 个
 pub const max_segments = 8;
 
-/// 程序的一个段，exec 时只记下来（proc.load），里面的页第一次被访问时才分配（fault）：
+/// 程序的一个段，exec 时只记下来（loader.load），里面的页第一次被访问时才分配（fault）：
 /// 段在文件里的那部分（从程序文件的 file_off 开始的 file_size 字节）读进来，剩下的（.bss）是 0。
 pub const Segment = struct {
     /// 段的起点（按页对齐）和终点（向上对齐到页）
@@ -245,7 +245,7 @@ pub const Backing = union(enum) {
     fn read(b: Backing, off: u64, dst: []u8) error{IoError}!void {
         switch (b) {
             .none => unreachable, // 有文件内容的段一定有 backing
-            // 段在不在镜像里，proc.loadSegment 检查过了
+            // 段在不在镜像里，loader.loadSegment 检查过了
             .bytes => |bytes| @memcpy(dst, bytes[off..][0..dst.len]),
             .file => |ino| try fsys.readText(ino, off, dst),
         }

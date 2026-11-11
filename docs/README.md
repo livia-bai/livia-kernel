@@ -55,6 +55,7 @@ livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 
 | `src/page.zig` | [page-allocator.md](page-allocator.md) | |
 | `src/vm.zig` | [paging.md](paging.md) | [syscalls.md](syscalls.md#访问用户内存)、[process.md](process.md#按需分页) |
 | `src/proc.zig` | [process.md](process.md) | |
+| `src/loader.zig` | [process.md](process.md#elf-加载器) | [paging.md](paging.md#按需分页) |
 | `src/kstat.zig` | [syscalls.md](syscalls.md#调用列表) | [user-programs.md](user-programs.md#kstat) |
 | `src/canary.zig` | [process.md](process.md#进程表) | [boot.md](boot.md#每个-hart-的启动栈) |
 | `src/kstack.zig` | [process.md](process.md#进程表) | [trap.md](trap.md#内核栈溢出)、[paging.md](paging.md#内核页表)、[boot.md](boot.md#每个-hart-的启动栈) |

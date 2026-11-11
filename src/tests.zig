@@ -20,4 +20,5 @@ test {
     _ = @import("canary.zig");
     _ = @import("kstack.zig");
     _ = @import("kstat.zig");
+    _ = @import("loader.zig");
 }
