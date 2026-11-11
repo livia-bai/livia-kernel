@@ -467,16 +467,11 @@ const handlers = struct {
     }
 
     pub fn fstat(f: *file.File, ptr: usize) !void {
-        var st: abi.Stat = .{ .ino = 0, .size = 0, .kind = .console };
-        switch (f.kind) {
-            .none => unreachable,
-            .console => {},
-            .pipe => st.kind = .pipe,
-            .inode, .device => {
-                var r = try fsys.reader();
-                defer r.end();
-                st = abiStat(try r.fs.stat(f.ino));
-            },
+        var st: abi.Stat = .{ .ino = 0, .size = 0, .kind = if (f.open.target == .pipe) .pipe else .console };
+        if (file.inodeOf(f)) |ino| {
+            var r = try fsys.reader();
+            defer r.end();
+            st = abiStat(try r.fs.stat(ino));
         }
         try copyOut(ptr, &st);
     }
@@ -484,21 +479,24 @@ const handlers = struct {
     /// 目录 fd 的下一个目录项：读写位置 off 就是 fs.readdir 的 cookie。返回 true；列完了返回 false。
     /// 拿着 pos_lock 写进用户内存（先 pin 好），共用这个 fd 的进程不会拿到同一项；在快照上找。
     pub fn readdir(f: *file.File, ptr: usize) !bool {
-        if (f.kind != .inode) return error.NotDir;
+        const dir = switch (f.open.target) {
+            .inode => |*i| i,
+            else => return error.NotDir,
+        };
         const dst = try vm.pinDst(space(), ptr, @sizeOf(abi.Dirent));
         f.pos_lock.acquire();
         defer f.pos_lock.release();
         var r = try fsys.reader();
         defer r.end();
         var ent: abi.Dirent = undefined;
-        const d = try r.fs.readdir(f.ino, f.off, &ent.name) orelse return false;
+        const d = try r.fs.readdir(dir.ino, dir.off, &ent.name) orelse return false;
         ent.ino = d.ino;
         ent.kind = @fromBackingInt(@backingInt(d.kind));
         ent.name_len = @intCast(d.name_len);
         ent._pad = @splat(0);
         @memset(ent.name[d.name_len..], 0);
         dst.copyOut(0, std.mem.asBytes(&ent));
-        f.off = d.next;
+        dir.off = d.next;
         return true;
     }
 
