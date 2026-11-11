@@ -145,7 +145,7 @@ pub fn readText(ino: u64, off: u64, dst: []u8) error{IoError}!void
 - `mounted`、`root` 只在 `init` 里写一次（那时还没有别的进程），之后只读，读者不拿锁读它们。`root.next_ino` 只有修改的一方用，由 `write_lock` 保护；读者的 `Fs` 里它是 0，不用。
 - 原始区域只由 `readblock`、`writeblock` 读写，不拿文件系统的锁：它和文件系统用的块不重叠。
 
-**打开的文件**：`file.File` 多了一种 `.inode`，记着 inode 号 `ino` 和读写位置 `off`（[files.md](files.md)）。`read`、`write` 系统调用对它调用 `fs.read`、`fs.run(Fs.write, ...)`，`out`、`in` 是 `UserOut`、`UserIn`（用户地址空间和指针，经 `vm.copyToUser`、`copyFromUser`，[syscalls.md](syscalls.md#访问用户内存)），成功了才挪 `off`。
+**打开的文件**：`file.File` 的 `Target` 有一种 `.inode`，记着 inode 号 `ino` 和读写位置 `off`（[files.md](files.md)）。`read`、`write` 系统调用对它调用 `fs.read`、`fs.run(Fs.write, ...)`，`out`、`in` 直接是 pin 好的用户内存 `vm.PinnedDst`、`vm.PinnedSrc`（它们实现了 `put`、`get`，[syscalls.md](syscalls.md#访问用户内存)），成功了才挪 `off`。
 
 **每个进程有当前目录**：`Process.cwd`（inode 号，从根目录开始），`fork` 继承，`exec` 不变，只有自己读写（`chdir`）。相对路径从它开始找。
 

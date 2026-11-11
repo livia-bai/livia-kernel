@@ -66,8 +66,9 @@ QEMU `virt` 机器、`-m 128M` 时，和这个内核有关的物理地址如下�
 main.zig ─┬─ uart.zig ──────────── 串口输出（加锁）、键盘输入缓冲、Ctrl-C
           ├─ sbi.zig ───────────── ecall 到 OpenSBI（定时器、关机、启动其他 hart）
           ├─ trap.zig ─┬─ timer.zig、plic.zig、uart.zig（中断）
-          │            ├─ syscall.zig ─── abi.zig、vm.zig、proc.zig、file.zig、page.zig、timer.zig、uart.zig、sbi.zig、
-          │            │                   bio.zig（原始区域）、fsys.zig（文件系统的调用）
+          │            ├─ syscall.zig ─── abi.zig（调用号、abi.params：每个调用的参数，生成 dispatch）、vm.zig、proc.zig、
+          │            │                   file.zig、page.zig、timer.zig、uart.zig、sbi.zig、bio.zig（原始区域）、
+          │            │                   fsys.zig（文件系统的调用）、kstat.zig（计数器）
           │            ├─ virtio_disk.zig（磁盘中断）
           │            └─ proc.zig（让出 CPU、wakeup、杀进程）
           ├─ virtio_disk.zig ───── virtio 块设备驱动（proc.zig 的 sleep/wakeup 等磁盘）
@@ -77,7 +78,8 @@ main.zig ─┬─ uart.zig ──────────── 串口输出（
           ├─ vm.zig ────────────── 页表（用 page.zig 分配页表）
           ├─ plic.zig、timer.zig
           └─ proc.zig ──────────── userinit、scheduler（每个 hart 最后都调用它，永不返回）
-                                   vm.zig、trap.zig（进入 U 模式）、file.zig（fd 表）、abi.zig、嵌入的 init、fsys.zig（exec 从 /bin 加载程序）
+                                   vm.zig、trap.zig（进入 U 模式）、file.zig（fd 表）、abi.zig、嵌入的 init、fsys.zig（exec 从 /bin 找程序）、
+                                   loader.zig（ELF 加载器、命令行参数，只依赖 vm.zig）
 
 file.zig ─┬─ uart.zig（串口作为文件）
           ├─ pipe.zig ─── page.zig（每个管道一页）、vm.zig（复制用户内存）、proc.zig（sleep/wakeup）
@@ -91,7 +93,7 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
                 └─ user/<程序>.zig ─── user/sys.zig      （init.zig、sh.zig 也是这样的程序）
 ```
 
-`riscv.zig`（CSR 读写）、`hart.zig`（当前 hart 的编号、panic 时让所有 hart 停下）和 `spinlock.zig`（自旋锁）几乎被所有内核模块用到，图里省略了。
+`riscv.zig`（CSR 读写）、`hart.zig`（当前 hart 的编号、panic 时让所有 hart 停下）、`spinlock.zig`（自旋锁，带等级）、`kstat.zig`（每个 hart 的计数器）和 `kstack.zig`（内核栈、保护页、高水位、panic 时的调用栈）几乎被所有内核模块用到，图里省略了。
 
 
 
@@ -129,7 +131,7 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 - 被 kill 的进程不会再回到 U 模式：陷阱返回前、新进程第一次进入 U 模式前都检查 `killed`（[process.md](process.md#结束进程)）。
 - init（pid 1）一直存在：结束的进程由父进程回收，父进程先结束的交给 init 回收。init 结束内核就 panic。
 - 用户程序只能用根页表第 1 项；内核的映射不能放进 `0x4000_0000..0x8000_0000`（[paging.md](paging.md)）。
-- 内核从不直接解引用用户给的指针，`sstatus.SUM` 始终为 0，访问用户内存一律走 `vm.copyFromUser`（[syscalls.md](syscalls.md)）。拿着锁复制用户内存的系统调用先 `vm.prefault`：拿着锁时不能为了按需分页读盘（[paging.md](paging.md#内核访问用户内存)）。
+- 内核从不直接解引用用户给的指针，`sstatus.SUM` 始终为 0，访问用户内存一律走 `vm.copyFromUser`（[syscalls.md](syscalls.md)）。拿着锁复制用户内存的系统调用先 pin（`vm.pinSrc`、`pinDst`），拿着锁时只用 pin 好的 `PinnedSrc`/`PinnedDst` 复制：拿着锁时不能缺页（[paging.md](paging.md#内核访问用户内存)）。
 - 正在运行的程序文件不能改、不能删（`ETXTBSY`）：按需分页一直要从它读页（[fs.md](fs.md#正在运行的程序文件)）。
 - `TrapFrame` 的布局和 `trapEntry`/`trapExit` 的汇编绑在一起；`proc.Context` 和 `proc.contextAsm` 绑在一起。
 - 内核和用户程序都不用浮点（目标是 rv64imac），陷阱处理不保存浮点寄存器；`sstatus.FS` 在启动时清成 Off，手写的浮点指令也会触发非法指令异常（[build.md](build.md)）。

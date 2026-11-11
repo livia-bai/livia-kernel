@@ -237,8 +237,8 @@ bio.init(if (virtio_disk.blocks > 0) .{ .blocks = virtio_disk.blocks, .transfer 
 | 号 | 调用 | 说明 |
 | --- | --- | --- |
 | 21 | `blockcount()` | 原始区域有多少块，没有磁盘时是 0 |
-| 22 | `readblock(blockno, ptr)` | 原始区域的第 `blockno` 块读进用户内存 `ptr`（4096 字节）。先 `checkUser` 检查整个目标可写（顺便复制好写时复制的页），再 `bio.read`、`copyToUser` |
-| 23 | `writeblock(blockno, ptr)` | 用户内存的 4096 字节写到原始区域的第 `blockno` 块，写完才返回。先 `checkUser` 检查来源可读，再 `bio.get`（不读旧内容）、`copyFromUser`、`bio.write` |
+| 22 | `readblock(blockno, ptr)` | 原始区域的第 `blockno` 块读进用户内存 `ptr`（4096 字节）。先 `pinDst` 整个目标（检查可写，顺便复制好写时复制的页），再 `bio.read`，拿着缓冲区的睡眠锁 `copyOut` |
+| 23 | `writeblock(blockno, ptr)` | 用户内存的 4096 字节写到原始区域的第 `blockno` 块，写完才返回。先 `pinSrc` 来源，再 `bio.get`（不读旧内容）、`copyIn`、`bio.write` |
 
 都返回 0；块号超出原始区域是 `-EINVAL`，没有磁盘是 `-ENODEV`，指针不对是 `-EFAULT`（[syscalls.md](syscalls.md#调用列表)）。先检查指针再碰缓冲区：复制到一半失败的话，缓冲区里会留下半新半旧的内容（写），或者白读一次盘（读）。shell 的 `disk` 命令打印 `blockcount`。
 
