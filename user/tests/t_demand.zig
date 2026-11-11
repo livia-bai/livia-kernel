@@ -26,7 +26,8 @@ fn expect(ok: bool, comptime what: []const u8, args: anytype) void {
 const page = 4096;
 
 /// 只读数据段里的 256 KiB，每个字节都是 7（在程序文件里，按需读进来）
-const big: [64 * page]u8 = @splat(7);
+/// 按页对齐：不然它的第一页可能和别的只读数据共用、早就读进来了，数出来就少一页
+const big: [64 * page]u8 align(page) = @splat(7);
 /// 数据段里的 128 KiB，每个字节都是 3
 var data: [32 * page]u8 = @splat(3);
 

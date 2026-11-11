@@ -52,30 +52,30 @@ pub fn arg(i: usize) ?[]const u8         // 第 i 个参数，没有就是 null
 
 pub const Fd = usize;                    // stdin = 0，stdout = 1，stderr = 2
 pub fn exit(code: u8) noreturn
-pub fn write(fd: Fd, bytes: []const u8) WriteError!usize
-pub fn writeAll(fd: Fd, bytes: []const u8) WriteError!void
-pub fn read(fd: Fd, buf: []u8) ReadError!usize   // 没有数据时阻塞；0 表示读到结尾
-pub fn close(fd: Fd) error{ BadFd, Unexpected }!void
-pub fn dup(fd: Fd) error{ BadFd, TooManyOpenFiles, Unexpected }!Fd
-pub fn pipe() PipeError![2]Fd            // { 读端, 写端 }
-pub fn sbrk(increment: isize) SbrkError!usize    // 返回原来的堆末尾
-pub fn open(path: []const u8, flags: OpenFlags) FsError!Fd   // OpenFlags{ read = true, write = false, create = false, truncate = false }
-pub fn mkdir(path: []const u8) FsError!void
-pub fn unlink(path: []const u8) FsError!void
-pub fn chdir(path: []const u8) FsError!void
-pub fn fstat(fd: Fd) FsError!abi.Stat
-pub fn readdir(fd: Fd, ent: *abi.Dirent) FsError!bool        // 列完了是 false
+pub fn write(fd: Fd, bytes: []const u8) Error!usize
+pub fn writeAll(fd: Fd, bytes: []const u8) Error!void
+pub fn read(fd: Fd, buf: []u8) Error!usize   // 没有数据时阻塞；0 表示读到结尾
+pub fn close(fd: Fd) Error!void
+pub fn dup(fd: Fd) Error!Fd
+pub fn pipe() Error![2]Fd            // { 读端, 写端 }
+pub fn sbrk(increment: isize) Error!usize    // 返回原来的堆末尾
+pub fn open(path: []const u8, flags: OpenFlags) Error!Fd   // OpenFlags{ read = true, write = false, create = false, truncate = false }
+pub fn mkdir(path: []const u8) Error!void
+pub fn unlink(path: []const u8) Error!void
+pub fn chdir(path: []const u8) Error!void
+pub fn fstat(fd: Fd) Error!abi.Stat
+pub fn readdir(fd: Fd, ent: *abi.Dirent) Error!bool        // 列完了是 false
 pub fn getpid() usize
 pub fn getppid() usize
 pub fn uptime() u64                      // 开机以来的毫秒数
 pub fn yield() void                      // 让出 CPU
 pub fn sleep(ms: u64) void               // 睡至少 ms 毫秒，精度 10 ms
-pub fn fork() ForkError!usize            // 父进程得到子进程的 pid，子进程得到 0
-pub fn exec(name: []const u8, args: []const []const u8) ExecError!noreturn
-pub fn execRaw(name: []const u8, args: []const abi.Arg) ExecError!noreturn
-pub fn wait(pid: ?usize, nohang: bool) WaitError!?WaitResult
-pub fn kill(pid: usize) KillError!void
-pub fn setfg(pid: ?usize) error{ NoSuchProcess, Unexpected }!void
+pub fn fork() Error!usize            // 父进程得到子进程的 pid，子进程得到 0
+pub fn exec(name: []const u8, args: []const []const u8) Error!noreturn
+pub fn execRaw(name: []const u8, args: []const abi.Arg) Error!noreturn
+pub fn wait(pid: ?usize, nohang: bool) Error!?WaitResult
+pub fn kill(pid: usize) Error!void
+pub fn setfg(pid: ?usize) Error!void
 pub fn procinfo(buf: []abi.ProcInfo) usize
 pub fn meminfo() abi.MemInfo
 pub fn shutdown() noreturn
@@ -84,8 +84,8 @@ pub fn fprint(fd: Fd, comptime fmt: []const u8, args: anytype) void
 
 pub const LineReader = struct {          // 带缓冲区地按行读一个 fd（head、tail、grep、xargs 用）
     pub fn init(fd: Fd, buf: []u8) LineReader
-    pub fn next(r: *LineReader) ReadError!?[]const u8      // 下一行，不含 '\n'；读完了是 null
-    pub fn nextRaw(r: *LineReader) ReadError!?[]const u8   // 带着 '\n'（有的话）
+    pub fn next(r: *LineReader) Error!?[]const u8      // 下一行，不含 '\n'；读完了是 null
+    pub fn nextRaw(r: *LineReader) Error!?[]const u8   // 带着 '\n'（有的话）
 };
 ```
 
@@ -106,7 +106,7 @@ pub fn syscall4(n: abi.Syscall, arg0: usize, arg1: usize, arg2: usize, arg3: usi
 
 - 调用号放 `a7`，参数放 `a0`..`a3`，返回值在 `a0`。内核会保存并恢复其他所有寄存器，所以不需要声明更多 clobber。memory clobber 是因为 `write` 要读用户内存、`read` 等要写用户内存，编译器必须在 `ecall` 之前把缓冲区真正写好，之后重新读。
 - `syscall` 是 `pub` 的：回归测试用它传各种坏参数，直接看原始的返回值。
-- 封装函数把内核返回的错误码（`abi.errnoOf`）转换成 Zig 的错误，比如 `write` 的 `EFAULT` → `error.BadAddress`、`EBADF` → `error.BadFd`、`EPIPE` → `error.BrokenPipe`，其他 → `error.Unexpected`。`write` 的返回值可能小于 `bytes.len`（遇到坏地址时只写出了前一部分）。
+- 封装函数把内核返回的错误码换成 Zig 的错误（`check`：`abi.errnoOf` 取出错误码，`abi.errorOf` 按 `abi.zig` 的 `error_names` 换成错误，比如 `EFAULT` → `error.BadAddress`、`EBADF` → `error.BadFd`、`EPIPE` → `error.BrokenPipe`，不认识的错误码 → `error.Unexpected`）。所有封装的错误集都是 `sys.Error`。`write` 的返回值可能小于 `bytes.len`（遇到坏地址时只写出了前一部分）。
 - `exit` 之后写的是 `unreachable`：内核保证 `exit` 不返回。
 - `print` 和内核的 `uart.print` 一样接入 `std.Io.Writer`，输出到 1 号 fd（stdout），带一个 256 字节的缓冲区：格式化的各段先攒在缓冲区里，`print` 最后 `flush`，用**一次** `write` 系统调用写出去（超过 256 字节时，`drain` 先写出攒着的部分，再直接写剩下的，会多写几次）。`write` 在内核里关着中断整段输出，所以一次 `print` 的输出不会被别的进程的输出从中间打断。最初没有缓冲区，每一段都是一次 `write`（`print("pid {d}\n", .{pid})` 是三次），时钟中断可能落在两次 `write` 之间：后台进程刚启动时，它打印的一行插进了 shell 的 `[proc] pid 9 (spin) started in the background` 中间，fast 模式下的 QEMU 测试因此失败过。`drain` 里 `write` 失败（比如 stdout 是读端已经关了的管道）就返回 `error.WriteFailed`，`print` 吞掉错误、丢掉没写出去的部分。要知道写没写成功的程序（`echo`、`cat`）直接用 `writeAll`。
 - `LineReader` 在调用方给的缓冲区里攒数据，找到 `\n` 就切出一行（返回的切片指向缓冲区，下一次调用就失效了），剩下的半行挪到开头再读。比缓冲区还长的行截成几段，每段当一行；最后一行没有 `\n` 也算一行。原样输出一行的程序用 `nextRaw`，带着换行一次 `write` 写出去：分两次写（内容、换行）的话，中间可能插进别的进程的输出（多核时管道里前面的程序结束，内核打印的 `[proc] ... exited` 那一行插在一行的中间，QEMU 测试在 4 核上碰到过）。

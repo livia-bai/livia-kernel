@@ -33,34 +33,28 @@ pub fn exit(code: u8) noreturn {
     unreachable;
 }
 
+/// 系统调用的错误：每个错误码一个名字（abi.Error，内核和用户程序共用那张表），再加上不认识的错误码（Unexpected：
+/// 比这个程序新的内核加的）。所有的封装都返回它，出错信息直接打印 @errorName。
+pub const Error = abi.Error || error{Unexpected};
+
+/// 系统调用的返回值是错误码的话换成错误，否则原样返回。
+pub fn check(ret: usize) Error!usize {
+    const e = abi.errnoOf(ret) orelse return ret;
+    return abi.errorOf(e) orelse error.Unexpected;
+}
+
 pub const Fd = usize;
 pub const stdin: Fd = abi.stdin;
 pub const stdout: Fd = abi.stdout;
 pub const stderr: Fd = abi.stderr;
 
-/// NotFound：打开着的文件被删掉了（ReadError 也是）。TextBusy：文件是正在运行的程序，不能改
-pub const WriteError = error{ BadAddress, BadFd, BrokenPipe, NoSpace, FileTooBig, IsDir, IoError, NotFound, TextBusy, Unexpected };
-
 /// 写 fd，返回写出的字节数（串口、管道遇到坏地址时可能比 bytes.len 少；文件要么全写、要么返回错误）。
-pub fn write(fd: Fd, bytes: []const u8) WriteError!usize {
-    const ret = syscall(.write, fd, @intFromPtr(bytes.ptr), bytes.len);
-    if (abi.errnoOf(ret)) |e| return switch (e) {
-        .fault => error.BadAddress,
-        .badf => error.BadFd,
-        .pipe => error.BrokenPipe,
-        .nospc => error.NoSpace,
-        .fbig => error.FileTooBig,
-        .isdir => error.IsDir,
-        .io => error.IoError,
-        .noent => error.NotFound,
-        .txtbsy => error.TextBusy,
-        else => error.Unexpected,
-    };
-    return ret;
+pub fn write(fd: Fd, bytes: []const u8) Error!usize {
+    return check(syscall(.write, fd, @intFromPtr(bytes.ptr), bytes.len));
 }
 
 /// 把 bytes 全部写进 fd。
-pub fn writeAll(fd: Fd, bytes: []const u8) WriteError!void {
+pub fn writeAll(fd: Fd, bytes: []const u8) Error!void {
     var done: usize = 0;
     while (done < bytes.len) done += try write(fd, bytes[done..]);
 }
@@ -89,89 +83,13 @@ pub fn sleep(ms: u64) void {
     _ = syscall(.sleep, ms, 0, 0);
 }
 
-pub const ReadError = error{ BadAddress, BadFd, IsDir, IoError, NotFound, Unexpected };
-
 /// 从 fd 读最多 buf.len 个字节，返回读到的字节数，0 表示读到了结尾。没有数据时阻塞（串口、管道）。
 /// 从串口读时不回显；单独按 Ctrl-D 读到 0。
-pub fn read(fd: Fd, buf: []u8) ReadError!usize {
-    const ret = syscall(.read, fd, @intFromPtr(buf.ptr), buf.len);
-    if (abi.errnoOf(ret)) |e| return switch (e) {
-        .fault => error.BadAddress,
-        .badf => error.BadFd,
-        .isdir => error.IsDir,
-        .io => error.IoError,
-        .noent => error.NotFound,
-        else => error.Unexpected,
-    };
-    return ret;
+pub fn read(fd: Fd, buf: []u8) Error!usize {
+    return check(syscall(.read, fd, @intFromPtr(buf.ptr), buf.len));
 }
 
 // ---- 文件系统 ----
-
-pub const FsError = error{
-    NotFound,
-    Exists,
-    NotDir,
-    IsDir,
-    NotEmpty,
-    NameTooLong,
-    /// 名字是空的、"."、".."，或者 open 的 flags 不对
-    InvalidArgument,
-    NoSpace,
-    FileTooBig,
-    /// 磁盘上的数据不对
-    IoError,
-    /// 没有磁盘或者没有文件系统
-    NoDevice,
-    BadAddress,
-    BadFd,
-    TooManyOpenFiles,
-    SystemFdQuotaExceeded,
-    /// lseek 串口、管道、设备
-    NotSeekable,
-    /// 给目录建硬链接
-    PermissionDenied,
-    /// 链接数到上限了
-    TooManyLinks,
-    /// 打开的设备文件的设备号内核不认识
-    NoSuchDevice,
-    /// 跟着走的符号链接太多（多半是有环）
-    SymlinkLoop,
-    /// 给的缓冲区放不下（getcwd）
-    BufferTooSmall,
-    /// 文件是正在运行的程序，不能截断、删掉它的最后一个名字（open、unlink、rename）
-    TextBusy,
-    Unexpected,
-};
-
-fn fsResult(ret: usize) FsError!usize {
-    const e = abi.errnoOf(ret) orelse return ret;
-    return switch (e) {
-        .noent => error.NotFound,
-        .exist => error.Exists,
-        .notdir => error.NotDir,
-        .isdir => error.IsDir,
-        .notempty => error.NotEmpty,
-        .nametoolong => error.NameTooLong,
-        .inval => error.InvalidArgument,
-        .nospc => error.NoSpace,
-        .fbig => error.FileTooBig,
-        .io => error.IoError,
-        .nodev => error.NoDevice,
-        .fault => error.BadAddress,
-        .badf => error.BadFd,
-        .mfile => error.TooManyOpenFiles,
-        .nfile => error.SystemFdQuotaExceeded,
-        .spipe => error.NotSeekable,
-        .perm => error.PermissionDenied,
-        .mlink => error.TooManyLinks,
-        .nxio => error.NoSuchDevice,
-        .loop => error.SymlinkLoop,
-        .range => error.BufferTooSmall,
-        .txtbsy => error.TextBusy,
-        else => error.Unexpected,
-    };
-}
 
 pub const OpenFlags = struct {
     read: bool = true,
@@ -193,135 +111,110 @@ pub const OpenFlags = struct {
 };
 
 /// 打开文件或目录，返回 fd。
-pub fn open(path: []const u8, flags: OpenFlags) FsError!Fd {
-    return fsResult(syscall(.open, @intFromPtr(path.ptr), path.len, flags.bits()));
+pub fn open(path: []const u8, flags: OpenFlags) Error!Fd {
+    return check(syscall(.open, @intFromPtr(path.ptr), path.len, flags.bits()));
 }
 
 /// 建一个空目录。
-pub fn mkdir(path: []const u8) FsError!void {
-    _ = try fsResult(syscall(.mkdir, @intFromPtr(path.ptr), path.len, 0));
+pub fn mkdir(path: []const u8) Error!void {
+    _ = try check(syscall(.mkdir, @intFromPtr(path.ptr), path.len, 0));
 }
 
 /// 删掉一个文件或空目录。
-pub fn unlink(path: []const u8) FsError!void {
-    _ = try fsResult(syscall(.unlink, @intFromPtr(path.ptr), path.len, 0));
+pub fn unlink(path: []const u8) Error!void {
+    _ = try check(syscall(.unlink, @intFromPtr(path.ptr), path.len, 0));
 }
 
 /// 换当前目录。
-pub fn chdir(path: []const u8) FsError!void {
-    _ = try fsResult(syscall(.chdir, @intFromPtr(path.ptr), path.len, 0));
+pub fn chdir(path: []const u8) Error!void {
+    _ = try check(syscall(.chdir, @intFromPtr(path.ptr), path.len, 0));
 }
 
-pub fn fstat(fd: Fd) FsError!abi.Stat {
+pub fn fstat(fd: Fd) Error!abi.Stat {
     var st: abi.Stat = undefined;
-    _ = try fsResult(syscall(.fstat, fd, @intFromPtr(&st), 0));
+    _ = try check(syscall(.fstat, fd, @intFromPtr(&st), 0));
     return st;
 }
 
 /// 把 old 改名成 new（见 abi.Syscall.rename）。
-pub fn rename(old: []const u8, new: []const u8) FsError!void {
-    _ = try fsResult(syscall4(.rename, @intFromPtr(old.ptr), old.len, @intFromPtr(new.ptr), new.len));
+pub fn rename(old: []const u8, new: []const u8) Error!void {
+    _ = try check(syscall4(.rename, @intFromPtr(old.ptr), old.len, @intFromPtr(new.ptr), new.len));
 }
 
 /// 硬链接：给文件 old 再起一个名字 new（见 abi.Syscall.link）。
-pub fn link(old: []const u8, new: []const u8) FsError!void {
-    _ = try fsResult(syscall4(.link, @intFromPtr(old.ptr), old.len, @intFromPtr(new.ptr), new.len));
+pub fn link(old: []const u8, new: []const u8) Error!void {
+    _ = try check(syscall4(.link, @intFromPtr(old.ptr), old.len, @intFromPtr(new.ptr), new.len));
 }
 
 /// 建一个设备文件（见 abi.Syscall.mknod）。
-pub fn mknod(path: []const u8, major: abi.Major) FsError!void {
-    _ = try fsResult(syscall(.mknod, @intFromPtr(path.ptr), path.len, @backingInt(major)));
+pub fn mknod(path: []const u8, major: abi.Major) Error!void {
+    _ = try check(syscall(.mknod, @intFromPtr(path.ptr), path.len, @backingInt(major)));
 }
 
 /// 建符号链接 path，指向 target（见 abi.Syscall.symlink）。
-pub fn symlink(target: []const u8, path: []const u8) FsError!void {
-    _ = try fsResult(syscall4(.symlink, @intFromPtr(target.ptr), target.len, @intFromPtr(path.ptr), path.len));
+pub fn symlink(target: []const u8, path: []const u8) Error!void {
+    _ = try check(syscall4(.symlink, @intFromPtr(target.ptr), target.len, @intFromPtr(path.ptr), path.len));
 }
 
 /// 符号链接 path 的目标，写进 buf，返回写了的那一段（放不下就截断）。不是符号链接是 InvalidArgument。
-pub fn readlink(path: []const u8, buf: []u8) FsError![]const u8 {
-    const n = try fsResult(syscall4(.readlink, @intFromPtr(path.ptr), path.len, @intFromPtr(buf.ptr), buf.len));
+pub fn readlink(path: []const u8, buf: []u8) Error![]const u8 {
+    const n = try check(syscall4(.readlink, @intFromPtr(path.ptr), path.len, @intFromPtr(buf.ptr), buf.len));
     return buf[0..n];
 }
 
 /// 当前目录的绝对路径，写进 buf，返回那一段。
-pub fn getcwd(buf: []u8) FsError![]const u8 {
-    const n = try fsResult(syscall(.getcwd, @intFromPtr(buf.ptr), buf.len, 0));
+pub fn getcwd(buf: []u8) Error![]const u8 {
+    const n = try check(syscall(.getcwd, @intFromPtr(buf.ptr), buf.len, 0));
     return buf[0..n];
 }
 
 /// path 自己的 Stat：是符号链接的话不跟着走（open + fstat 是跟着走的）。
-pub fn lstat(path: []const u8) FsError!abi.Stat {
+pub fn lstat(path: []const u8) Error!abi.Stat {
     var st: abi.Stat = undefined;
-    _ = try fsResult(syscall(.lstat, @intFromPtr(path.ptr), path.len, @intFromPtr(&st)));
+    _ = try check(syscall(.lstat, @intFromPtr(path.ptr), path.len, @intFromPtr(&st)));
     return st;
 }
 
 pub const Whence = enum(usize) { set = abi.seek_set, cur = abi.seek_cur, end = abi.seek_end };
 
 /// 挪 fd 的读写位置，返回新的位置（见 abi.Syscall.lseek）。
-pub fn lseek(fd: Fd, offset: i64, whence: Whence) FsError!u64 {
-    return fsResult(syscall(.lseek, fd, @bitCast(offset), @backingInt(whence)));
+pub fn lseek(fd: Fd, offset: i64, whence: Whence) Error!u64 {
+    return check(syscall(.lseek, fd, @bitCast(offset), @backingInt(whence)));
 }
 
 /// 检查整个文件系统（见 abi.Syscall.scrub）。坏了是 IoError。
-pub fn scrub() FsError!abi.ScrubInfo {
+pub fn scrub() Error!abi.ScrubInfo {
     var info: abi.ScrubInfo = undefined;
-    _ = try fsResult(syscall(.scrub, @intFromPtr(&info), 0, 0));
+    _ = try check(syscall(.scrub, @intFromPtr(&info), 0, 0));
     return info;
 }
 
 /// 目录 fd 的下一个目录项写进 ent，返回 true；列完了返回 false。
-pub fn readdir(fd: Fd, ent: *abi.Dirent) FsError!bool {
-    return try fsResult(syscall(.readdir, fd, @intFromPtr(ent), 0)) == 1;
+pub fn readdir(fd: Fd, ent: *abi.Dirent) Error!bool {
+    return try check(syscall(.readdir, fd, @intFromPtr(ent), 0)) == 1;
 }
 
-pub fn close(fd: Fd) error{ BadFd, Unexpected }!void {
-    const ret = syscall(.close, fd, 0, 0);
-    if (abi.errnoOf(ret)) |e| return switch (e) {
-        .badf => error.BadFd,
-        else => error.Unexpected,
-    };
+pub fn close(fd: Fd) Error!void {
+    _ = try check(syscall(.close, fd, 0, 0));
 }
 
 /// 返回编号最小的空闲 fd，它和 fd 指向同一个文件。
-pub fn dup(fd: Fd) error{ BadFd, TooManyOpenFiles, Unexpected }!Fd {
-    const ret = syscall(.dup, fd, 0, 0);
-    if (abi.errnoOf(ret)) |e| return switch (e) {
-        .badf => error.BadFd,
-        .mfile => error.TooManyOpenFiles,
-        else => error.Unexpected,
-    };
-    return ret;
+pub fn dup(fd: Fd) Error!Fd {
+    return check(syscall(.dup, fd, 0, 0));
 }
 
-pub const PipeError = error{ TooManyOpenFiles, SystemFdQuotaExceeded, OutOfMemory, Unexpected };
-
 /// 创建管道，返回 { 读端, 写端 }。
-pub fn pipe() PipeError![2]Fd {
+pub fn pipe() Error![2]Fd {
     var fds: [2]u32 = undefined;
     const ret = syscall(.pipe, @intFromPtr(&fds), 0, 0);
-    if (abi.errnoOf(ret)) |e| return switch (e) {
-        .mfile => error.TooManyOpenFiles,
-        .nfile => error.SystemFdQuotaExceeded,
-        .nomem => error.OutOfMemory,
-        else => error.Unexpected,
-    };
+    _ = try check(ret);
     return .{ fds[0], fds[1] };
 }
 
-pub const SbrkError = error{ OutOfMemory, InvalidArgument, Unexpected };
-
 /// 把堆的末尾移动 increment 字节，返回原来的末尾。sbrk(0) 只查询。
 /// 新增的内存清零；increment 为正时，返回值就是新内存的起点。
-pub fn sbrk(increment: isize) SbrkError!usize {
-    const ret = syscall(.sbrk, @bitCast(increment), 0, 0);
-    if (abi.errnoOf(ret)) |e| return switch (e) {
-        .nomem => error.OutOfMemory,
-        .inval => error.InvalidArgument,
-        else => error.Unexpected,
-    };
-    return ret;
+pub fn sbrk(increment: isize) Error!usize {
+    return check(syscall(.sbrk, @bitCast(increment), 0, 0));
 }
 
 /// 磁盘块的大小。
@@ -332,47 +225,29 @@ pub fn blockCount() u64 {
     return syscall(.blockcount, 0, 0, 0);
 }
 
-pub const BlockError = error{ NoDevice, OutOfRange, BadAddress, Unexpected };
-
-fn blockError(ret: usize) BlockError!void {
-    if (abi.errnoOf(ret)) |e| return switch (e) {
-        .nodev => error.NoDevice,
-        .inval => error.OutOfRange,
-        .fault => error.BadAddress,
-        else => error.Unexpected,
-    };
+fn blockError(ret: usize) Error!void {
+    _ = try check(ret);
 }
 
 /// 把磁盘的第 n 块读进 buf。
-pub fn readBlock(n: u64, buf: *[block_size]u8) BlockError!void {
+pub fn readBlock(n: u64, buf: *[block_size]u8) Error!void {
     return blockError(syscall(.readblock, n, @intFromPtr(buf), 0));
 }
 
 /// 把 buf 写到磁盘的第 n 块，写完才返回。
-pub fn writeBlock(n: u64, buf: *const [block_size]u8) BlockError!void {
+pub fn writeBlock(n: u64, buf: *const [block_size]u8) Error!void {
     return blockError(syscall(.writeblock, n, @intFromPtr(buf), 0));
 }
 
-pub const ForkError = error{ TooManyProcesses, OutOfMemory, Unexpected };
-
 /// 复制当前进程。父进程得到子进程的 pid，子进程得到 0。
-pub fn fork() ForkError!usize {
-    const ret = syscall(.fork, 0, 0, 0);
-    if (abi.errnoOf(ret)) |e| return switch (e) {
-        .again => error.TooManyProcesses,
-        .nomem => error.OutOfMemory,
-        else => error.Unexpected,
-    };
-    return ret;
+pub fn fork() Error!usize {
+    return check(syscall(.fork, 0, 0, 0));
 }
-
-/// TextBusy：程序文件正在被改（写到一半）
-pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, BadAddress, ArgsTooLong, NameTooLong, NotDir, IoError, NoDevice, SymlinkLoop, TextBusy, Unexpected };
 
 /// 换成文件系统里的程序 name 运行（name 里没有 '/' 时在 /bin 里找），命令行参数是 args（按惯例第一个是程序名）。
 /// 成功时不返回。
 /// 最多 abi.max_args 个参数，加起来最多 abi.max_arg_bytes 字节。
-pub fn exec(name: []const u8, args: []const []const u8) ExecError!noreturn {
+pub fn exec(name: []const u8, args: []const []const u8) Error!noreturn {
     if (args.len > abi.max_args) return error.ArgsTooLong;
     var a: [abi.max_args]abi.Arg = undefined;
     for (args, a[0..args.len]) |s, *x| x.* = .of(s);
@@ -380,22 +255,10 @@ pub fn exec(name: []const u8, args: []const []const u8) ExecError!noreturn {
 }
 
 /// 和 exec 一样，参数已经是 Arg 数组（比如转交自己的 argv）。
-pub fn execRaw(name: []const u8, args: []const abi.Arg) ExecError!noreturn {
+pub fn execRaw(name: []const u8, args: []const abi.Arg) Error!noreturn {
     const ret = syscall4(.exec, @intFromPtr(name.ptr), name.len, @intFromPtr(args.ptr), args.len);
-    return switch (abi.errnoOf(ret) orelse .inval) {
-        .noent => error.NoSuchProgram,
-        .nomem => error.OutOfMemory,
-        .noexec => error.BadElf,
-        .fault => error.BadAddress,
-        .toobig => error.ArgsTooLong,
-        .nametoolong => error.NameTooLong,
-        .notdir => error.NotDir,
-        .io => error.IoError,
-        .nodev => error.NoDevice,
-        .loop => error.SymlinkLoop,
-        .txtbsy => error.TextBusy,
-        else => error.Unexpected,
-    };
+    _ = try check(ret);
+    unreachable; // exec 成功时不返回
 }
 
 pub const WaitResult = struct {
@@ -404,40 +267,24 @@ pub const WaitResult = struct {
     status: u32,
 };
 
-pub const WaitError = error{ NoChildren, Unexpected };
-
 /// 等子进程结束并回收它。pid 为 null 时等任意一个子进程。
 /// nohang 为 true 时不阻塞：有子进程但都还没结束就返回 null。
-pub fn wait(pid: ?usize, nohang: bool) WaitError!?WaitResult {
+pub fn wait(pid: ?usize, nohang: bool) Error!?WaitResult {
     var status: u32 = 0;
     const ret = syscall(.wait, pid orelse abi.wait_any, @intFromPtr(&status), if (nohang) abi.wait_nohang else 0);
-    if (abi.errnoOf(ret)) |e| return switch (e) {
-        .child => error.NoChildren,
-        else => error.Unexpected,
-    };
+    _ = try check(ret);
     if (ret == 0) return null;
     return .{ .pid = ret, .status = status };
 }
 
-pub const KillError = error{ NoSuchProcess, PermissionDenied, Unexpected };
-
 /// 结束进程 pid。只做标记，它回到 U 模式之前才真正结束。
-pub fn kill(pid: usize) KillError!void {
-    const ret = syscall(.kill, pid, 0, 0);
-    if (abi.errnoOf(ret)) |e| return switch (e) {
-        .srch => error.NoSuchProcess,
-        .perm => error.PermissionDenied,
-        else => error.Unexpected,
-    };
+pub fn kill(pid: usize) Error!void {
+    _ = try check(syscall(.kill, pid, 0, 0));
 }
 
 /// 设置前台进程（按 Ctrl-C 时内核结束它），null 表示没有。
-pub fn setfg(pid: ?usize) error{ NoSuchProcess, Unexpected }!void {
-    const ret = syscall(.setfg, pid orelse 0, 0, 0);
-    if (abi.errnoOf(ret)) |e| return switch (e) {
-        .srch => error.NoSuchProcess,
-        else => error.Unexpected,
-    };
+pub fn setfg(pid: ?usize) Error!void {
+    _ = try check(syscall(.setfg, pid orelse 0, 0, 0));
 }
 
 /// 把进程信息写进 buf，返回进程总数（可能比 buf.len 大，多出来的没写）。
@@ -535,14 +382,14 @@ pub const LineReader = struct {
 
     /// 下一行，不含结尾的 '\n'（最后一行没有 '\n' 也算一行），读到结尾返回 null。
     /// 返回的切片指向缓冲区，下一次调用之后就失效了。比缓冲区还长的行截成几段返回，每段都当成一行。
-    pub fn next(r: *LineReader) ReadError!?[]const u8 {
+    pub fn next(r: *LineReader) Error!?[]const u8 {
         const line = try r.nextRaw() orelse return null;
         return if (line.len > 0 and line[line.len - 1] == '\n') line[0 .. line.len - 1] else line;
     }
 
     /// 和 next 一样，但是带着结尾的 '\n'（有的话）：原样输出一行时用它，一次 write 写完整行，
     /// 不会和别的进程（比如内核打印的 [proc] 那一行）的输出交错在一行中间。
-    pub fn nextRaw(r: *LineReader) ReadError!?[]const u8 {
+    pub fn nextRaw(r: *LineReader) Error!?[]const u8 {
         while (true) {
             if (std.mem.indexOfScalar(u8, r.buf[r.start..r.end], '\n')) |i| {
                 const line = r.buf[r.start..][0 .. i + 1];

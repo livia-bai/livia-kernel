@@ -95,7 +95,7 @@ fn grep(fd: sys.Fd, name: []const u8, prefix: ?[]const u8) error{Failed}!bool {
 var out: [buf.len + 2 * sys.abi.max_path]u8 = undefined;
 
 /// 输出一行：`文件名:`、`行号:`、内容、换行拼好了一次写出去，不会和别的进程的输出交错在一行中间。
-fn output(prefix: ?[]const u8, lineno: ?u64, line: []const u8) sys.WriteError!void {
+fn output(prefix: ?[]const u8, lineno: ?u64, line: []const u8) sys.Error!void {
     var w: std.Io.Writer = .fixed(&out);
     if (prefix) |p| w.print("{s}:", .{p}) catch {};
     if (lineno) |n| w.print("{d}:", .{n}) catch {};

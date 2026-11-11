@@ -2,6 +2,12 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-11 每个错误码一个 Zig 名字，两个方向都按表换
+
+- 改动：`abi.zig` 新增 `error_names`（每个错误码对应一个错误名）、`abi.Error`、`abi.errorOf`、`abi.errnoFor`，编译期检查它和 `Errno` 一一对应。内核里和 `abi.Error` 同名的错误直接换成那个错误码，`syscall.errnos` 缩成只列不同名的 `syscall.aliases`。
+- 改动：`user/sys.zig` 的封装都返回 `sys.Error`（`abi.Error` 加 `Unexpected`），用 `sys.check` 把返回值换成错误，原来每个封装里手写的 `switch` 和 `FsError`、`WriteError`、`ExecError` 等错误集都去掉了。用户程序看到的名字有几个变了：`exec` 找不到程序是 `NotFound`（原来是 `NoSuchProgram`），`readblock`/`writeblock` 块号超出范围是 `InvalidArgument`（原来是 `OutOfRange`），系统的文件表满了是 `TooManyFiles`（原来是 `SystemFdQuotaExceeded`）。
+- 修复：`t_demand` 数页数的只读数组按页对齐，它的第一页不会和别的只读数据共用（代码一变，原来可能少数一页）。
+
 ## 2026-11-11 拿着锁读写用户内存要先 pin
 
 - 改动：拿着锁读写用户内存只能通过 `vm.PinnedSrc` / `vm.PinnedDst`：拿锁之前用 `vm.pinSrc`、`pinSrcPrefix`、`pinDst` 把范围里的页都准备好，拿着锁时 `copyIn` / `copyOut` 不缺页、不会失败。`copyFromUser`、`copyToUser` 拿着锁调用直接 panic。`vm.prefault`、`vm.checkUser`、`fsys.UserIn`/`UserOut` 去掉了；`vm.fault` 去掉了 `may_sleep` 参数和 `WouldSleep`。`write`、`read`、`readdir`、`wait`、`pipe`、`readblock`、`writeblock`、`scrub` 改成先 pin；`file.read`/`write`、`pipe.read`/`write`、`proc.wait` 接收 pin 好的范围。拿着锁时不再为用户内存分配页。

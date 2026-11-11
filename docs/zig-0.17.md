@@ -16,6 +16,8 @@
 - `std.SinglyLinkedList` 是**侵入式**的、不带类型参数：链表只认 `Node { next: ?*Node }`，节点嵌在哪里由使用者决定（`page.zig` 直接把节点放在空闲页的开头）。
 - `std.mem.indexOfScalar` 改名为 `std.mem.findScalar`（旧名是弃用的别名）；新增 `std.mem.cutScalar(T, s, c)`，返回分隔符前后两段（`user/sh.zig` 用它拆命令名和参数）。
 - `std.elf` 推荐用 `std.elf.Elf64.Ehdr` / `Elf64.Phdr`：字段名没有 `e_` / `p_` 前缀，类型是枚举（`type: ET`、`machine: EM`）和 packed struct（`flags: PF`，有 `.R`、`.W`、`.X` 字段）。旧的 `Elf64_Ehdr` 等已弃用。
+- `@typeInfo` 的结果换了形状：结构体是 `@typeInfo(T).@"struct".field_names`、`.field_types`、`.field_attrs` 几个并列的数组（不再是 `.fields` 里一个个带 `name`、`type` 的结构体），枚举是 `.field_names`、`.field_values`，错误集是 `@typeInfo(E).error_set.error_names`（`?[]const [:0]const u8`，`anyerror` 是 null）。只要名字的话用 `std.meta.fieldNames(T)` 最简单（`kstat.zig`、`abi.zig`、`user/kstat.zig`）。
+- `std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 })` 把一个值写成 JSON（`build.zig` 生成 `config.json`）。
 - 0.17.0 有一个 x86 软浮点下 compiler-rt 编译失败的回归（#37006），只影响 x86 目标，这里的 RISC-V 目标不受影响。
 
 ### 构建系统

@@ -99,25 +99,26 @@ fn sleep(ms: usize) usize {
 
 // ---- 错误码 ----
 
-/// 内核里的错误（按名字）对应哪个错误码。errno 在编译期查这张表：系统调用处理函数里可能出现的每一个错误都要在这里，
-/// 不在的编译不过，所以新加的错误不会悄悄变成 EIO（在这个内核里 EIO 的意思是“磁盘上的数据不对”）。
-const errnos = .{
-    // 文件系统（fs.Error，含 ctree.Error）
-    .NotFound = .noent,
-    .Exists = .exist,
-    .NotDir = .notdir,
-    .IsDir = .isdir,
-    .NotEmpty = .notempty,
-    .NameTooLong = .nametoolong,
-    .InvalidName = .inval,
-    .NoSpace = .nospc,
-    .FileTooBig = .fbig,
-    .IsDirLink = .perm,
-    .TooManyLinks = .mlink,
-    .SymlinkLoop = .loop,
-    .NotSymlink = .inval,
-    .TextBusy = .txtbsy,
-    .NoDevice = .nodev,
+/// 错误换成错误码。和 abi.Error 里的错误同名的（NotFound、BadAddress……）直接换成那个错误码（abi.errnoNamed）；
+/// 内核里别的名字在 aliases 里说明换成哪个。两边都没有的错误编译不过：新加的错误不会悄悄变成 EIO
+/// （在这个内核里 EIO 的意思是“磁盘上的数据不对”）。err 的错误集是什么都行。
+fn errno(err: anytype) abi.Errno {
+    switch (err) {
+        inline else => |e| {
+            const name = @errorName(e);
+            if (comptime abi.errnoNamed(name)) |code| return code;
+            if (!@hasField(@TypeOf(aliases), name)) @compileError("no errno for error." ++ name ++ ": add it to syscall.aliases");
+            return @field(aliases, name);
+        },
+    }
+}
+
+/// 内核里和 abi.Error 不同名的错误换成哪个错误码。
+const aliases = .{
+    // 文件系统（fs.Error、ctree.Error）
+    .InvalidName = .inval, // 空名字、"."、".."
+    .NotSymlink = .inval, // readlink 的不是符号链接
+    .IsDirLink = .perm, // 给目录建硬链接
     // 磁盘上的东西不对：校验和、结构（Corrupt），没有能用的超级块，块号超出磁盘（指针坏了），
     // 条目的数据太大（只能是树坏了：fs.zig 自己不会写这么大的条目）
     .Corrupt = .io,
@@ -125,37 +126,12 @@ const errnos = .{
     .DiskTooLarge = .io,
     .OutOfRange = .io,
     .TooBig = .io,
-    .IoError = .io,
-    // 用户内存
-    .BadAddress = .fault,
-    // 打开的文件（file.Error）
+    // 打开的文件（file.Error）：方向不对
     .NotReadable = .badf,
     .NotWritable = .badf,
-    .BrokenPipe = .pipe,
-    .NotSeekable = .spipe,
-    .InvalidArgument = .inval,
-    .TooManyFiles = .nfile,
-    .NoSuchDevice = .nxio,
-    // 进程、内存
-    .OutOfMemory = .nomem,
-    .TooManyProcesses = .again,
+    // exec
     .NoSuchProgram = .noent,
-    .BadElf = .noexec,
-    .NoChildren = .child,
-    .NoSuchProcess = .srch,
-    .PermissionDenied = .perm,
 };
-
-/// 错误换成错误码（见 errnos）。err 的错误集是什么都行，只要里面每个错误都在表里。
-fn errno(err: anytype) abi.Errno {
-    switch (err) {
-        inline else => |e| {
-            const name = @errorName(e);
-            if (!@hasField(@TypeOf(errnos), name)) @compileError("syscall.errnos has no errno for error." ++ name);
-            return @field(errnos, name);
-        },
-    }
-}
 
 /// 出错的系统调用的返回值。
 fn failWith(err: anytype) usize {

@@ -858,7 +858,7 @@ fn exitCode(s: u32) u8 {
     return if (s > 255) 255 else @intCast(s);
 }
 
-fn forkFailed(err: sys.ForkError) void {
+fn forkFailed(err: sys.Error) void {
     switch (err) {
         error.TooManyProcesses => sys.print("sh: too many processes (at most {d})\n", .{abi.max_procs}),
         else => sys.print("sh: cannot fork: {s}\n", .{@errorName(err)}),

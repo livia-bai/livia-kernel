@@ -4,6 +4,8 @@
 //! 其他寄存器原样恢复。返回值按有符号数理解：>= 0 表示成功，-4095..-1 是错误码的相反数
 //! （和 Linux 一样，错误码也沿用 Linux 的编号）。
 
+const std = @import("std");
+
 pub const Syscall = enum(usize) {
     /// exit(code: u8) 结束当前进程，不返回
     exit = 0,
@@ -382,6 +384,85 @@ pub const KStat = extern struct {
     stack_trap_size: u64,
 };
 
+/// 每个错误码在 Zig 里叫什么：用户程序拿到的错误就是这些（user/sys.zig 按这张表把错误码换成错误），
+/// 内核里同名的错误直接换成这个错误码（syscall.zig 的 errno：名字不在这里的才要另外说明换成哪个）。
+/// 一个错误码只有一个名字，所以 exec 找不到程序和 open 找不到文件都是 NotFound。
+const error_names = .{
+    .perm = error.PermissionDenied,
+    .noent = error.NotFound,
+    .srch = error.NoSuchProcess,
+    .io = error.IoError,
+    .nxio = error.NoSuchDevice,
+    .toobig = error.ArgsTooLong,
+    .noexec = error.BadElf,
+    .badf = error.BadFd,
+    .child = error.NoChildren,
+    .again = error.TooManyProcesses,
+    .nomem = error.OutOfMemory,
+    .fault = error.BadAddress,
+    .exist = error.Exists,
+    .nodev = error.NoDevice,
+    .notdir = error.NotDir,
+    .isdir = error.IsDir,
+    .inval = error.InvalidArgument,
+    .nfile = error.TooManyFiles,
+    .mfile = error.TooManyOpenFiles,
+    .txtbsy = error.TextBusy,
+    .fbig = error.FileTooBig,
+    .nospc = error.NoSpace,
+    .spipe = error.NotSeekable,
+    .mlink = error.TooManyLinks,
+    .pipe = error.BrokenPipe,
+    .range = error.BufferTooSmall,
+    .nametoolong = error.NameTooLong,
+    .nosys = error.NoSuchSyscall,
+    .notempty = error.NotEmpty,
+    .loop = error.SymlinkLoop,
+};
+
+/// 所有错误码对应的错误。
+pub const Error = blk: {
+    var set = error{};
+    for (std.meta.fieldNames(@TypeOf(error_names))) |name| set = set || @TypeOf(@field(error_names, name));
+    break :blk set;
+};
+
+comptime {
+    // error_names 正好列出了每一个错误码，名字也不重复：两个方向都是一一对应的
+    const codes = std.meta.fieldNames(Errno);
+    const names = std.meta.fieldNames(@TypeOf(error_names));
+    if (codes.len != names.len) @compileError("abi.error_names must name every Errno");
+    for (codes) |c| {
+        if (!@hasField(@TypeOf(error_names), c)) @compileError("abi.error_names has no name for Errno." ++ c);
+    }
+    if (@typeInfo(Error).error_set.error_names.?.len != codes.len) @compileError("abi.error_names gives two errnos the same name");
+}
+
+/// 错误码换成错误。不认识的错误码（比用户程序新的内核）是 null。
+pub fn errorOf(e: Errno) ?Error {
+    inline for (comptime std.meta.fieldNames(Errno)) |name| {
+        if (e == @field(Errno, name)) return @field(error_names, name);
+    }
+    return null;
+}
+
+/// 错误换成错误码。在编译期按名字查，所以 err 的错误集是 Error 的子集就行。
+pub fn errnoFor(err: anytype) Errno {
+    switch (err) {
+        inline else => |e| return comptime errnoNamed(@errorName(e)) orelse
+            @compileError("abi.error_names has no errno for error." ++ @errorName(e)),
+    }
+}
+
+/// 名字叫 name 的错误对应的错误码，没有就是 null（syscall.zig 用它决定内核里的错误要不要另外说明换成哪个）。
+pub fn errnoNamed(comptime name: []const u8) ?Errno {
+    @setEvalBranchQuota(10_000);
+    for (std.meta.fieldNames(Errno)) |code| {
+        if (std.mem.eql(u8, @errorName(@field(error_names, code)), name)) return @field(Errno, code);
+    }
+    return null;
+}
+
 const max_errno = 4095;
 
 /// 把错误码编码成返回值。
@@ -395,8 +476,17 @@ pub fn errnoOf(ret: usize) ?Errno {
     return @fromBackingInt(0 -% ret);
 }
 
+test "错误码和错误一一对应，两个方向换回来都是自己" {
+    inline for (comptime std.meta.fieldNames(Errno)) |name| {
+        const e = @field(Errno, name);
+        try std.testing.expectEqual(e, errnoFor(errorOf(e).?));
+    }
+    try std.testing.expectEqual(Errno.noent, errnoFor(error.NotFound));
+    try std.testing.expectEqual(@as(?Error, null), errorOf(@fromBackingInt(4000)));
+}
+
 test "错误码编码成返回值，再取回来" {
-    const expectEqual = @import("std").testing.expectEqual;
+    const expectEqual = std.testing.expectEqual;
     try expectEqual(@as(?Errno, .fault), errnoOf(fail(.fault)));
     try expectEqual(@as(?Errno, .nosys), errnoOf(0 -% @as(usize, 38)));
     // 普通返回值不是错误；-4096 超出了错误码的范围，也当成普通返回值

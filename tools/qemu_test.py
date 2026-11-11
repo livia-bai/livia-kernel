@@ -667,7 +667,7 @@ def case_tools(q, c, mode):
         ("seq 3 | xargs", r"\n1 2 3\n> $"),
         ("seq 2 4 | xargs -n 1 echo hi", r"\nhi 2\nhi 3\nhi 4\n> $"),
         ("seq 3 | xargs -n 1 test 2 -eq; echo $?", r"\n123\n> $"),
-        ("echo x | xargs nope; echo $?", r"xargs: nope: NoSuchProgram\n127\n"),
+        ("echo x | xargs nope; echo $?", r"xargs: nope: NotFound\n127\n"),
         ("sleep 0.05 && echo slept", r"\nslept\n"),
         ("sleep x", r"sleep: invalid time: 'x'\n"),
     ]:

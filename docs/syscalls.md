@@ -166,7 +166,9 @@ pub fn dispatch(frame: *TrapFrame) usize {
 
 `proc.exit` 和 `shutdown` 是 `noreturn`，可以直接放在 `switch` 表达式里。其余的大多是一个小函数：把参数交给 `proc` 或 `vm` 里的函数，把 Zig 的错误换成 `abi.fail(错误码)`。
 
-**错误码**：内核里的错误按名字查 `syscall.errnos` 这张表换成错误码（`errno(err)`、`failWith(err)`）。表是一个匿名结构体，字段名是错误名、值是错误码（`.NotFound = .noent`、`.Corrupt = .io`……）；`errno` 对错误集做 `inline else`，在编译期逐个查表，表里没有的错误直接编译失败（`syscall.errnos has no errno for error.X`）。所以新加一个错误不会悄悄变成 `-EIO`（这个内核里 `EIO` 的意思是“磁盘上的数据不对”），原来的 `fsys.errno(anyerror)` 有一个 `else => .io` 兜底，就会这样。同一个名字在不同调用里的意思要一样：原始区域的块号超出范围原来是 `OutOfRange`（`-EINVAL`），和文件系统里“指针坏了”的 `OutOfRange`（`-EIO`）撞了名字，改成了 `InvalidArgument`。
+**错误码**：每个错误码在 Zig 里有一个名字，写在 `abi.zig` 的 `error_names` 里（`.noent = error.NotFound`、`.fault = error.BadAddress`……），内核和用户程序共用。编译期检查它正好列出了每一个错误码、名字不重复，所以两个方向都是一一对应的：`abi.errorOf(errno)` 换成错误，`abi.errnoFor(err)` 换回错误码，单元测试把每个错误码换过去再换回来。
+
+内核这边，`syscall.errno(err)` 对错误集做 `inline else`，在编译期逐个看名字：和 `abi.Error` 里的同名（`NotFound`、`BadAddress`、`TextBusy`……）就直接用那个错误码；内核里别的名字（`Corrupt`、`InvalidName`、`IsDirLink`……）在 `syscall.aliases` 里说明换成哪个。两边都没有的错误直接编译失败（`no errno for error.X: add it to syscall.aliases`）。所以新加一个错误不会悄悄变成 `-EIO`（这个内核里 `EIO` 的意思是“磁盘上的数据不对”），原来的 `fsys.errno(anyerror)` 有一个 `else => .io` 兜底，就会这样。内核的错误尽量直接用 `abi.Error` 里的名字，`aliases` 里剩下的十来个是文件系统、`exec` 内部更具体的说法。
 
 会等待的调用（`yield`、`sleep`、`read`、管道的 `write`、`wait`）在里面切回调度器，等这个进程再被调度时才返回，然后 `handleTrap` 照常把返回值写进 `a0`、检查 `killed`、回到 U 模式。`sleep` 和 xv6 的 `sys_sleep` 一样，拿着 `timer.lock` 在循环里 `proc.sleep(&timer.ticks, &timer.lock)`，每个 tick 醒来一次，数够了 tick（或者被 kill 了）才返回（[process.md](process.md#sleepwakeup)）。
 
@@ -308,7 +310,7 @@ pub fn pinDst(s: *Space, va: usize, len: usize) error{BadAddress}!PinnedDst
 
 ## 用户态封装
 
-`user/sys.zig` 为每个调用提供一个函数，把错误码换成 Zig 的错误（[user-programs.md](user-programs.md#syszig)）：
+`user/sys.zig` 为每个调用提供一个函数，返回值是错误码的话换成错误（`check`：`abi.errorOf`）。所有函数的错误集都是同一个 `sys.Error`，就是 `abi.Error` 加上 `Unexpected`（不认识的错误码，比这个程序新的内核才会给），所以原来每个封装里把错误码一个个换成错误的 `switch`（七十多个分支）都没有了。一个错误码只有一个名字：`exec` 找不到程序和 `open` 找不到文件都是 `NotFound`，`readblock` 的块号超出范围是 `InvalidArgument`（[user-programs.md](user-programs.md#syszig)）：
 
 ```zig
 pub const abi = @import("abi");
@@ -319,49 +321,43 @@ pub var argv: []const abi.Arg                                   // 命令行参�
 pub fn arg(i: usize) ?[]const u8                                // 第 i 个参数
 
 pub fn exit(code: u8) noreturn
-pub fn write(fd: Fd, bytes: []const u8) WriteError!usize
-// WriteError = error{ BadAddress, BadFd, BrokenPipe, NoSpace, FileTooBig, IsDir, IoError, NotFound, Unexpected }
-pub fn writeAll(fd: Fd, bytes: []const u8) WriteError!void
+pub fn write(fd: Fd, bytes: []const u8) Error!usize
+pub fn writeAll(fd: Fd, bytes: []const u8) Error!void
 pub fn getpid() usize
 pub fn getppid() usize
 pub fn uptime() u64
 pub fn yield() void
 pub fn sleep(ms: u64) void
-pub fn read(fd: Fd, buf: []u8) error{ BadAddress, BadFd, IsDir, IoError, NotFound, Unexpected }!usize
-pub fn open(path: []const u8, flags: OpenFlags) FsError!Fd   // OpenFlags{ read = true, write, create, truncate, append }
-pub fn mkdir(path: []const u8) FsError!void
-pub fn unlink(path: []const u8) FsError!void
-pub fn chdir(path: []const u8) FsError!void
-pub fn fstat(fd: Fd) FsError!abi.Stat
-pub fn readdir(fd: Fd, ent: *abi.Dirent) FsError!bool        // 列完了是 false
-pub fn scrub() FsError!abi.ScrubInfo                         // 坏了是 IoError
-pub fn rename(old: []const u8, new: []const u8) FsError!void
-pub fn link(old: []const u8, new: []const u8) FsError!void    // 目录是 PermissionDenied
-pub fn mknod(path: []const u8, major: abi.Major) FsError!void
-pub fn symlink(target: []const u8, path: []const u8) FsError!void
-pub fn readlink(path: []const u8, buf: []u8) FsError![]const u8   // 不是符号链接是 InvalidArgument
-pub fn getcwd(buf: []u8) FsError![]const u8                   // 放不下是 BufferTooSmall
-pub fn lstat(path: []const u8) FsError!abi.Stat               // 不跟着最后一段的符号链接走
-pub fn lseek(fd: Fd, offset: i64, whence: Whence) FsError!u64 // Whence = enum { set, cur, end }；串口、管道是 NotSeekable
-// FsError = error{ NotFound, Exists, NotDir, IsDir, NotEmpty, NameTooLong, InvalidArgument, NoSpace,
-//                  FileTooBig, IoError, NoDevice, BadAddress, BadFd, TooManyOpenFiles, SystemFdQuotaExceeded,
-//                  NotSeekable, PermissionDenied, TooManyLinks, NoSuchDevice, SymlinkLoop, BufferTooSmall, Unexpected }
-pub fn close(fd: Fd) error{ BadFd, Unexpected }!void
-pub fn dup(fd: Fd) error{ BadFd, TooManyOpenFiles, Unexpected }!Fd
-pub fn pipe() error{ TooManyOpenFiles, SystemFdQuotaExceeded, OutOfMemory, Unexpected }![2]Fd   // { 读端, 写端 }
-pub fn sbrk(increment: isize) error{ OutOfMemory, InvalidArgument, Unexpected }!usize
+pub fn read(fd: Fd, buf: []u8) Error!usize
+pub fn open(path: []const u8, flags: OpenFlags) Error!Fd   // OpenFlags{ read = true, write, create, truncate, append }
+pub fn mkdir(path: []const u8) Error!void
+pub fn unlink(path: []const u8) Error!void
+pub fn chdir(path: []const u8) Error!void
+pub fn fstat(fd: Fd) Error!abi.Stat
+pub fn readdir(fd: Fd, ent: *abi.Dirent) Error!bool        // 列完了是 false
+pub fn scrub() Error!abi.ScrubInfo                         // 坏了是 IoError
+pub fn rename(old: []const u8, new: []const u8) Error!void
+pub fn link(old: []const u8, new: []const u8) Error!void    // 目录是 PermissionDenied
+pub fn mknod(path: []const u8, major: abi.Major) Error!void
+pub fn symlink(target: []const u8, path: []const u8) Error!void
+pub fn readlink(path: []const u8, buf: []u8) Error![]const u8   // 不是符号链接是 InvalidArgument
+pub fn getcwd(buf: []u8) Error![]const u8                   // 放不下是 BufferTooSmall
+pub fn lstat(path: []const u8) Error!abi.Stat               // 不跟着最后一段的符号链接走
+pub fn lseek(fd: Fd, offset: i64, whence: Whence) Error!u64 // Whence = enum { set, cur, end }；串口、管道是 NotSeekable
+pub fn close(fd: Fd) Error!void
+pub fn dup(fd: Fd) Error!Fd
+pub fn pipe() Error![2]Fd   // { 读端, 写端 }
+pub fn sbrk(increment: isize) Error!usize
 pub const block_size = abi.block_size;
 pub fn blockCount() u64
-pub fn readBlock(n: u64, buf: *[block_size]u8) BlockError!void
-pub fn writeBlock(n: u64, buf: *const [block_size]u8) BlockError!void
-// BlockError = error{ NoDevice, OutOfRange, BadAddress, Unexpected }
-pub fn fork() error{ TooManyProcesses, OutOfMemory, Unexpected }!usize
-pub fn exec(name: []const u8, args: []const []const u8) ExecError!noreturn
-pub fn execRaw(name: []const u8, args: []const abi.Arg) ExecError!noreturn
-// ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, BadAddress, ArgsTooLong, NameTooLong, NotDir, IoError, NoDevice, SymlinkLoop, Unexpected }
-pub fn wait(pid: ?usize, nohang: bool) error{ NoChildren, Unexpected }!?WaitResult   // WaitResult{ pid, status }
-pub fn kill(pid: usize) error{ NoSuchProcess, PermissionDenied, Unexpected }!void
-pub fn setfg(pid: ?usize) error{ NoSuchProcess, Unexpected }!void
+pub fn readBlock(n: u64, buf: *[block_size]u8) Error!void
+pub fn writeBlock(n: u64, buf: *const [block_size]u8) Error!void
+pub fn fork() Error!usize
+pub fn exec(name: []const u8, args: []const []const u8) Error!noreturn
+pub fn execRaw(name: []const u8, args: []const abi.Arg) Error!noreturn
+pub fn wait(pid: ?usize, nohang: bool) Error!?WaitResult   // WaitResult{ pid, status }
+pub fn kill(pid: usize) Error!void
+pub fn setfg(pid: ?usize) Error!void
 pub fn procinfo(buf: []abi.ProcInfo) usize
 pub fn meminfo() abi.MemInfo
 pub fn shutdown() noreturn
@@ -369,7 +365,7 @@ pub fn print(comptime fmt: []const u8, args: anytype) void   // 格式化输出�
 pub fn fprint(fd: Fd, comptime fmt: []const u8, args: anytype) void
 ```
 
-- `exec` 的返回类型是 `ExecError!noreturn`：成功时不返回，所以只可能拿到错误。它把 `[]const []const u8` 转成栈上的 `Arg` 数组再交给内核，超过 `max_args` 个直接返回 `ArgsTooLong`；参数总长由内核检查。
+- `exec` 的返回类型是 `Error!noreturn`：成功时不返回，所以只可能拿到错误。它把 `[]const []const u8` 转成栈上的 `Arg` 数组再交给内核，超过 `max_args` 个直接返回 `ArgsTooLong`；参数总长由内核检查。
 - `Fd` 就是 `usize`，`sys.stdin`、`sys.stdout`、`sys.stderr` 是 0、1、2。
 - `wait` 的 `pid` 为 `null` 时等任意一个子进程；`nohang` 时没有已结束的子进程返回 `null`。状态写进 `wait` 自己栈上的变量，再放进 `WaitResult`。
 

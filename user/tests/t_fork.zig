@@ -132,11 +132,11 @@ pub fn main() u8 {
     check(sys.setfg(9999) == error.NoSuchProcess, "setfg a missing pid", .{});
 
     // exec：失败时原来的程序照常运行；成功时 pid 不变
-    check(sys.exec("nope", &.{}) == error.NoSuchProgram, "exec a missing program", .{});
-    check(sys.exec("", &.{}) == error.NoSuchProgram, "exec an empty name", .{});
-    check(sys.exec("/bin/nope", &.{}) == error.NoSuchProgram, "exec a missing path", .{});
+    check(sys.exec("nope", &.{}) == error.NotFound, "exec a missing program", .{});
+    check(sys.exec("", &.{}) == error.NotFound, "exec an empty name", .{});
+    check(sys.exec("/bin/nope", &.{}) == error.NotFound, "exec a missing path", .{});
     const long_name: [40]u8 = @splat('x');
-    check(sys.exec(&long_name, &.{}) == error.NoSuchProgram, "exec a long name", .{});
+    check(sys.exec(&long_name, &.{}) == error.NotFound, "exec a long name", .{});
     const too_long: [abi.max_path + 1]u8 = @splat('x');
     check(sys.exec(&too_long, &.{}) == error.NameTooLong, "exec a {d}-byte name", .{too_long.len});
     check(sys.exec(too_long[0 .. abi.max_path - 4], &.{}) == error.NameTooLong, "exec a name too long for /bin/", .{});

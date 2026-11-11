@@ -51,7 +51,7 @@ fn list(path: []const u8, header: bool) u8 {
 
 /// 列 path 自己（lstat，不跟着符号链接走）。open 失败的原因是 open_err：lstat 也失败的话报 open 的错，
 /// 这样悬空的符号链接也列得出来，真的没有的报 NotFound。
-fn single(path: []const u8, open_err: ?sys.FsError) u8 {
+fn single(path: []const u8, open_err: ?sys.Error) u8 {
     const st = sys.lstat(path) catch |err| {
         sys.print("ls: {s}: {s}\n", .{ path, @errorName(open_err orelse err) });
         return 1;

@@ -87,10 +87,10 @@ pub fn main() u8 {
     expect(bad == 0, "{d} blocks differ from the disk image", .{bad});
 
     // 2. 坏参数：块号超出磁盘、指针指向只读的代码页、没有映射的地址、内核；失败的写不改磁盘
-    const E = sys.BlockError;
-    expect(sys.readBlock(disk_blocks, &buf) == E.OutOfRange, "readBlock past the end", .{});
-    expect(sys.readBlock(std.math.maxInt(u64), &buf) == E.OutOfRange, "readBlock(maxInt)", .{});
-    expect(sys.writeBlock(disk_blocks, &buf) == E.OutOfRange, "writeBlock past the end", .{});
+    const E = sys.Error;
+    expect(sys.readBlock(disk_blocks, &buf) == E.InvalidArgument, "readBlock past the end", .{});
+    expect(sys.readBlock(std.math.maxInt(u64), &buf) == E.InvalidArgument, "readBlock(maxInt)", .{});
+    expect(sys.writeBlock(disk_blocks, &buf) == E.InvalidArgument, "writeBlock past the end", .{});
     const code: *[block_size]u8 = @ptrFromInt(@intFromPtr(&main) & ~@as(usize, block_size - 1));
     expect(sys.readBlock(50, code) == E.BadAddress, "readBlock into the code segment", .{});
     for ([_]usize{ 0x6000_0000, 0x8020_0000 }) |addr| {
