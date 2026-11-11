@@ -215,7 +215,8 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
             .ecall_from_u => {
                 // sepc 指向 ecall 本身（固定 4 字节，没有压缩形式），返回时要跳过它
                 frame.sepc += 4;
-                frame.regs[10] = syscall.dispatch(frame);
+                // 返回值写进 a0；exec 成功时 TrapFrame 已经换成新程序的，不写（dispatch 返回 null）
+                if (syscall.dispatch(frame)) |ret| frame.regs[10] = ret;
             },
             // 缺页：按需分页（还没分配的页，段里的从程序文件读）、写时复制（写了 fork 之后和别的进程共用的页），
             // 见 vm.fault。处理完回到原来的地方重新执行这条指令。地址不该有页（没有映射的地址、保护页）、

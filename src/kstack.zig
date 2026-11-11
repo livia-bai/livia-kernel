@@ -42,7 +42,7 @@ pub fn Stack(comptime size: usize) type {
 pub const Boot = Stack(32 * 1024);
 /// 陷阱栈 16 KiB：中断处理程序都很浅，最深的是 panic（格式化输出）
 pub const Trap = Stack(16 * 1024);
-/// 进程的内核栈 24 KiB：实测 Debug 模式下最深的是文件系统的系统调用，约 14 KiB（见 docs/process.md）。
+/// 进程的内核栈 24 KiB：实测 Debug 模式下最深的是文件系统的系统调用，约 16 KiB（见 docs/process.md）。
 /// 原来是 16 KiB，Debug 模式下只剩 2.4 KiB 的余量，调大了
 pub const Process = Stack(24 * 1024);
 

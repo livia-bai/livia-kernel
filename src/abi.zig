@@ -109,6 +109,93 @@ pub const Syscall = enum(usize) {
     _,
 };
 
+/// 系统调用的参数在寄存器里是什么。abi.params 给每个系统调用写一串：内核的 dispatch 按它从 a0..a5 取参数、
+/// 交给处理函数（syscall.zig），用户程序的 sys.call 按它把参数放进寄存器。两边的参数个数、顺序、种类都在编译期
+/// 和这张表对一遍，写错了编译不过。
+pub const Param = enum {
+    /// 一个整数（一个寄存器）
+    int,
+    /// 一个 fd（一个寄存器）。内核收到的是它指向的打开的文件，fd 不对是 EBADF
+    fd,
+    /// 用户内存里的一段字节：地址、字节数（两个寄存器）
+    bytes,
+    /// 用户内存里的一个数组：地址、元素个数（两个寄存器）
+    array,
+    /// 用户内存里的一个地址，结果写在那里，大小由调用决定（一个寄存器）
+    ptr,
+
+    /// 占几个寄存器
+    pub fn regs(p: Param) usize {
+        return switch (p) {
+            .bytes, .array => 2,
+            else => 1,
+        };
+    }
+};
+
+/// 每个系统调用的参数（Syscall 的文档注释里有每个参数的意思）。
+pub const params = .{
+    .exit = .{.int},
+    .write = .{ .fd, .bytes },
+    .getpid = .{},
+    .uptime = .{},
+    .yield = .{},
+    .sleep = .{.int},
+    .read = .{ .fd, .bytes },
+    .fork = .{},
+    .exec = .{ .bytes, .array },
+    .wait = .{ .int, .ptr, .int },
+    .kill = .{.int},
+    .getppid = .{},
+    .setfg = .{.int},
+    .procinfo = .{.array},
+    .meminfo = .{.ptr},
+    .shutdown = .{},
+    .close = .{.fd},
+    .dup = .{.fd},
+    .pipe = .{.ptr},
+    .sbrk = .{.int},
+    .blockcount = .{},
+    .readblock = .{ .int, .ptr },
+    .writeblock = .{ .int, .ptr },
+    .open = .{ .bytes, .int },
+    .mkdir = .{.bytes},
+    .unlink = .{.bytes},
+    .chdir = .{.bytes},
+    .fstat = .{ .fd, .ptr },
+    .readdir = .{ .fd, .ptr },
+    .scrub = .{.ptr},
+    .rename = .{ .bytes, .bytes },
+    .lseek = .{ .fd, .int, .int },
+    .link = .{ .bytes, .bytes },
+    .mknod = .{ .bytes, .int },
+    .symlink = .{ .bytes, .bytes },
+    .readlink = .{ .bytes, .bytes },
+    .getcwd = .{.bytes},
+    .lstat = .{ .bytes, .ptr },
+    .kstat = .{.ptr},
+};
+
+/// 系统调用 name 的参数，按 Param。
+pub fn paramsOf(comptime name: []const u8) []const Param {
+    const list = @field(params, name);
+    var out: [list.len]Param = undefined;
+    for (list, &out) |p, *o| o.* = p;
+    const final = out;
+    return &final;
+}
+
+comptime {
+    // 每个系统调用都有参数表，表里没有多余的名字，参数最多占 6 个寄存器（a0..a5）
+    for (std.meta.fieldNames(Syscall)) |name| {
+        if (!@hasField(@TypeOf(params), name)) @compileError("abi.params has no entry for Syscall." ++ name);
+        var n = 0;
+        for (paramsOf(name)) |p| n += p.regs();
+        if (n > 6) @compileError("Syscall." ++ name ++ " takes more than 6 registers");
+    }
+    if (std.meta.fieldNames(@TypeOf(params)).len != std.meta.fieldNames(Syscall).len) @compileError("abi.params names a syscall that does not exist");
+}
+
 /// 设备号（设备文件的 major）。打开设备文件时内核按它找设备（file.zig）
 pub const Major = enum(u16) {
     /// 串口，和 init 打开的 0、1、2 号 fd 一样

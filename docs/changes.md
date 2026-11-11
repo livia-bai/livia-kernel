@@ -2,6 +2,12 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-11 系统调用的签名只写一次
+
+- 改动：`abi.params` 给每个系统调用写一串参数的种类（`abi.Param`：`int`、`fd`、`bytes`、`array`、`ptr`）。内核的 `syscall.dispatch` 对每个调用号展开一份解码代码，按 `abi.params` 和 `syscall.handlers` 里同名函数的参数类型取参数（fd 换成打开的文件、用户内存是 `UserSlice`），处理函数的错误在这里换成错误码，处理函数里直接 `try`。用户程序的 `sys.call(.名字, .{...})` 按同一张表放参数。两边的参数个数、种类在编译期和表核对。
+- 改动：`exec` 成功时 `dispatch` 返回 null，`handleTrap` 不写 `a0`（`a0 = argc` 由 `proc.exec` 设好），不再靠返回 `argc` 恰好写对。
+- 改动：`mknod` 的设备号放不进 `u16` 时是 `-EINVAL`（原来也是），由解码统一检查；`sys.zig` 新增 `call`、`raw`。
+
 ## 2026-11-11 每个错误码一个 Zig 名字，两个方向都按表换
 
 - 改动：`abi.zig` 新增 `error_names`（每个错误码对应一个错误名）、`abi.Error`、`abi.errorOf`、`abi.errnoFor`，编译期检查它和 `Errno` 一一对应。内核里和 `abi.Error` 同名的错误直接换成那个错误码，`syscall.errnos` 缩成只列不同名的 `syscall.aliases`。

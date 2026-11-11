@@ -43,7 +43,11 @@ fn panicImpl(msg: []const u8, first_trace_addr: ?usize) noreturn {
 ## sys.zig
 
 ```zig
-pub const abi = @import("abi");          // 系统调用号、错误码、ProcInfo 等，和内核共用
+pub const abi = @import("abi");          // 系统调用号、参数表、错误码、ProcInfo 等，和内核共用
+pub fn call(comptime n: abi.Syscall, args: anytype) usize   // 按 abi.params 放参数，做系统调用
+pub fn check(ret: usize) Error!usize                         // 返回值是错误码的话换成错误
+pub const Error = abi.Error || error{Unexpected};
+pub fn raw(n: abi.Syscall, regs: [6]usize) usize             // 寄存器原样交给内核，测试用
 pub fn syscall(n: abi.Syscall, arg0: usize, arg1: usize, arg2: usize) usize
 pub fn syscall4(n: abi.Syscall, arg0: usize, arg1: usize, arg2: usize, arg3: usize) usize
 
@@ -89,23 +93,31 @@ pub const LineReader = struct {          // 带缓冲区地按行读一个 fd（
 };
 ```
 
-每个函数的语义和错误见 [syscalls.md](syscalls.md#用户态封装)。所有调用都通过 `syscall4`（`syscall` 是第四个参数为 0 的简写）：
+每个函数的语义和错误见 [syscalls.md](syscalls.md#用户态封装)。封装都很短，比如：
 
 ```zig
-pub fn syscall4(n: abi.Syscall, arg0: usize, arg1: usize, arg2: usize, arg3: usize) usize {
+pub fn rename(old: []const u8, new: []const u8) Error!void {
+    _ = try check(call(.rename, .{ old, new }));
+}
+```
+
+`call` 按 `abi.params`（`.rename = .{ .bytes, .bytes }`）把两个切片各放成地址、长度两个寄存器，最后都交给 `raw`：
+
+```zig
+pub fn raw(n: abi.Syscall, regs: [6]usize) usize {
     return asm volatile ("ecall"
         : [ret] "={a0}" (-> usize),
         : [n] "{a7}" (@backingInt(n)),
-          [arg0] "{a0}" (arg0),
-          [arg1] "{a1}" (arg1),
-          [arg2] "{a2}" (arg2),
-          [arg3] "{a3}" (arg3),
+          [arg0] "{a0}" (regs[0]),
+          ...
+          [arg5] "{a5}" (regs[5]),
         : .{ .memory = true });
 }
 ```
 
-- 调用号放 `a7`，参数放 `a0`..`a3`，返回值在 `a0`。内核会保存并恢复其他所有寄存器，所以不需要声明更多 clobber。memory clobber 是因为 `write` 要读用户内存、`read` 等要写用户内存，编译器必须在 `ecall` 之前把缓冲区真正写好，之后重新读。
-- `syscall` 是 `pub` 的：回归测试用它传各种坏参数，直接看原始的返回值。
+- 调用号放 `a7`，参数放 `a0`..`a5`，返回值在 `a0`。内核会保存并恢复其他所有寄存器，所以不需要声明更多 clobber。memory clobber 是因为 `write` 要读用户内存、`read` 等要写用户内存，编译器必须在 `ecall` 之前把缓冲区真正写好，之后重新读。
+- `call` 的参数个数、种类在编译期和 `abi.params` 对一遍，和内核的 `dispatch` 用的是同一张表（[syscalls.md](syscalls.md#分发)），所以封装和内核不会对参数有两种理解。
+- `raw`、`syscall`、`syscall4` 是 `pub` 的：回归测试用它们传各种坏参数，直接看原始的返回值。
 - 封装函数把内核返回的错误码换成 Zig 的错误（`check`：`abi.errnoOf` 取出错误码，`abi.errorOf` 按 `abi.zig` 的 `error_names` 换成错误，比如 `EFAULT` → `error.BadAddress`、`EBADF` → `error.BadFd`、`EPIPE` → `error.BrokenPipe`，不认识的错误码 → `error.Unexpected`）。所有封装的错误集都是 `sys.Error`。`write` 的返回值可能小于 `bytes.len`（遇到坏地址时只写出了前一部分）。
 - `exit` 之后写的是 `unreachable`：内核保证 `exit` 不返回。
 - `print` 和内核的 `uart.print` 一样接入 `std.Io.Writer`，输出到 1 号 fd（stdout），带一个 256 字节的缓冲区：格式化的各段先攒在缓冲区里，`print` 最后 `flush`，用**一次** `write` 系统调用写出去（超过 256 字节时，`drain` 先写出攒着的部分，再直接写剩下的，会多写几次）。`write` 在内核里关着中断整段输出，所以一次 `print` 的输出不会被别的进程的输出从中间打断。最初没有缓冲区，每一段都是一次 `write`（`print("pid {d}\n", .{pid})` 是三次），时钟中断可能落在两次 `write` 之间：后台进程刚启动时，它打印的一行插进了 shell 的 `[proc] pid 9 (spin) started in the background` 中间，fast 模式下的 QEMU 测试因此失败过。`drain` 里 `write` 失败（比如 stdout 是读端已经关了的管道）就返回 `error.WriteFailed`，`print` 吞掉错误、丢掉没写出去的部分。要知道写没写成功的程序（`echo`、`cat`）直接用 `writeAll`。

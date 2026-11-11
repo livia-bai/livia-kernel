@@ -9,11 +9,11 @@
 | 寄存器 | 用途 |
 | --- | --- |
 | `a7` | 调用号（`abi.Syscall`） |
-| `a0..a5` | 参数（目前最多用四个，`exec`） |
+| `a0..a5` | 参数（哪个调用用几个、各是什么见 `abi.params`，目前最多用四个） |
 | `a0`（返回） | 返回值 |
 | 其他寄存器 | 内核原样恢复 |
 
-用户程序执行 `ecall` → CPU 产生“来自 U 模式的 ecall”异常（`scause = 8`，委托给了 S 模式）→ `trapEntry` 通过 `sscratch` 换到进程内核栈、保存全部寄存器 → `handleTrap` 把 `sepc` 加 4（跳过 `ecall`，它没有压缩形式，固定 4 字节）→ `syscall.dispatch(frame)` 的返回值写进 `frame.regs[10]`（`a0`）→ `trapExit` 恢复寄存器、`sret` 回到 `ecall` 的下一条指令。
+用户程序执行 `ecall` → CPU 产生“来自 U 模式的 ecall”异常（`scause = 8`，委托给了 S 模式）→ `trapEntry` 通过 `sscratch` 换到进程内核栈、保存全部寄存器 → `handleTrap` 把 `sepc` 加 4（跳过 `ecall`，它没有压缩形式，固定 4 字节）→ `syscall.dispatch(frame)` 的返回值写进 `frame.regs[10]`（`a0`；`exec` 成功时不写）→ `trapExit` 恢复寄存器、`sret` 回到 `ecall` 的下一条指令。
 
 **返回值按有符号数理解**：`>= 0` 表示成功；`-4095..-1` 表示失败，取反就是错误码（和 Linux 一样，错误码的编号也沿用 Linux）。
 
@@ -147,24 +147,53 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 
 ### 分发
 
+系统调用的签名只写一次，在 `abi.zig` 的 `params` 里：每个调用一串 `abi.Param`，说 `a0..a5` 里依次是什么。
+
 ```zig
-pub fn dispatch(frame: *TrapFrame) usize {
-    const args = frame.regs[10..16]; // a0..a5
-    const number: abi.Syscall = @fromBackingInt(frame.regs[17]); // a7
-    return switch (number) {
-        .exit => proc.exit(@truncate(args[0])),
-        .write => write(args[0], args[1], args[2]),
-        .getpid => proc.current().?.pid,
-        ...
-        .getppid => proc.parentPid(),       // 拿着 wait_lock 读 parent
-        ...
-        .shutdown => shutdown(),
-        _ => abi.fail(.nosys),
-    };
+pub const Param = enum { int, fd, bytes, array, ptr };   // bytes、array 占两个寄存器（地址、长度）
+pub const params = .{
+    .write = .{ .fd, .bytes },
+    .exec = .{ .bytes, .array },
+    .wait = .{ .int, .ptr, .int },
+    ...
+};
+```
+
+内核这边，每个调用是 `syscall.handlers` 里同名的一个函数，参数已经解码好了：
+
+```zig
+const handlers = struct {
+    pub fn write(f: *file.File, data: UserSlice) file.Error!usize { ... }
+    pub fn close(fd: OpenFd) void { ... }
+    pub fn rename(old_arg: UserSlice, new_arg: UserSlice) !void { ... }
+    pub fn exec(path_arg: UserSlice, argv_arg: UserSlice) !Replaced { ... }
+    ...
+};
+
+pub fn dispatch(frame: *TrapFrame) ?usize {
+    const number = frame.regs[17]; // a7
+    const regs = frame.regs[10..16]; // a0..a5
+    inline for (comptime std.meta.fieldNames(abi.Syscall)) |name| {
+        if (number == @backingInt(@field(abi.Syscall, name))) return call(name, regs);
+    }
+    return abi.fail(.nosys);
 }
 ```
 
-`proc.exit` 和 `shutdown` 是 `noreturn`，可以直接放在 `switch` 表达式里。其余的大多是一个小函数：把参数交给 `proc` 或 `vm` 里的函数，把 Zig 的错误换成 `abi.fail(错误码)`。
+`dispatch` 对 `abi.Syscall` 的每个名字展开一份 `call(name, regs)`。`call` 在编译期拿 `abi.params` 和处理函数的参数类型对一遍：个数不一样编译不过（`syscall.handlers.kill takes 2 parameters, abi.params says 1`），种类对不上也编译不过（`a parameter of type syscall.UserSlice cannot take abi.Param.ptr`）；`handlers` 里缺了哪个调用也编译不过。对得上就按参数的类型解码：
+
+| `abi.Param` | 处理函数的参数类型 | 解码 |
+| --- | --- | --- |
+| `int` | 整数类型 | 有符号的按补码（`sbrk` 的增量、`lseek` 的偏移）；窄的无符号整数（`mknod` 的设备号 `u16`）放不下是 `-EINVAL` |
+| `fd` | `*file.File`，或者 `OpenFd`（还要 fd 本身的，`close`） | 查当前进程的 fd 表，`fd >= max_fds` 或者没打开是 `-EBADF` |
+| `bytes`、`array` | `UserSlice{ ptr, len }` | 两个寄存器原样放进去；内核不能直接解引用，要经过 `vm.copyFromUser`、pin 这些 |
+| `ptr` | `usize` | 用户内存的地址，原样 |
+
+处理函数的返回值也由 `call` 换成 `a0`：错误联合里的错误换成错误码（`errno`，见下面），`void` 是 0，`bool` 是 0 或 1，整数原样，`noreturn` 的（`exit`、`shutdown`）不返回；`Replaced` 是 `exec` 专用的，表示 `TrapFrame` 已经换成新程序的了（`a0 = argc` 由 `proc.exec` 设好），`dispatch` 返回 `null`，`handleTrap` 不写 `a0`。原来 `exec` 成功时返回 `argc`，靠 `handleTrap` 把返回值写进 `a0`“恰好”设对新程序的 `argc`，要一段注释才看得懂。
+
+所以处理函数里没有 `catch |err| return abi.fail(...)`（原来重复了几十次），出错直接 `try`；fd 不对、坏的设备号这些也不用每个函数自己查。用户程序的 `sys.call` 按同一张 `abi.params` 放参数（[用户态封装](#用户态封装)），两边的参数个数、顺序都由它决定。
+
+代价是 `dispatch` 展开成 40 份解码代码。Debug 模式下进程内核栈的最深处从约 14 KiB 变成了约 16 KiB（`kstack.deepest` 量的，[process.md](process.md#进程表)），release 模式下几乎不变；内核栈是 24 KiB，余量还够。编译错误也比手写的 `switch` 难读一些，所以上面那几条错误信息是专门写的。
 
 **错误码**：每个错误码在 Zig 里有一个名字，写在 `abi.zig` 的 `error_names` 里（`.noent = error.NotFound`、`.fault = error.BadAddress`……），内核和用户程序共用。编译期检查它正好列出了每一个错误码、名字不重复，所以两个方向都是一一对应的：`abi.errorOf(errno)` 换成错误，`abi.errnoFor(err)` 换回错误码，单元测试把每个错误码换过去再换回来。
 
@@ -310,12 +339,16 @@ pub fn pinDst(s: *Space, va: usize, len: usize) error{BadAddress}!PinnedDst
 
 ## 用户态封装
 
-`user/sys.zig` 为每个调用提供一个函数，返回值是错误码的话换成错误（`check`：`abi.errorOf`）。所有函数的错误集都是同一个 `sys.Error`，就是 `abi.Error` 加上 `Unexpected`（不认识的错误码，比这个程序新的内核才会给），所以原来每个封装里把错误码一个个换成错误的 `switch`（七十多个分支）都没有了。一个错误码只有一个名字：`exec` 找不到程序和 `open` 找不到文件都是 `NotFound`，`readblock` 的块号超出范围是 `InvalidArgument`（[user-programs.md](user-programs.md#syszig)）：
+`user/sys.zig` 为每个调用提供一个函数。它们都用 `call(.名字, .{ 参数... })` 做系统调用：`call` 按 `abi.params` 把元组里的参数放进 `a0..a5`（切片放地址和长度，指针放地址，枚举放它的整数），参数的个数、种类在编译期对一遍（`sys.call(.write): 3 arguments, abi.params says 2`、`[]const u8 is not an integer`），所以封装和内核不会对参数的顺序有两种理解。`raw`（和 `syscall`、`syscall4` 两个简写）把寄存器原样交给内核，回归测试用它传坏参数。
+
+返回值是错误码的话换成错误（`check`：`abi.errorOf`）。所有函数的错误集都是同一个 `sys.Error`，就是 `abi.Error` 加上 `Unexpected`（不认识的错误码，比这个程序新的内核才会给），所以原来每个封装里把错误码一个个换成错误的 `switch`（七十多个分支）都没有了。一个错误码只有一个名字：`exec` 找不到程序和 `open` 找不到文件都是 `NotFound`，`readblock` 的块号超出范围是 `InvalidArgument`（[user-programs.md](user-programs.md#syszig)）：
 
 ```zig
 pub const abi = @import("abi");
-pub fn syscall(n: abi.Syscall, arg0: usize, arg1: usize, arg2: usize) usize   // 原始调用，测试用
-
+pub fn call(comptime n: abi.Syscall, args: anytype) usize        // 按 abi.params 放参数
+pub fn check(ret: usize) Error!usize                            // 错误码换成错误
+pub fn raw(n: abi.Syscall, regs: [6]usize) usize                // 原始调用，测试用
+pub fn syscall(n: abi.Syscall, arg0: usize, arg1: usize, arg2: usize) usize
 pub fn syscall4(n: abi.Syscall, arg0: usize, arg1: usize, arg2: usize, arg3: usize) usize
 pub var argv: []const abi.Arg                                   // 命令行参数，start.zig 设好
 pub fn arg(i: usize) ?[]const u8                                // 第 i 个参数
@@ -374,15 +407,15 @@ pub fn fprint(fd: Fd, comptime fmt: []const u8, args: anytype) void
 - 系统调用在陷阱处理程序里执行，**全程关着中断**，所以每个调用都要短。一个很长的 `write` 会在输出期间挡住时钟中断，但不会丢失中断：挂起的中断在 `sret` 回到 U 模式后立刻被处理（这时进程马上让出 CPU），计时也不会少，`timer` 按预约时刻补上错过的 tick（[devices.md](devices.md#定时器timerzig)）。
 - 会等待的调用（`yield`、`sleep`、`read`、管道的 `write`、`wait`）不在里面开中断等待，而是切回调度器，由调度器开着中断去处理别的事。
 - `exec` 一次加载整个程序（分配页、从文件系统读内容），`fork` 一次复制整个地址空间，`sbrk` 一次映射所有新的页，期间都关着中断。现在的程序都只有几十 KiB，没有问题；`sbrk` 一次要上百 MiB 时会关着中断清零这么多页，`t_sbrk` 里长到超过物理内存（约 125 MiB）再失败、回滚，QEMU 里测试照常通过。
-- 运行在当前进程自己的内核栈上（24 KiB），系统调用里不要放大的局部数组，也不要按值复制大的结构体（[fs.md](fs.md#接进内核fsyszig)：8 KiB 的位图按值传过一次，把栈撑爆了）。局部数组最大的是 `exec` 复制参数和路径用的约 1.8 KiB（参数 1024 字节、`Arg` 数组和切片各 256 字节、路径 256 字节）；栈用得最深的是文件系统的调用（实测 Debug 模式约 14 KiB，[process.md](process.md#进程表)）。
+- 运行在当前进程自己的内核栈上（24 KiB），系统调用里不要放大的局部数组，也不要按值复制大的结构体（[fs.md](fs.md#接进内核fsyszig)：8 KiB 的位图按值传过一次，把栈撑爆了）。局部数组最大的是 `exec` 复制参数和路径用的约 1.8 KiB（参数 1024 字节、`Arg` 数组和切片各 256 字节、路径 256 字节）；栈用得最深的是文件系统的调用（实测 Debug 模式约 16 KiB，[process.md](process.md#进程表)）。
 - 文件系统的调用读写磁盘，要等磁盘时和 `read` 一样切回调度器。读的调用在快照上读、不拿锁，改的调用拿着睡眠锁 `fsys.write_lock`（[fs.md](fs.md#接进内核fsyszig)）。
 - `exit`、`shutdown` 和成功的 `exec` 不返回；其他调用返回后，用户程序从 `ecall` 的下一条指令继续执行，除 `a0` 以外的寄存器都不变。
 
 ## 新增一个系统调用
 
-1. `src/abi.zig`：在 `Syscall` 里加一个编号（需要新错误码就在 `Errno` 里加，沿用 Linux 的编号）。
-2. `src/syscall.zig`：在 `dispatch` 的 `switch` 里加分支。参数是 `args[0..6]`，返回 `usize`；失败时返回 `abi.fail(...)`。
-3. 涉及用户指针的，一律通过 `vm.copyFromUser` / `vm.copyToUser` 访问，不要打开 `SUM`。会消耗内核状态（比如取走输入）的，先用 `vm.checkUser` 检查整个范围。
+1. `src/abi.zig`：在 `Syscall` 里加一个编号，在 `params` 里写它的参数（需要新错误码就在 `Errno` 里加，沿用 Linux 的编号，再在 `error_names` 里给它起名字）。漏了 `params` 编译不过。
+2. `src/syscall.zig`：在 `handlers` 里加一个同名的 `pub fn`，参数类型按上面的表（`*file.File`、`UserSlice`、整数……），返回什么都行（`!usize`、`!void`……），出错直接 `try`。漏了、参数对不上编译不过。内核里新的错误名要么和 `abi.Error` 里的同名，要么加进 `aliases`，否则编译不过。
+3. 涉及用户指针的，一律通过 `vm.copyFromUser` / `vm.copyToUser` 访问，不要打开 `SUM`。要拿着锁读写用户内存、或者会消耗内核状态（比如取走输入）的，先 pin（[访问用户内存](#访问用户内存)）。
 4. 要阻塞等待的（比如等键盘输入），照 `sleep` 的办法：挑一个代表“在等什么”的地址作通道，拿着保护条件的锁 `while (!条件 and !proc.isKilled()) proc.sleep(chan, &lock);`，在条件可能变化的地方（中断处理程序、别的进程）拿着同一把锁改条件、`proc.wakeup(chan)`（[process.md](process.md#sleepwakeup)）。读串口用的是 `uart.rx_chan` 和 `uart.rx_lock`，管道用的是 `&pipe.nread`/`&pipe.nwrite` 和管道的锁，`wait` 用的是进程自己和 `proc.wait_lock`，`sleep` 用的是 `&timer.ticks` 和 `timer.lock`。`lock` 不能为空。不要在系统调用里开中断 `wfi`（[trap.md](trap.md#中断开关不变量)）。
-5. `user/sys.zig`：加一个封装函数。
+5. `user/sys.zig`：加一个封装函数，用 `call(.名字, .{ 参数... })` 和 `check`。参数个数、种类不对编译不过。
 6. 更新本文的调用列表，在 [changes.md](changes.md) 里加一行。
