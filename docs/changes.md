@@ -2,6 +2,10 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-11 CSR 的位用 packed struct
+
+- 改动：`riscv.zig` 的 `sstatus`、`sie`/`sip`、`scause`、`satp` 读写的是 `packed struct(u64)`（`Sstatus`、`Interrupts`、`Scause`、`Satp`），`read` 的返回类型、`write`/`set`/`clear` 的参数类型由 CSR 决定；原来的 `sstatus_sie`、`sie_stie`、`satp_sv39` 等掩码常量去掉了。`TrapFrame.sstatus` 的类型是 `riscv.Sstatus`。新增 `riscv.interruptsEnabled`、`riscv.bits`。
+
 ## 2026-11-11 打开的文件是一个 tagged union
 
 - 改动：`file.File` 只剩锁、引用数和 `open: Open`（可读、可写，加上 `Target`：`console`、`pipe`、`inode`（inode 号、读写位置、`append`）、`device`（inode 号、`Device`））。原来的 `kind` 和只对某些 `kind` 有效的 `pipe`、`ino`、`major`、`off`、`append` 字段，以及逐个字段清空的 `reset` 都去掉了。设备号在 `openDevice` 里换成内核认识的 `file.Device`。新增 `file.inodeOf`。

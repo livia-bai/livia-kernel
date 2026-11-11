@@ -104,7 +104,7 @@ fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
     kstack.paintAll(hartid);
     // OpenSBI 交过来时 FS 是 Dirty，浮点单元开着。这个内核不支持浮点（陷阱处理不保存浮点寄存器），
     // 关掉它：否则用户程序能直接用浮点寄存器，里面的值还会留给下一个进程
-    riscv.clear(.sstatus, riscv.sstatus_fs);
+    riscv.clear(.sstatus, .{ .fs = 3 });
     uart.init();
     uart.write("\nHello from a Zig kernel on RISC-V!\n");
     const version = sbi.specVersion();
@@ -193,7 +193,7 @@ fn startHarts(self: usize, ids: []const u32, timebase_hz: u64) void {
 
 /// 其他 hart 的初始化（kmain 的每个 hart 一份的部分），然后进入调度器。全局的东西启动 hart 都已经做好了。
 fn kmainSecondary() callconv(.c) noreturn {
-    riscv.clear(.sstatus, riscv.sstatus_fs); // 见 kmain
+    riscv.clear(.sstatus, .{ .fs = 3 }); // 见 kmain
     trap.init();
     vm.initHart();
     plic.initHart();

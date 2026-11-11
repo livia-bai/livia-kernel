@@ -136,7 +136,7 @@ fn mapMmio(base: usize, size: usize) MapError!void {
 pub fn activate(root: *PageTable) void {
     kstat.add(.tlb_full_flushes, 2);
     riscv.sfenceVma();
-    riscv.write(.satp, riscv.satp_sv39 | (@intFromPtr(root) >> 12));
+    riscv.write(.satp, .{ .mode = .sv39, .ppn = @intCast(@intFromPtr(root) >> 12) });
     riscv.sfenceVma();
 }
 

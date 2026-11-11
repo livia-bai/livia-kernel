@@ -46,7 +46,7 @@ S 模式陷阱发生时，硬件自动：
 pub const TrapFrame = extern struct {
     regs: [32]usize,   // regs[i] 就是 xi；x0 恒为 0，它的槽位不用
     sepc: usize,
-    sstatus: usize,
+    sstatus: riscv.Sstatus,
     kernel_tp: usize = 0,        // 回到 U 模式时内核的 tp（hart 编号），见“tp 约定”
     kernel_sscratch: usize = 0,  // 回到被打断的地方时 sscratch 要恢复成什么，见“sscratch 约定”
 };
@@ -191,10 +191,9 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void
 先解出三个量：
 
 ```zig
-const scause = riscv.read(.scause);
-const is_interrupt = scause >> 63 != 0;
-const code = scause & ~(@as(usize, 1) << 63);
-const from_user = frame.sstatus & riscv.sstatus_spp == 0;
+const scause = riscv.read(.scause);         // riscv.Scause{ code, interrupt }
+const code = scause.code;
+const from_user = frame.sstatus.spp == .user;
 ```
 
 `from_user` 看的是保存在 `TrapFrame` 里的 `sstatus.SPP`，也就是陷入前的特权级。

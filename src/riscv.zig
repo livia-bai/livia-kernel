@@ -1,4 +1,6 @@
 //! RISC-V 特权架构相关的辅助函数：读写 CSR、开关中断、刷新 TLB。
+//! 有位定义的 CSR（sstatus、sie、sip、scause、satp）读写的是 packed struct，字段名就是规范里的位名，
+//! 和 vm.Pte 一样：不会把 sstatus 的掩码用到 sie 上（两个寄存器的第 1 位意思不一样），也不用手工移位。
 
 /// 内核会用到的 S 模式 CSR。枚举名就是汇编里的寄存器名。
 pub const Csr = enum {
@@ -14,58 +16,111 @@ pub const Csr = enum {
     time,
 };
 
-// sstatus 中的位
-pub const sstatus_sie: usize = 1 << 1; // S 模式全局中断使能
-pub const sstatus_spie: usize = 1 << 5; // 陷入前的 SIE，sret 时恢复到 SIE
-pub const sstatus_spp: usize = 1 << 8; // 陷入前的特权级：0 = U，1 = S；sret 回到这个特权级
-pub const sstatus_fs: usize = 3 << 13; // 浮点单元状态（2 位）：0 = Off，这时浮点指令都是非法指令
+/// 特权级（sstatus.SPP）
+pub const Privilege = enum(u1) { user = 0, supervisor = 1 };
 
-// sip 中的位：S 模式软件中断挂起。核间中断就是别的 hart（经 SBI）把它置 1，处理时要自己清掉
-pub const sip_ssip: usize = 1 << 1;
+/// sstatus：S 模式的状态。字段名就是规范里的位名（小写），没用到的位也有名字（_9 这样），
+/// 读出来、改几个字段、再写回去时它们原样保留。
+pub const Sstatus = packed struct(u64) {
+    _0: u1 = 0,
+    /// S 模式全局中断使能
+    sie: bool = false,
+    _2: u3 = 0,
+    /// 陷入前的 SIE，sret 时恢复到 SIE
+    spie: bool = false,
+    _6: u2 = 0,
+    /// 陷入前的特权级；sret 回到这个特权级
+    spp: Privilege = .user,
+    _9: u4 = 0,
+    /// 浮点单元状态：0 = Off，这时浮点指令都是非法指令
+    fs: u2 = 0,
+    _15: u49 = 0,
+};
 
-// sie 中的位：分别使能三类 S 模式中断
-pub const sie_ssie: usize = 1 << 1; // 软件中断
-pub const sie_stie: usize = 1 << 5; // 时钟中断
-pub const sie_seie: usize = 1 << 9; // 外部中断（来自 PLIC）
+/// sie（中断使能）和 sip（中断挂起）：三类 S 模式中断各一位，两个寄存器的位置一样。
+pub const Interrupts = packed struct(u64) {
+    _0: u1 = 0,
+    /// 软件中断（核间中断：别的 hart 经 SBI 把 sip.ssip 置 1，处理时要自己清掉）
+    ssi: bool = false,
+    _2: u3 = 0,
+    /// 时钟中断
+    sti: bool = false,
+    _6: u3 = 0,
+    /// 外部中断（来自 PLIC）
+    sei: bool = false,
+    _10: u54 = 0,
+};
 
-/// satp 的 MODE 字段（最高 4 位）为 8 表示 Sv39，低 44 位是根页表的物理页号。
-pub const satp_sv39: usize = 8 << 60;
+/// scause：最高位说明是中断还是异常，低位是编号（trap.Interrupt、trap.Exception）。
+pub const Scause = packed struct(u64) {
+    code: u63,
+    interrupt: bool,
+};
 
-pub inline fn read(comptime csr: Csr) usize {
-    return asm volatile ("csrr %[ret], " ++ @tagName(csr)
+/// satp：MODE 是 8 表示 Sv39，PPN 是根页表的物理页号。ASID 不用，是 0。
+pub const Satp = packed struct(u64) {
+    ppn: u44,
+    asid: u16 = 0,
+    mode: enum(u4) { bare = 0, sv39 = 8, _ },
+};
+
+/// 每个 CSR 读出来、写进去的类型：有位定义的是上面的结构体，别的（地址、计数）是 usize。
+fn Type(comptime csr: Csr) type {
+    return switch (csr) {
+        .sstatus => Sstatus,
+        .sie, .sip => Interrupts,
+        .scause => Scause,
+        .satp => Satp,
+        .stvec, .sscratch, .sepc, .stval, .time => usize,
+    };
+}
+
+/// 位在 CSR 里的掩码（set、clear、汇编里的立即数用）：Sstatus{ .sie = true } 这样的值换成整数。
+pub fn bits(value: anytype) u64 {
+    return @bitCast(value);
+}
+
+pub inline fn read(comptime csr: Csr) Type(csr) {
+    const v = asm volatile ("csrr %[ret], " ++ @tagName(csr)
         : [ret] "=r" (-> usize),
     );
+    return @bitCast(v);
 }
 
-pub inline fn write(comptime csr: Csr, value: usize) void {
+pub inline fn write(comptime csr: Csr, value: Type(csr)) void {
     asm volatile ("csrw " ++ @tagName(csr) ++ ", %[value]"
         :
-        : [value] "r" (value),
+        : [value] "r" (@as(usize, @bitCast(value))),
         : .{ .memory = true });
 }
 
-/// 把 mask 中为 1 的位置 1。
-pub inline fn set(comptime csr: Csr, mask: usize) void {
+/// 把 mask 里为 1 的位置 1（原子地读改写这个 CSR），比如 set(.sie, .{ .sti = true })。
+pub inline fn set(comptime csr: Csr, mask: Type(csr)) void {
     asm volatile ("csrs " ++ @tagName(csr) ++ ", %[mask]"
         :
-        : [mask] "r" (mask),
+        : [mask] "r" (@as(usize, @bitCast(mask))),
         : .{ .memory = true });
 }
 
-/// 把 mask 中为 1 的位清 0。
-pub inline fn clear(comptime csr: Csr, mask: usize) void {
+/// 把 mask 里为 1 的位清 0。
+pub inline fn clear(comptime csr: Csr, mask: Type(csr)) void {
     asm volatile ("csrc " ++ @tagName(csr) ++ ", %[mask]"
         :
-        : [mask] "r" (mask),
+        : [mask] "r" (@as(usize, @bitCast(mask))),
         : .{ .memory = true });
 }
 
 pub inline fn enableInterrupts() void {
-    set(.sstatus, sstatus_sie);
+    set(.sstatus, .{ .sie = true });
 }
 
 pub inline fn disableInterrupts() void {
-    clear(.sstatus, sstatus_sie);
+    clear(.sstatus, .{ .sie = true });
+}
+
+/// 中断现在是不是开着（sstatus.SIE）。
+pub inline fn interruptsEnabled() bool {
+    return read(.sstatus).sie;
 }
 
 /// 让 CPU 休眠直到有中断待处理。
@@ -86,4 +141,13 @@ pub inline fn sfenceVmaPage(va: usize) void {
         :
         : [va] "r" (va),
         : .{ .memory = true });
+}
+
+comptime {
+    // 位的位置照规范（The RISC-V Instruction Set Manual, Volume II，4.1 节）
+    const std = @import("std");
+    std.debug.assert(@bitOffsetOf(Sstatus, "sie") == 1 and @bitOffsetOf(Sstatus, "spie") == 5);
+    std.debug.assert(@bitOffsetOf(Sstatus, "spp") == 8 and @bitOffsetOf(Sstatus, "fs") == 13);
+    std.debug.assert(@bitOffsetOf(Interrupts, "ssi") == 1 and @bitOffsetOf(Interrupts, "sti") == 5 and @bitOffsetOf(Interrupts, "sei") == 9);
+    std.debug.assert(@bitOffsetOf(Scause, "interrupt") == 63 and @bitOffsetOf(Satp, "mode") == 60);
 }

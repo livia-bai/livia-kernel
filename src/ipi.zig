@@ -30,7 +30,7 @@ var idle: std.atomic.Value(usize) = .init(0);
 
 /// 每个 hart 调用一次：在 sie 里使能软件中断，核间中断才会被接收（没使能的话 sip.SSIP 只是挂着）。
 pub fn initHart() void {
-    riscv.set(.sie, riscv.sie_ssie);
+    riscv.set(.sie, .{ .ssi = true });
 }
 
 /// 调度器调用：这一轮要开始扫描了（true），或者挑中了一个进程（false）。
@@ -78,7 +78,7 @@ pub fn send(id: usize) void {
 /// S 模式软件中断的处理：清掉 sip.SSIP，否则一开中断又会进来。别的什么都不用做：
 /// 被叫醒的调度器接着扫描；被打断的进程回到 U 模式之前，handleTrap 末尾的 checkKilled 会看到它被杀了。
 pub fn onInterrupt() void {
-    riscv.clear(.sip, riscv.sip_ssip);
+    riscv.clear(.sip, .{ .ssi = true });
 }
 
 test "wakeIdle 每次认领一个别的空闲 hart，不叫自己" {

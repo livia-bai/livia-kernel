@@ -220,7 +220,7 @@ scheduler → switchContext ─ret→ forkret → forkretC（放开进程锁、c
 
 和 xv6 的 `userinit` 一样，只在启动时调用一次（这时别的 hart 已经在各自的调度器里空转了）：新建地址空间（`vm.createUserSpace()`，复制内核的根页表），页从嵌在内核里的 `init` 程序读（`backing = .bytes`，[程序从哪来](#程序从哪来)），`loadImage` 记下它的段（`Source.bytes`）、把命令行参数 `"init"` 放到栈顶（[命令行参数](#命令行参数)）；**打开串口作为 0、1、2 号 fd**（一个 `File`，引用数 3，[files.md](files.md)），之后所有进程都从 init `fork` 继承它们；拿着空槽位的锁（`allocSlot`），用 `startFrame(frame, image)` 构造从入口开始运行的 `TrapFrame`，填好字段，状态设为 `runnable`，pid 是 1，记进 `init_proc`，最后才放开锁。`init_proc` 在放开锁之前设置：别的 hart 要先拿到这把锁才能运行 init，那时一定看得到它。没有 `init` 程序是构建配置错了，直接 `@panic`；其他错误 `kmain` 会 panic。
 
-`startFrame` 构造的 `TrapFrame`：`sepc` = 入口地址，`sp`（`regs[2]`）和 `a1`（`regs[11]`）= 栈上 `Arg` 数组的地址，`a0`（`regs[10]`）= `argc`，其他寄存器为 0，`sstatus = (当前 sstatus & ~(SPP | SIE)) | SPIE`：
+`startFrame` 构造的 `TrapFrame`：`sepc` = 入口地址，`sp`（`regs[2]`）和 `a1`（`regs[11]`）= 栈上 `Arg` 数组的地址，`a0`（`regs[10]`）= `argc`，其他寄存器为 0，`sstatus` 是当前的 `sstatus` 改三个字段（`spp = .user`、`sie = false`、`spie = true`）：
 
 - `SPP = 0` 让 `sret` 回到 U 模式；`SPIE = 1` 让 U 模式下中断是开着的（时钟和键盘照常工作，抢占和 Ctrl-C 都靠它）。
 - **`SIE` 必须清掉**：`trapExit` 第一步就把 `frame.sstatus` 写回 `sstatus`，`SIE = 1` 的话恢复寄存器的途中就可能被中断打断，而那时 `sscratch` 已经指向进程的内核栈，栈和寄存器都是一半新一半旧的状态。内核代码都是关着中断运行的，读到的 `SIE` 本来就是 0，但不依赖这一点（更早的版本里 shell 在内核里开着中断调用过这里，踩过这个坑）。
@@ -440,7 +440,7 @@ fn sched() void {
     if (!p.lock.holding()) @panic("sched: not holding the process lock");
     if (spinlock.heldCount() != 1) std.debug.panic("sched: {d} spinlocks held", .{spinlock.heldCount()});
     std.debug.assert(p.state != .running);
-    std.debug.assert(riscv.read(.sstatus) & riscv.sstatus_sie == 0);
+    std.debug.assert(!riscv.interruptsEnabled());
     switchContext(&p.context, &cpus[hart.id()].context);
 }
 

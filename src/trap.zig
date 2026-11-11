@@ -21,7 +21,7 @@ const hart = @import("hart.zig");
 pub const TrapFrame = extern struct {
     regs: [32]usize,
     sepc: usize,
-    sstatus: usize,
+    sstatus: riscv.Sstatus,
     /// 回到 U 模式时内核的 tp（当前 hart 的编号，见 hart.zig），下次从 U 模式陷入时换回来
     kernel_tp: usize = 0,
     /// 处理完这个陷阱、回到被打断的地方时 sscratch 要恢复成什么（见 trapEntry 的 sscratch 约定）：
@@ -145,7 +145,7 @@ fn trapEntry() align(4) callconv(.naked) noreturn {
         :
         : [handleTrap] "X" (&handleTrap),
           [trapExit] "X" (&trapExit),
-          [spp] "i" (riscv.sstatus_spp),
+          [spp] "i" (comptime riscv.bits(riscv.Sstatus{ .spp = .supervisor })),
     );
 }
 
@@ -181,17 +181,16 @@ pub fn trapExit() callconv(.naked) noreturn {
             \\sret
         , asm_offsets)
         :
-        : [spp] "i" (riscv.sstatus_spp),
+        : [spp] "i" (comptime riscv.bits(riscv.Sstatus{ .spp = .supervisor })),
     );
 }
 
 fn handleTrap(frame: *TrapFrame) callconv(.c) void {
     const scause = riscv.read(.scause);
-    const is_interrupt = scause >> 63 != 0;
-    const code = scause & ~(@as(usize, 1) << 63);
-    const from_user = frame.sstatus & riscv.sstatus_spp == 0;
+    const code = scause.code;
+    const from_user = frame.sstatus.spp == .user;
 
-    if (is_interrupt) {
+    if (scause.interrupt) {
         const interrupt: Interrupt = @fromBackingInt(code);
         switch (interrupt) {
             .supervisor_timer => {

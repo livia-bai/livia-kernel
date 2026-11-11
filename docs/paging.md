@@ -156,7 +156,7 @@ fn mapExcept(root: *PageTable, start: usize, end: usize, holes: []const usize, p
 ```zig
 pub fn activate(root: *PageTable) void {
     riscv.sfenceVma();
-    riscv.write(.satp, riscv.satp_sv39 | (@intFromPtr(root) >> 12));
+    riscv.write(.satp, .{ .mode = .sv39, .ppn = @intCast(@intFromPtr(root) >> 12) });
     riscv.sfenceVma();
 }
 ```

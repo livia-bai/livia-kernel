@@ -27,33 +27,43 @@
 
 ### 位定义
 
+有位定义的 CSR 读写的是 `packed struct(u64)`，字段名就是规范里的位名，和页表项 `vm.Pte` 一样：
+
 ```zig
-pub const sstatus_sie: usize = 1 << 1;  // S 模式全局中断使能
-pub const sstatus_spie: usize = 1 << 5; // 陷入前的 SIE，sret 时恢复到 SIE
-pub const sstatus_spp: usize = 1 << 8;  // 陷入前的特权级：0 = U，1 = S
-pub const sstatus_fs: usize = 3 << 13;  // 浮点单元状态（2 位）：0 = Off
-
-pub const sip_ssip: usize = 1 << 1;     // 软件中断挂起（核间中断），S 模式可写，处理时自己清
-pub const sie_ssie: usize = 1 << 1;     // 软件中断
-pub const sie_stie: usize = 1 << 5;     // 时钟中断
-pub const sie_seie: usize = 1 << 9;     // 外部中断（PLIC）
-
-pub const satp_sv39: usize = 8 << 60;   // satp.MODE = 8 表示 Sv39
+pub const Sstatus = packed struct(u64) {
+    _0: u1 = 0,
+    sie: bool = false,             // S 模式全局中断使能
+    _2: u3 = 0,
+    spie: bool = false,            // 陷入前的 SIE，sret 时恢复到 SIE
+    _6: u2 = 0,
+    spp: Privilege = .user,        // 陷入前的特权级；sret 回到这个特权级
+    _9: u4 = 0,
+    fs: u2 = 0,                    // 浮点单元状态：0 = Off
+    _15: u49 = 0,
+};
+pub const Interrupts = packed struct(u64) { ... ssi: bool, ... sti: bool, ... sei: bool, ... };  // sie 和 sip
+pub const Scause = packed struct(u64) { code: u63, interrupt: bool };
+pub const Satp = packed struct(u64) { ppn: u44, asid: u16 = 0, mode: enum(u4) { bare = 0, sv39 = 8, _ } };
 ```
+
+`read(.scause)` 的返回类型由 CSR 决定（`Type(csr)`：`.sstatus` 是 `Sstatus`，`.sie`、`.sip` 是 `Interrupts`，没有位定义的 `stval`、`time` 这些是 `usize`），所以 `handleTrap` 写 `scause.interrupt`、`frame.sstatus.spp == .user`，不再手工移位、对掩码。`set`、`clear` 的参数也是同一个类型：`set(.sie, .{ .sti = true })`。原来是一组 `usize` 常量（`sstatus_sie = 1 << 1`、`sie_ssie = 1 << 1`……），两个寄存器的第 1 位意思不一样，掩码却可以随手用错地方，编译器不拦。没用到的位也有名字（`_9` 这样），读出来、改几个字段、写回去时原样保留；`riscv.zig` 末尾用 `@bitOffsetOf` 对照规范检查了每个字段的位置。
+
+汇编里要用的立即数从同一个定义算出来：`trapEntry` 的 `andi t1, t1, %[spp]` 传的是 `comptime riscv.bits(riscv.Sstatus{ .spp = .supervisor })`（`bits` 把结构体换成整数），不另外写一个 `1 << 8`。
 
 陷阱发生时硬件自动做的事：`SPIE ← SIE`、`SIE ← 0`、`SPP ← 陷入前的特权级`。`sret` 反过来：`SIE ← SPIE`、`SPIE ← 1`、特权级 ← `SPP`、`SPP ← 0`，然后跳到 `sepc`。内核正是利用这一点进入 U 模式：把 `SPP` 设成 0、`SPIE` 设成 1，`sret` 之后就在 U 模式运行并且开着中断（见 [process.md](process.md#userinit)）。
 
-`sstatus` 里还有几个这个内核刻意保持为 0 的位：`SUM`（为 1 时 S 模式可以访问 U 页，见 [syscalls.md](syscalls.md#访问用户内存)）、`MXR`、`FS`（浮点单元状态）。`SUM` 和 `MXR` 进入内核时就是 0，内核从不设置它们。`FS` 不一样：OpenSBI 交过来时是 3（Dirty，浮点单元开着），实测入口处 `sstatus = 0x8000000200006000`。所以 `kmain` 一开始用 `clear(.sstatus, sstatus_fs)` 把它清成 0（Off），之后是 `0x200000000`，S 模式和 U 模式的浮点指令都是非法指令。CSR 是每个 hart 自己的，其他 hart 在 `kmainSecondary` 开头也各清一次（[boot.md](boot.md#启动其他-hart)）。最高位 SD 是只读的汇总位，`FS` 为 Dirty 时它是 1。
+`sstatus` 里还有几个这个内核刻意保持为 0 的位：`SUM`（为 1 时 S 模式可以访问 U 页，见 [syscalls.md](syscalls.md#访问用户内存)）、`MXR`、`FS`（浮点单元状态）。`SUM` 和 `MXR` 进入内核时就是 0，内核从不设置它们。`FS` 不一样：OpenSBI 交过来时是 3（Dirty，浮点单元开着），实测入口处 `sstatus = 0x8000000200006000`。所以 `kmain` 一开始用 `clear(.sstatus, .{ .fs = 3 })` 把它清成 0（Off），之后是 `0x200000000`，S 模式和 U 模式的浮点指令都是非法指令。CSR 是每个 hart 自己的，其他 hart 在 `kmainSecondary` 开头也各清一次（[boot.md](boot.md#启动其他-hart)）。最高位 SD 是只读的汇总位，`FS` 为 Dirty 时它是 1。
 
 ### 函数
 
 ```zig
-pub inline fn read(comptime csr: Csr) usize      // csrr
-pub inline fn write(comptime csr: Csr, value: usize) void   // csrw
-pub inline fn set(comptime csr: Csr, mask: usize) void      // csrs：mask 中为 1 的位置 1
-pub inline fn clear(comptime csr: Csr, mask: usize) void    // csrc：mask 中为 1 的位清 0
-pub inline fn enableInterrupts() void            // set(.sstatus, sstatus_sie)
-pub inline fn disableInterrupts() void           // clear(.sstatus, sstatus_sie)
+pub inline fn read(comptime csr: Csr) Type(csr)              // csrr
+pub inline fn write(comptime csr: Csr, value: Type(csr)) void   // csrw
+pub inline fn set(comptime csr: Csr, mask: Type(csr)) void      // csrs：mask 中为 1 的位置 1
+pub inline fn clear(comptime csr: Csr, mask: Type(csr)) void    // csrc：mask 中为 1 的位清 0
+pub inline fn enableInterrupts() void            // set(.sstatus, .{ .sie = true })
+pub inline fn disableInterrupts() void           // clear(.sstatus, .{ .sie = true })
+pub inline fn interruptsEnabled() bool           // read(.sstatus).sie
 pub inline fn wfi() void
 pub inline fn sfenceVma() void                   // sfence.vma zero, zero
 ```

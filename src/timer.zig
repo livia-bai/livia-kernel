@@ -37,7 +37,7 @@ pub fn init(hz: u64) void {
 pub fn initHart() void {
     deadline[hart.id()] = riscv.read(.time);
     arm();
-    riscv.set(.sie, riscv.sie_stie);
+    riscv.set(.sie, .{ .sti = true });
 }
 
 /// 预约当前 hart 的下一次时钟中断：在上一次的预约时刻上加一个周期，而不是在“现在”上加。

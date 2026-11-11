@@ -143,7 +143,7 @@ pub fn assertNoneHeld() void {
 fn assertInterruptsOff() void {
     // 单元测试在主机上运行，没有 sstatus
     if (comptime builtin.cpu.arch.isRISCV()) {
-        if (riscv.read(.sstatus) & riscv.sstatus_sie != 0) @panic("acquire: interrupts are enabled");
+        if (riscv.interruptsEnabled()) @panic("acquire: interrupts are enabled");
     }
 }
 

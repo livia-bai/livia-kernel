@@ -49,6 +49,6 @@ pub fn checkPanic() void {
 pub fn halt() noreturn {
     if (comptime !builtin.cpu.arch.isRISCV()) @panic("halt() in a unit test");
     riscv.disableInterrupts();
-    riscv.write(.sie, 0);
+    riscv.write(.sie, .{});
     while (true) riscv.wfi();
 }

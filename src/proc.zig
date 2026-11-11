@@ -201,7 +201,13 @@ fn startFrame(frame: *trap.TrapFrame, image: Image) void {
         // SPP = 0：sret 回到 U 模式；SPIE = 1：回到 U 模式后打开中断，时钟和键盘照常工作。
         // SIE 必须清掉：trapExit 一开始就写回 sstatus，SIE = 1 的话恢复寄存器的途中就可能被中断打断。
         // （内核代码都是关着中断运行的，读到的 SIE 本来就是 0，但不依赖这一点。）
-        .sstatus = (riscv.read(.sstatus) & ~(riscv.sstatus_spp | riscv.sstatus_sie)) | riscv.sstatus_spie,
+        .sstatus = blk: {
+            var st = riscv.read(.sstatus);
+            st.spp = .user;
+            st.sie = false;
+            st.spie = true;
+            break :blk st;
+        },
     };
     frame.regs[2] = image.sp;
     frame.regs[10] = image.argc;
@@ -532,7 +538,7 @@ fn sched() void {
     // 拿着别的锁切走的话，别的进程再拿这把锁就会死锁
     if (spinlock.heldCount() != 1) std.debug.panic("sched: {d} spinlocks held", .{spinlock.heldCount()});
     std.debug.assert(p.state != .running);
-    std.debug.assert(riscv.read(.sstatus) & riscv.sstatus_sie == 0);
+    std.debug.assert(!riscv.interruptsEnabled());
     checkStack();
     // 不能缓存 cpus[hart.id()]：切回来时可能已经在另一个 hart 上了
     switchContext(&p.context, &cpus[hart.id()].context);

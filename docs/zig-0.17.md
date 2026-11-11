@@ -72,7 +72,7 @@ error: file exists in modules 'sys' and 'program'
 error: unused argument in '...'
 ```
 
-用 `comptimePrint` 生成汇编代码时，参数结构体里有格式串没用到的字段就会报错（比如 `trapEntry`、`trapExit` 想共用一个偏移量结构体，而其中一个字段只有 `trapExit` 用）。解决办法：把多段汇编模板先用 `++` 拼起来再统一 `comptimePrint`；只有一边用到的常量改用内联汇编的操作数传入，比如立即数用 `"i"` 约束：`andi t0, t0, %[spp]` + `[spp] "i" (riscv.sstatus_spp)`。
+用 `comptimePrint` 生成汇编代码时，参数结构体里有格式串没用到的字段就会报错（比如 `trapEntry`、`trapExit` 想共用一个偏移量结构体，而其中一个字段只有 `trapExit` 用）。解决办法：把多段汇编模板先用 `++` 拼起来再统一 `comptimePrint`；只有一边用到的常量改用内联汇编的操作数传入，比如立即数用 `"i"` 约束：`andi t0, t0, %[spp]` + `[spp] "i" (comptime riscv.bits(riscv.Sstatus{ .spp = .supervisor }))`。裸函数里不能有运行时调用，所以算立即数的函数调用要写 `comptime`。
 
 ### 内联汇编里取变量的地址不能用 `"X"` 约束
 

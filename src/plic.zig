@@ -52,7 +52,7 @@ pub fn init(disk_irq: u32) void {
 pub fn initHart() void {
     enable().* = enabled;
     threshold().* = 0; // 接收所有优先级 > 0 的中断
-    riscv.set(.sie, riscv.sie_seie);
+    riscv.set(.sie, .{ .sei = true });
 }
 
 /// 领取当前优先级最高的待处理中断，返回中断号；0 表示没有。
