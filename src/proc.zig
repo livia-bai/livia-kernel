@@ -147,7 +147,8 @@ const Context = extern struct {
 };
 
 /// 找一个空槽位，拿着它的锁返回（对应 xv6 的 allocproc）。拿着锁，别的 hart 就看不到它半填好的样子。
-/// 槽位空着，它的内核栈没人用，顺便重新写上金丝雀。
+/// 槽位空着，它的内核栈没人用，顺便重新写上金丝雀（只写最底下的，栈的其余部分留着上一个进程用过的痕迹，
+/// 高水位量的是整个运行期间的最深值，见 kstack.deepest）。
 fn allocSlot() error{TooManyProcesses}!*Process {
     for (&table) |*p| {
         p.lock.acquire();

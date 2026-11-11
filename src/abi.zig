@@ -238,6 +238,12 @@ pub const Errno = enum(usize) {
     _,
 };
 
+/// 用户地址空间：[user_base, user_end)，Sv39 根页表的第 1 项（见 vm.zig）。程序从 user_base 开始链接（user/linker.ld），
+/// 栈从 user_end 往下长，最多 user_stack_max 字节，再往下一页是保护页。
+pub const user_base: usize = 0x4000_0000;
+pub const user_end: usize = 0x8000_0000;
+pub const user_stack_max: usize = 1 << 20;
+
 /// 进程表的大小：最多同时有这么多个进程（包括 init、shell 和还没被回收的 zombie）。
 pub const max_procs = 64;
 

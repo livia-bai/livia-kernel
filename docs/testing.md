@@ -49,7 +49,7 @@ python3 tools/qemu_test.py --smp 8        # 只用 8 个 hart 跑（可以给几
 python3 tools/qemu_test.py --list         # 列出用例和它们覆盖的文件
 ```
 
-每种模式只构建一次（带上 `user/tests/` 里的测试程序），然后对每个 hart 数（默认 `-smp 1` 和 `-smp 4`）各启动一次 QEMU（每次接上一份新拷的磁盘镜像 `disk-smpN.img`，不加 `snapshot=on`，退出之后还要读它），等提示符出现再一条条输入命令、检查输出。不管跑哪些用例，都会检查启动日志（包括 `[ok] N harts running` 里的 N 等于 `-smp` 给的数、文件系统挂上了）；结束时还要求前后两次 `mem` 的空闲页数相同（不能漏页）、`shutdown` 后 QEMU 的退出码为 0、输出里没有 `KERNEL PANIC`。
+每种模式只构建一次（带上 `user/tests/` 里的测试程序），然后对每个 hart 数（默认 `-smp 1` 和 `-smp 4`）各启动一次 QEMU（每次接上一份新拷的磁盘镜像 `disk-smpN.img`，不加 `snapshot=on`，退出之后还要读它），等提示符出现再一条条输入命令、检查输出。不管跑哪些用例，都会检查启动日志（包括 `[ok] N harts running` 里的 N 等于 `-smp` 给的数、文件系统挂上了）；结束时还要求前后两次 `mem` 的空闲页数相同（不能漏页）、`shutdown` 后 QEMU 的退出码为 0、内核打印的每种内核栈用到过的最深处离栈底至少还有 2048 字节（`STACK_MARGIN`，[process.md](process.md#进程表)）、输出里没有 `KERNEL PANIC`。QEMU 的命令行、进程表的大小这些常量从 `zig build` 生成的 `config.json` 读（[build.md](build.md#给测试脚本的配置)）。
 
 两次 `mem` 都在**新启动的 shell** 里看（`fresh_mem`）：先 `kill $$` 让 shell 结束，init 重新启动一个，新 shell 的第一条命令就是 `mem`。按需分页之后进程的页用到才分配，一直在运行的 shell 执行的命令越多、用到的页越多（代码、栈），直接比较开头和结尾会差几页，分不出是漏页还是 shell 长大了；两个新 shell 走的是同一条路，用到的页一样多（init 重启 shell 的那段代码在第一次时就读进来了）。
 

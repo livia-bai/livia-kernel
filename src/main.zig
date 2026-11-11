@@ -17,7 +17,6 @@ const hart = @import("hart.zig");
 const ipi = @import("ipi.zig");
 const virtio_disk = @import("virtio_disk.zig");
 const bio = @import("bio.zig");
-const canary = @import("canary.zig");
 const kstack = @import("kstack.zig");
 
 /// 替换标准库默认的 panic 处理。@panic、std.debug.panic 以及
@@ -35,7 +34,7 @@ fn kernelPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 // 每个 hart 的启动栈（kstack.boot，32 KiB，下面一页是保护页），按 hart 编号下标。kmain / kmainSecondary 在上面运行，
-// 之后归这个 hart 的调度器用。最底下放着金丝雀（canary.zig），kmain / kmainSecondary 一开始写上，调度器每一轮检查。
+// 之后归这个 hart 的调度器用。最底下放着金丝雀（canary.zig），kmain 一开始给所有 hart 写上（kstack.paintAll），调度器每一轮检查。
 // 导出成符号 boot_stacks，汇编里按名字取地址：用 "X" 约束传进去的话，编译器会先把地址算进一个寄存器（这里占了 a0）。
 // 导出要写在根文件里（docs/zig-0.17.md）。
 comptime {
@@ -94,9 +93,10 @@ fn secondaryEntry() callconv(.naked) noreturn {
 }
 
 fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
-    // 启动栈最底下的金丝雀（canary.zig）：kmain 那一串初始化是启动栈用得最深的地方，越早写上越好，
-    // 之后调度器每一轮检查一次
-    canary.set(&kstack.boot[hartid].stack);
+    // 所有的栈都写上金丝雀的图案（canary.zig）：每块栈最底下的金丝雀由此写好，之后调度器每一轮检查启动栈的；
+    // 栈从没用到的地方也保持图案，shutdown 时量出每种栈用到过多深（kstack.deepest）。
+    // kmain 那一串初始化是启动栈用得最深的地方，越早写上越好
+    kstack.paintAll(hartid);
     // OpenSBI 交过来时 FS 是 Dirty，浮点单元开着。这个内核不支持浮点（陷阱处理不保存浮点寄存器），
     // 关掉它：否则用户程序能直接用浮点寄存器，里面的值还会留给下一个进程
     riscv.clear(.sstatus, riscv.sstatus_fs);
@@ -188,7 +188,6 @@ fn startHarts(self: usize, ids: []const u32, timebase_hz: u64) void {
 
 /// 其他 hart 的初始化（kmain 的每个 hart 一份的部分），然后进入调度器。全局的东西启动 hart 都已经做好了。
 fn kmainSecondary() callconv(.c) noreturn {
-    canary.set(&kstack.boot[hart.id()].stack); // 见 kmain
     riscv.clear(.sstatus, riscv.sstatus_fs); // 见 kmain
     trap.init();
     vm.initHart();

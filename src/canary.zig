@@ -10,6 +10,9 @@
 //!
 //! 这是尽力而为的检查：一个很大、只写了一部分的栈帧可能整个跨过金丝雀，它没被改，下面的数据却被改了。
 //! 留 size 字节而不是一个字，就是为了让这种情况少一些。
+//!
+//! 同一个图案还用来量栈用到过多深（高水位）：启动时把整块栈都写上（paint），之后从栈底往上找第一个被改过的字（used），
+//! 它以上就是用到过的部分（kstack.deepest）。
 
 const std = @import("std");
 
@@ -23,9 +26,31 @@ fn words(stack: []u8) *[size / 8]u64 {
     return @ptrCast(@alignCast(stack[0..size]));
 }
 
+/// stack 当成按 8 字节对齐的字（长度向下取整到 8 的倍数）。
+fn allWords(stack: []u8) []u64 {
+    return @as([*]u64, @ptrCast(@alignCast(stack.ptr)))[0 .. stack.len / 8];
+}
+
 /// 在栈 stack（整块，低地址在前）的最底下写上图案。栈还没开始用、或者这块栈当前没人用时调用。
 pub fn set(stack: []u8) void {
     @memset(words(stack), word);
+}
+
+/// 把 region（栈最底下的一段，或者整块栈）都写上图案。栈从没用到过的地方保持图案，used 才量得出用到过多深。
+/// 包含了 set 写的那 size 字节。region 里不能有正在用的栈帧。
+pub fn paint(region: []u8) void {
+    @memset(allWords(region), word);
+}
+
+/// 栈 stack 用到过的最深处离栈顶多少字节：从栈底往上第一个不是图案的字以上都算用到过。
+/// 栈可能正被别的 hart 用着（shutdown 时量），所以逐个字原子地读，读到的是某一时刻的值。
+/// 前提是这块栈用之前 paint 过；金丝雀被改过的话，结果就是整块栈。
+pub fn used(stack: []u8) usize {
+    const ws = allWords(stack);
+    for (ws, 0..) |*w, i| {
+        if (@atomicLoad(u64, w, .monotonic) != word) return stack.len - i * 8;
+    }
+    return 0;
 }
 
 /// 图案还在不在。
@@ -39,6 +64,19 @@ pub fn intact(stack: []u8) bool {
 /// 图案被改了就 panic，what 说明是哪块栈。
 pub fn check(stack: []u8, comptime what: []const u8, args: anytype) void {
     if (!intact(stack)) std.debug.panic("kernel stack overflow: " ++ what, args);
+}
+
+test "高水位：paint 之后没用过是 0，用到哪里量到哪里" {
+    var stack: [1024]u8 align(16) = undefined;
+    paint(&stack);
+    try std.testing.expect(intact(&stack));
+    try std.testing.expectEqual(0, used(&stack));
+    stack[1023] = 0; // 栈顶的一个字节
+    try std.testing.expectEqual(8, used(&stack));
+    stack[600] = 0;
+    try std.testing.expectEqual(1024 - 600, used(&stack));
+    stack[3] = 0; // 金丝雀被改了：整块
+    try std.testing.expectEqual(1024, used(&stack));
 }
 
 test "金丝雀：写上之后完好，栈底任何一个字节被改了都能发现" {

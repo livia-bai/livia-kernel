@@ -2,6 +2,11 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-11 内核自己量栈用到过多深；测试脚本的常量从构建导出
+
+- 新增：内核栈的高水位。启动时 `kstack.paintAll` 把所有的栈（进程内核栈、启动栈、陷阱栈）都写上金丝雀的图案，关机时 `kstack.deepest` 从栈底找第一个被改过的字，打印 `[stack] deepest use: process P of 16384, boot B of 32768, trap T of 16384 bytes`。`qemu_test.py` 要求每种栈至少留 2048 字节。实测 Debug 模式下进程内核栈最深 13912 字节，比文档里以前记的 11624 字节深。
+- 新增：`zig build` 生成 `zig-out/config.json`（`build.zig` 的 `Config`）：QEMU 的命令行、`max_procs`、`max_args`、磁盘镜像的布局、用户地址空间和栈下面的保护页。`qemu_test.py` 读它，不再手抄这些数。`user_base`、`user_end`、`user_stack_max` 从 `vm.zig` 挪到 `abi.zig`。
+
 ## 2026-11-11 错误码按名字查表；read 不再为用不到的缓冲区分配页；wakeup 没人在等时不扫进程表
 
 - 改动：系统调用把内核的错误换成错误码统一走 `syscall.errnos`（错误名 → 错误码的表）：`errno` 在编译期逐个查表，表里没有的错误编译不过，不再有 `else => EIO` 兜底。`fsys.errno` 去掉了，各个系统调用里手写的 `switch` 换成 `failWith(err)`。原始区域的块号超出范围在内核里改叫 `InvalidArgument`（错误码还是 `-EINVAL`）。

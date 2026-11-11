@@ -13,6 +13,8 @@
 """
 
 import argparse
+import functools
+import json
 import os
 import random
 import re
@@ -24,8 +26,7 @@ import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 MODES = ["debug", "safe", "fast", "small"]
-QEMU = ["qemu-system-riscv64", "-machine", "virt", "-m", "128M", "-nographic", "-bios", "default"]
-DEFAULT_SMP = [1, 4]  # 单核、多核各跑一遍；4 和 build.zig 里 zig build run 用的一样
+DEFAULT_SMP = [1, 4]  # 单核、多核各跑一遍；4 和 build.zig 里 zig build run 用的一样（config.json 的 run_smp，启动时检查）
 
 BOOT_TIMEOUT = 60  # 秒：从启动 QEMU 到出现第一个提示符
 COMMAND_TIMEOUT = 60  # 秒：每条命令从发出到出现下一个提示符
@@ -34,11 +35,16 @@ SPIN_SECONDS = 0.5  # 让 spin 转多久再按 Ctrl-C
 MIN_SPIN_TICKS = 10  # 这段时间里至少要有多少次时钟中断（100 Hz 下理论上约 50 次）
 TIMEBASE_HZ = 10_000_000  # QEMU virt 的 time CSR 频率
 
-# 用户地址空间里栈下面那一页保护页（src/vm.zig 的 heap_limit..stack_limit，栈最多 1 MiB）
-GUARD_PAGE = (0x7FEFF000, 0x7FF00000)
-USER_SPACE = (0x40000000, 0x80000000)
-MAX_PROCS = 64  # src/abi.zig 的 max_procs，其中两个槽位是 init 和 sh
-MAX_ARGS = 32  # src/abi.zig 的 max_args
+# 下面这些在 Zig 里已经定义了，从 zig build 生成的 config.json 读（build.zig 的 Config），见 load_config
+QEMU = None  # QEMU 的命令行（不含 -smp、-kernel、磁盘）
+QEMU_DISK = None  # 接磁盘的参数，镜像的路径填进 {disk}
+GUARD_PAGE = None  # 用户地址空间里栈下面那一页保护页（src/vm.zig 的 heap_limit..stack_limit）
+USER_SPACE = None
+MAX_PROCS = None  # src/abi.zig 的 max_procs，其中两个槽位是 init 和 sh
+MAX_ARGS = None  # src/abi.zig 的 max_args
+FS_BLOCKS = None  # 磁盘镜像的前 FS_BLOCKS 块是文件系统（mkfs 的参数）
+RAW_BLOCKS = None  # 后 RAW_BLOCKS 块是原始区域
+BLOCK_SIZE = None
 # t_ipi 的两个延迟（中位数，微秒）的上限，多核时检查。没有核间中断时实测 kill ≥ 4000、wakeup ≥ 1100；
 # 有了之后 kill 约 300～560（Debug 最慢，含打印 killed 那一行）、wakeup 约 200
 IPI_KILL_MAX_US = 2000
@@ -56,8 +62,7 @@ class Qemu:
     def __init__(self, kernel, smp, disk):
         # 磁盘：virtio 块设备，现代（version 2）的 virtio-mmio 接口，和 build.zig 的 zig build run 一样，
         # 只是不加 snapshot=on：退出之后要检查写进磁盘镜像的内容
-        drive = ["-global", "virtio-mmio.force-legacy=false", "-drive", f"if=none,format=raw,id=disk,file={disk}",
-                 "-device", "virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0"]
+        drive = [a.replace("{disk}", disk) for a in QEMU_DISK]
         self.proc = subprocess.Popen(
             QEMU + ["-smp", str(smp), "-kernel", kernel] + drive,
             stdin=subprocess.PIPE,
@@ -715,23 +720,24 @@ def case_ipi(q, c, mode):
     exited(c, out, "t_ipi", 0)
 
 
-# build.zig 生成的磁盘镜像：前 FS_BLOCKS 块是文件系统（mkfs 的参数），后 DISK_BLOCKS 块是原始区域，
+# build.zig 生成的磁盘镜像：前 FS_BLOCKS 块是文件系统（mkfs 的参数），后 RAW_BLOCKS 块是原始区域，
 # readblock/writeblock 只能读写原始区域，块号从它的开头算。原始区域的图案和 t_disk 改写的块见下面（几边的公式要一致）
-FS_BLOCKS = 7168
-DISK_BLOCKS = 1024
-BLOCK_SIZE = 4096
-_PERIOD = bytes(i % 251 for i in range(BLOCK_SIZE + 251))
 
 
 def disk_original(b):
     """镜像里第 b 块的内容：第 i 个字节是 (b * 131 + i) % 251。按 251 循环，所以是一段固定序列的切片。"""
     start = b * 131 % 251
-    return _PERIOD[start:start + BLOCK_SIZE]
+    return _period()[start:start + BLOCK_SIZE]
+
+
+@functools.cache
+def _period():
+    return bytes(i % 251 for i in range(BLOCK_SIZE + 251))
 
 
 def disk_expected(b):
     """t_disk 跑过之后第 b 块应该是什么。"""
-    if b == 0 or b == DISK_BLOCKS - 1 or 100 <= b < 140:
+    if b == 0 or b == RAW_BLOCKS - 1 or 100 <= b < 140:
         return bytes(255 - x for x in disk_original(b))
     if 200 <= b < 500:
         k = (b - 200) // 50
@@ -742,9 +748,9 @@ def disk_expected(b):
 def check_disk_image(q, c):
     with open(q.disk, "rb") as f:
         image = f.read()
-    c.expect(len(image) == (FS_BLOCKS + DISK_BLOCKS) * BLOCK_SIZE, f"disk image: {len(image)} bytes")
+    c.expect(len(image) == (FS_BLOCKS + RAW_BLOCKS) * BLOCK_SIZE, f"disk image: {len(image)} bytes")
     raw = image[FS_BLOCKS * BLOCK_SIZE:]
-    bad = [b for b in range(DISK_BLOCKS) if raw[b * BLOCK_SIZE:(b + 1) * BLOCK_SIZE] != disk_expected(b)]
+    bad = [b for b in range(RAW_BLOCKS) if raw[b * BLOCK_SIZE:(b + 1) * BLOCK_SIZE] != disk_expected(b)]
     c.expect(not bad, f"disk image after shutdown: {len(bad)} blocks differ from what t_disk wrote, first {bad[:8]}")
 
 
@@ -1044,6 +1050,25 @@ def build(mode, prefix):
     # 链接器的警告会以 "error: warning(link)" 打印出来，但 zig build 仍然返回 0，所以输出必须为空
     if r.returncode != 0 or r.stdout.strip():
         raise Failure(f"`{' '.join(cmd)}` failed (exit {r.returncode}) or printed output:\n{indent(r.stdout)}")
+    load_config(os.path.join(prefix, "config.json"))
+
+
+def load_config(path):
+    """读 zig build 生成的 config.json（build.zig 的 Config），设好上面那些常量。"""
+    global QEMU, QEMU_DISK, GUARD_PAGE, USER_SPACE, MAX_PROCS, MAX_ARGS, FS_BLOCKS, RAW_BLOCKS, BLOCK_SIZE
+    with open(path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    QEMU = cfg["qemu"]
+    QEMU_DISK = cfg["qemu_disk"] + [cfg["qemu_drive"] + "{disk}"] + cfg["qemu_disk_device"]
+    GUARD_PAGE = tuple(cfg["user_stack_guard"])
+    USER_SPACE = tuple(cfg["user_space"])
+    MAX_PROCS = cfg["max_procs"]
+    MAX_ARGS = cfg["max_args"]
+    FS_BLOCKS = cfg["fs_blocks"]
+    RAW_BLOCKS = cfg["raw_blocks"]
+    BLOCK_SIZE = cfg["block_size"]
+    if cfg["run_smp"] not in DEFAULT_SMP:
+        raise Failure(f"zig build run uses {cfg['run_smp']} harts, but DEFAULT_SMP is {DEFAULT_SMP}")
 
 
 def check_boot(q, c, smp):
@@ -1056,12 +1081,28 @@ def check_boot(q, c, smp):
         r"\[ok\] page allocator: \d+ free pages",
         r"\[ok\] Sv39 paging enabled: .*, 80 stack guard pages unmapped\n",
         r"\[ok\] stack overflow check: hitting a guard page traps onto the trap stack\n",
-        r"\[ok\] virtio disk: 8192 blocks of 4 KiB \(32 MiB\), irq 1, flush\n",
+        rf"\[ok\] virtio disk: {FS_BLOCKS + RAW_BLOCKS} blocks of 4 KiB \({(FS_BLOCKS + RAW_BLOCKS) * BLOCK_SIZE >> 20} MiB\), irq 1, flush\n",
         rf"\[ok\] file system: \d+ of {FS_BLOCKS} blocks free, generation \d+\n",
         r"\[ok\] interrupt sources enabled: timer at 100 Hz, keyboard via UART \+ PLIC, IPIs, disk\n",
         rf"\[ok\] {smp} harts? running, booted on hart \d+\n",
     ]:
         c.contains(text, pattern, "boot log")
+
+
+# 内核栈至少要留这么多字节没用到过（shutdown 时内核打印每种栈用到过的最深处，kstack.deepest）。
+# 最底下 256 字节是金丝雀，碰到就 panic；再留一些，栈用得越来越深时在这里先发现，而不是等到真的溢出
+STACK_MARGIN = 2048
+STACK_USE = re.compile(r"\[stack\] deepest use: process (\d+) of (\d+), boot (\d+) of (\d+), trap (\d+) of (\d+) bytes\n")
+
+
+def check_stack_use(c, text):
+    m = STACK_USE.search(text)
+    c.expect(m is not None, "shutdown: no '[stack] deepest use' line")
+    if m is None:
+        return
+    for i, name in enumerate(["process", "boot", "trap"]):
+        used, size = int(m.group(2 * i + 1)), int(m.group(2 * i + 2))
+        c.expect(size - used >= STACK_MARGIN, f"{name} stack: {used} of {size} bytes used, less than {STACK_MARGIN} left")
 
 
 def fresh_mem(q, c):
@@ -1093,6 +1134,7 @@ def run_session(kernel, disk, log_path, names, mode, smp):
         q.send("shutdown\r")
         code = q.finish(COMMAND_TIMEOUT)
         session.expect(code == 0, f"shutdown: QEMU exit code {code}, expected 0")
+        check_stack_use(session, q.text())
         for c, check in q.after_shutdown:
             check(c)
     except Failure as e:

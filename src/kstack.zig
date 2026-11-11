@@ -17,6 +17,7 @@
 const std = @import("std");
 const hart = @import("hart.zig");
 const abi = @import("abi.zig");
+const canary = @import("canary.zig");
 
 const page_size = 4096;
 
@@ -36,12 +37,12 @@ pub fn Stack(comptime size: usize) type {
     };
 }
 
-/// 启动栈 32 KiB：实测 Debug 模式下跑完全部 QEMU 测试，启动 hart 最深用了约 17 KiB（kmain 那一串初始化），
-/// 其他 hart 不到 2 KiB；safe 模式下分别约 3.6 KiB 和 0.8 KiB（见 docs/boot.md）。
+/// 启动栈 32 KiB：实测 Debug 模式下跑完全部 QEMU 测试，最深用了约 18 KiB（kmain 那一串初始化），safe 模式下约 4.7 KiB。
+/// 这些数是 shutdown 时 deepest 量的（见 docs/process.md），qemu_test.py 检查余量。
 pub const Boot = Stack(32 * 1024);
 /// 陷阱栈 16 KiB：中断处理程序都很浅，最深的是 panic（格式化输出）
 pub const Trap = Stack(16 * 1024);
-/// 进程的内核栈 16 KiB：实测 Debug 模式下最深的是文件系统的系统调用，约 11 KiB（见 docs/process.md）
+/// 进程的内核栈 16 KiB：实测 Debug 模式下最深的是文件系统的系统调用，约 13.6 KiB（见 docs/process.md）
 pub const Process = Stack(16 * 1024);
 
 /// main.zig 用 @export 导出成 boot_stacks：_start、secondaryEntry 的汇编按名字取地址
@@ -51,6 +52,37 @@ pub var trap: [hart.max]Trap = undefined;
 pub var process: [abi.max_procs]Process = undefined;
 
 pub const guard_count = boot.len + trap.len + process.len;
+
+/// 启动 hart 的 kmain 一开始调用（别的 hart 还没启动、没有进程、还没有陷阱）：把所有的栈都写上金丝雀的图案，
+/// deepest 之后才量得出每块栈用到过多深；顺便写好了每块栈底的金丝雀。启动 hart 自己的启动栈正在用，
+/// 只写到当前的 sp 往下留出 1 KiB 的地方（paint 自己和它调用的 memset 的栈帧都在这 1 KiB 里）。
+pub fn paintAll(boot_hart: usize) void {
+    for (&process) |*s| canary.paint(&s.stack);
+    for (&trap) |*s| canary.paint(&s.stack);
+    for (&boot, 0..) |*s, i| if (i != boot_hart) canary.paint(&s.stack);
+    paintBelowSp(&boot[boot_hart].stack);
+}
+
+noinline fn paintBelowSp(stack: []u8) void {
+    const sp = asm volatile ("mv %[sp], sp"
+        : [sp] "=r" (-> usize),
+    );
+    const end = sp - 1024 - @intFromPtr(stack.ptr);
+    std.debug.assert(end >= canary.size and end < stack.len);
+    canary.paint(stack[0..end]);
+}
+
+/// 各种栈用到过的最深处（字节，从栈顶算），取所有 hart、所有进程槽位里最大的。见 paintAll。
+pub const Usage = struct { process: usize = 0, boot: usize = 0, trap: usize = 0 };
+
+/// 量一遍所有的栈（shutdown 时打印，qemu_test.py 检查还有多少余量）。正在用的栈也量，读到的是某一时刻的值。
+pub fn deepest() Usage {
+    var u: Usage = .{};
+    for (&process) |*s| u.process = @max(u.process, canary.used(&s.stack));
+    for (&boot) |*s| u.boot = @max(u.boot, canary.used(&s.stack));
+    for (&trap) |*s| u.trap = @max(u.trap, canary.used(&s.stack));
+    return u;
+}
 
 /// 所有保护页的地址（vm.init 不映射它们），按地址从低到高。
 /// 三个数组在 .bss 里谁先谁后由链接器定，所以要排序。用插入排序：std.mem.sort 在栈上放一个 4 KiB 的缓存，

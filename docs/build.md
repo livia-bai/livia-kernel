@@ -219,7 +219,7 @@ const mkfs = b.addExecutable(.{
 });
 const make_disk = b.addRunArtifact(mkfs);
 const disk = make_disk.addOutputFileArg("disk.img");
-make_disk.addArgs(&.{ "8192", "7168" });
+make_disk.addArgs(&.{ b.fmt("{d}", .{disk_blocks}), b.fmt("{d}", .{fs_blocks}) });
 for (program_bins.items) |bin| make_disk.addFileArg(bin);
 b.getInstallStep().dependOn(&b.addInstallFile(disk, "disk.img").step);
 ```
@@ -227,21 +227,27 @@ b.getInstallStep().dependOn(&b.addInstallFile(disk, "disk.img").step);
 - `mkfs`（`src/mkfs.zig`，[fs.md](fs.md#生成磁盘镜像mkfszig)）编译成**主机**的程序，构建时运行：`mkfs <输出> 8192 7168 <ELF>...`。32 MiB 的镜像，前 7168 块格式化成文件系统，选中的每个用户程序装成 `/bin/<名字>`，再建 `/dev/console`、`/dev/null`、`/dev/zero` 三个设备文件；后 1024 块是原始区域，填上固定图案（第 b 块的第 i 个字节是 `(b * 131 + i) % 251`），给回归测试 `t_disk` 检查读写（[disk.md](disk.md)）。结果装到 `zig-out/disk.img`。
 - `addOutputFileArg`、`addFileArg` 让构建系统知道 Run 步骤的输入和输出：`mkfs` 或哪个 ELF 变了才重新生成，否则命中缓存。`InstallFile` 发现 `zig-out/disk.img` 的大小或修改时间和缓存里的不一样就重新拷一份，所以磁盘被改写过之后，下一次 `zig build` 会恢复原样。
 - `-Dtest-programs=true` 时测试程序也装进 `/bin`，镜像和平时的不一样（空闲块少一些）。
-- 两个数字和原始区域的图案在几个地方各写了一遍：`build.zig`（`mkfs` 的参数）、`src/mkfs.zig`（图案）、`user/tests/t_disk.zig`（原始区域的块数和图案）、`tools/qemu_test.py`（`FS_BLOCKS`、`DISK_BLOCKS`、`disk_original`），改一处要一起改。
+- 两个数字是 `build.zig` 顶上的 `disk_blocks`、`fs_blocks`，`qemu_test.py` 从 `config.json` 读（见下面的[给测试脚本的配置](#给测试脚本的配置)）。原始区域的图案和块数还在几个地方各写了一遍：`src/mkfs.zig`（图案）、`user/tests/t_disk.zig`（原始区域的块数和图案）、`tools/qemu_test.py`（`disk_original`），改一处要一起改。
 
 ## 运行步骤
 
 ```zig
-const qemu = b.addSystemCommand(&.{
-    "qemu-system-riscv64", "-machine", "virt", "-smp", "4", "-m", "128M",
-    "-nographic", "-bios", "default", "-kernel",
-});
+const qemu_machine = [_][]const u8{ "qemu-system-riscv64", "-machine", "virt", "-m", "128M", "-nographic", "-bios", "default" };
+const run_smp = 4;
+const qemu_disk_global = [_][]const u8{ "-global", "virtio-mmio.force-legacy=false" };
+const qemu_drive = "if=none,format=raw,id=disk";
+const qemu_disk_device = [_][]const u8{ "-device", "virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0" };
+
+const qemu = b.addSystemCommand(&qemu_machine);
+qemu.addArgs(&.{ "-smp", b.fmt("{d}", .{run_smp}), "-kernel" });
 qemu.addArtifactArg2(kernel, .{});
-qemu.addArgs(&.{ "-global", "virtio-mmio.force-legacy=false", "-drive" });
-qemu.addPrefixedFileArg("if=none,format=raw,id=disk,snapshot=on,file=", disk);
-qemu.addArgs(&.{ "-device", "virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0" });
+qemu.addArgs(&(qemu_disk_global ++ .{"-drive"}));
+qemu.addPrefixedFileArg(qemu_drive ++ ",snapshot=on,file=", disk);
+qemu.addArgs(&qemu_disk_device);
 qemu.addPassthruArgs();
 ```
+
+这些参数定义成 `build.zig` 顶上的常量，是为了和 `qemu_test.py` 共用（下一节）。
 
 | 参数 | 含义 |
 | --- | --- |
@@ -256,6 +262,23 @@ qemu.addPassthruArgs();
 | `-device virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0` | 把它接成 virtio 块设备，放在第 0 个 virtio-mmio 槽位（`0x1000_1000`，PLIC 的 1 号中断） |
 
 `addPassthruArgs()` 把 `zig build run -- ...` 里 `--` 之后的参数追加到 QEMU 命令行末尾（0.17 之前的写法是 `if (b.args) |args| run.addArgs(args)`，`b.args` 已经没有了）。
+
+## 给测试脚本的配置
+
+`tools/qemu_test.py` 要知道一些已经在 Zig 里定义了的东西：QEMU 的命令行、进程表多大（测“进程表满了”）、`exec` 最多几个参数、磁盘镜像的布局、用户地址空间和栈下面的保护页（测“被杀时的 `stval` 落在哪”）。原来它们在脚本里手抄一份，改一边忘了另一边，测试就在测一个过时的数。现在 `build.zig` 把它们放进一个结构体 `Config`（字段的默认值直接引用 `src/abi.zig` 的常量和 `build.zig` 自己的常量），用 `std.json.Stringify.valueAlloc` 写成 `zig-out/config.json`，测试脚本构建完读它（`load_config`）：
+
+```zig
+const abi_consts = @import("src/abi.zig");   // build.zig 可以直接导入仓库里的 Zig 文件
+const Config = struct {
+    max_procs: usize = abi_consts.max_procs,
+    fs_blocks: usize = fs_blocks,
+    user_stack_guard: [2]usize = .{ abi_consts.user_end - abi_consts.user_stack_max - 4096, abi_consts.user_end - abi_consts.user_stack_max },
+    qemu: []const []const u8 = &qemu_machine,
+    ...
+};
+```
+
+用户地址空间的几个常量（`user_base`、`user_end`、`user_stack_max`）因此从 `vm.zig` 挪到了 `abi.zig`：它们本来就是内核和用户程序之间的约定（用户程序从 `user_base` 链接），`vm.zig` 引用它们。
 
 ## 产物和缓存
 

@@ -17,6 +17,7 @@ const file = @import("file.zig");
 const bio = @import("bio.zig");
 const fsys = @import("fsys.zig");
 const fs = @import("fs.zig");
+const kstack = @import("kstack.zig");
 const Fs = fsys.Fs;
 
 comptime {
@@ -596,6 +597,11 @@ fn meminfo(ptr: usize) usize {
     return 0;
 }
 
+/// 关机之前打印各种内核栈用到过的最深处（kstack.deepest），qemu_test.py 检查它们离栈底还有足够的余量。
 fn shutdown() noreturn {
+    const u = kstack.deepest();
+    uart.print("[stack] deepest use: process {d} of {d}, boot {d} of {d}, trap {d} of {d} bytes\n", .{
+        u.process, kstack.Process.stack_size, u.boot, kstack.Boot.stack_size, u.trap, kstack.Trap.stack_size,
+    });
     sbi.shutdown();
 }

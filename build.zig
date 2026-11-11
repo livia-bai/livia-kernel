@@ -1,4 +1,38 @@
 const std = @import("std");
+/// 和内核、用户程序共用的常量（进程表大小、用户地址空间……），导出进 config.json 给 tools/qemu_test.py
+const abi_consts = @import("src/abi.zig");
+
+// 磁盘镜像：共 disk_blocks 块，前 fs_blocks 块是文件系统，后面是原始区域（见下面的 mkfs）
+const disk_blocks = 8192;
+const fs_blocks = 7168;
+
+// QEMU：virt 机器，128 MiB 内存，QEMU 自带的 OpenSBI（-bios default）。zig build run 和 qemu_test.py 共用（config.json）
+const qemu_machine = [_][]const u8{ "qemu-system-riscv64", "-machine", "virt", "-m", "128M", "-nographic", "-bios", "default" };
+/// zig build run 给几个 hart
+const run_smp = 4;
+/// 磁盘：virtio 块设备，用现代（version 2）的 virtio-mmio 接口（QEMU 默认是旧版的）。
+/// -drive 的选项后面还要接 file=镜像（zig build run 再加 snapshot=on）
+const qemu_disk_global = [_][]const u8{ "-global", "virtio-mmio.force-legacy=false" };
+const qemu_drive = "if=none,format=raw,id=disk";
+const qemu_disk_device = [_][]const u8{ "-device", "virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0" };
+
+/// zig-out/config.json 的内容：测试脚本要知道、又已经在 Zig 里定义了的东西，只在这里定义一次（tools/qemu_test.py 读它）。
+const Config = struct {
+    max_procs: usize = abi_consts.max_procs,
+    max_args: usize = abi_consts.max_args,
+    block_size: usize = abi_consts.block_size,
+    fs_blocks: usize = fs_blocks,
+    raw_blocks: usize = disk_blocks - fs_blocks,
+    user_space: [2]usize = .{ abi_consts.user_base, abi_consts.user_end },
+    /// 用户栈下面那一页保护页（src/vm.zig 的 heap_limit..stack_limit）
+    user_stack_guard: [2]usize = .{ abi_consts.user_end - abi_consts.user_stack_max - 4096, abi_consts.user_end - abi_consts.user_stack_max },
+    qemu: []const []const u8 = &qemu_machine,
+    run_smp: usize = run_smp,
+    /// 接磁盘的参数，file= 之后要接上镜像的路径
+    qemu_disk: []const []const u8 = &(qemu_disk_global ++ .{"-drive"}),
+    qemu_drive: []const u8 = qemu_drive ++ ",file=",
+    qemu_disk_device: []const []const u8 = &qemu_disk_device,
+};
 
 pub fn build(b: *std.Build) void {
     // rv64imac：不启用 F/D 浮点扩展（和 Linux 内核一样），
@@ -131,7 +165,7 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&install.step);
     }
 
-    // 磁盘镜像：32 MiB，8192 个 4 KiB 的块。前 7168 块是文件系统，由主机上的 mkfs（src/mkfs.zig，
+    // 磁盘镜像：32 MiB，disk_blocks（8192）个 4 KiB 的块。前 fs_blocks（7168）块是文件系统，由主机上的 mkfs（src/mkfs.zig，
     // 和内核用同一份文件系统代码）生成，用户程序装在 /bin 里；后 1024 块是原始区域，填固定的图案
     // （第 b 块的第 i 个字节是 (b * 131 + i) % 251），回归测试 t_disk 和 qemu_test.py 照着它检查读写。
     // 装到 zig-out/disk.img。
@@ -145,33 +179,26 @@ pub fn build(b: *std.Build) void {
     });
     const make_disk = b.addRunArtifact(mkfs);
     const disk = make_disk.addOutputFileArg("disk.img");
-    make_disk.addArgs(&.{ "8192", "7168" });
+    make_disk.addArgs(&.{ b.fmt("{d}", .{disk_blocks}), b.fmt("{d}", .{fs_blocks}) });
     for (program_bins.items) |bin| make_disk.addFileArg(bin);
     b.getInstallStep().dependOn(&b.addInstallFile(disk, "disk.img").step);
 
     // zig build run：用 QEMU 的 virt 机器启动内核。
     // -bios default 使用 QEMU 自带的 OpenSBI 固件，它在 M 模式完成初始化后
     // 以 S 模式跳到 0x80200000 执行内核。按 Ctrl-A 再按 X 退出 QEMU。
-    const qemu = b.addSystemCommand(&.{
-        "qemu-system-riscv64",
-        "-machine",
-        "virt",
-        "-smp",
-        "4",
-        "-m",
-        "128M",
-        "-nographic",
-        "-bios",
-        "default",
-        "-kernel",
-    });
+    const qemu = b.addSystemCommand(&qemu_machine);
+    qemu.addArgs(&.{ "-smp", b.fmt("{d}", .{run_smp}), "-kernel" });
     qemu.addArtifactArg2(kernel, .{});
-    // 磁盘：virtio 块设备，用现代（version 2）的 virtio-mmio 接口（QEMU 默认是旧版的）。
     // snapshot=on：写只进临时的覆盖层，QEMU 退出就丢掉，生成的镜像不会被改
-    qemu.addArgs(&.{ "-global", "virtio-mmio.force-legacy=false", "-drive" });
-    qemu.addPrefixedFileArg("if=none,format=raw,id=disk,snapshot=on,file=", disk);
-    qemu.addArgs(&.{ "-device", "virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0" });
+    qemu.addArgs(&(qemu_disk_global ++ .{"-drive"}));
+    qemu.addPrefixedFileArg(qemu_drive ++ ",snapshot=on,file=", disk);
+    qemu.addArgs(&qemu_disk_device);
     qemu.addPassthruArgs();
+
+    // zig-out/config.json（见 Config）
+    const config = std.json.Stringify.valueAlloc(b.allocator, Config{}, .{ .whitespace = .indent_2 }) catch @panic("OOM");
+    const config_file = b.addWriteFiles().add("config.json", config);
+    b.getInstallStep().dependOn(&b.addInstallFile(config_file, "config.json").step);
 
     const run_step = b.step("run", "Run the kernel in QEMU");
     run_step.dependOn(&qemu.step);

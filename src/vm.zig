@@ -32,9 +32,10 @@ const virtio_disk = @import("virtio_disk.zig");
 const spinlock = @import("spinlock.zig");
 const proc = @import("proc.zig");
 const fsys = @import("fsys.zig");
+const abi = @import("abi.zig");
 
-pub const user_base: usize = 0x4000_0000;
-pub const user_end: usize = 0x8000_0000;
+pub const user_base = abi.user_base;
+pub const user_end = abi.user_end;
 
 /// 页表项。A（访问过）和 D（写过）位直接置 1：规范允许硬件在它们为 0 时触发缺页异常，
 /// 而不是自动置位，这个内核不需要靠它们统计页面使用情况。
@@ -207,7 +208,7 @@ fn walk(root: *PageTable, va: usize, level: u2) MapError!*Pte {
 // ---- 用户地址空间 ----
 
 /// 用户栈最多 1 MiB：[stack_limit, stack_top)。按需分配，用到哪一页才分配哪一页
-pub const stack_max = 1 << 20;
+pub const stack_max = abi.user_stack_max;
 pub const stack_top = user_end;
 pub const stack_limit = stack_top - stack_max;
 /// 栈的下面留一页保护页：堆最多长到它下面为止，栈溢出时撞到它（缺页，结束进程），而不是悄悄写进堆里
