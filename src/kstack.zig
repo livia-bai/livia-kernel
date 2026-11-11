@@ -42,8 +42,9 @@ pub fn Stack(comptime size: usize) type {
 pub const Boot = Stack(32 * 1024);
 /// 陷阱栈 16 KiB：中断处理程序都很浅，最深的是 panic（格式化输出）
 pub const Trap = Stack(16 * 1024);
-/// 进程的内核栈 16 KiB：实测 Debug 模式下最深的是文件系统的系统调用，约 13.6 KiB（见 docs/process.md）
-pub const Process = Stack(16 * 1024);
+/// 进程的内核栈 24 KiB：实测 Debug 模式下最深的是文件系统的系统调用，约 14 KiB（见 docs/process.md）。
+/// 原来是 16 KiB，Debug 模式下只剩 2.4 KiB 的余量，调大了
+pub const Process = Stack(24 * 1024);
 
 /// main.zig 用 @export 导出成 boot_stacks：_start、secondaryEntry 的汇编按名字取地址
 pub var boot: [hart.max]Boot = undefined;
@@ -84,6 +85,40 @@ pub fn deepest() Usage {
     return u;
 }
 
+/// addr 是不是落在某一块内核栈（不含保护页）里。
+pub fn contains(addr: usize) bool {
+    for (&boot) |*s| if (inStack(addr, &s.stack)) return true;
+    for (&trap) |*s| if (inStack(addr, &s.stack)) return true;
+    for (&process) |*s| if (inStack(addr, &s.stack)) return true;
+    return false;
+}
+
+fn inStack(addr: usize, stack: []const u8) bool {
+    const lo = @intFromPtr(stack.ptr);
+    return addr >= lo and addr - lo < stack.len;
+}
+
+/// 沿帧指针链取调用栈：RISC-V 的帧指针（s0）指向调用者的 sp（栈帧的上沿），fp - 8 存着返回地址，
+/// fp - 16 存着调用者的帧指针（内核编译时保留帧指针，见 build.zig）。从 fp 开始往上走，返回地址依次放进 out。
+/// 帧指针不对齐、或者它下面那 16 字节不在 in_stack 认可的栈里就停下（panic 时栈可能已经坏了，
+/// 不能顺着一个坏指针去读）；陷阱处理程序的帧把链接到被打断的代码的栈上，所以链可以跨过几块栈。
+pub fn backtrace(fp_start: usize, in_stack: *const fn (usize) bool, out: []usize) []usize {
+    var fp = fp_start;
+    var n: usize = 0;
+    while (n < out.len) {
+        if (fp % 8 != 0 or fp < 16 or !in_stack(fp - 16) or !in_stack(fp - 1)) break;
+        const words: *const [2]usize = @ptrFromInt(fp - 16);
+        const prev = words[0];
+        const ra = words[1];
+        if (ra == 0) break;
+        out[n] = ra;
+        n += 1;
+        if (prev == fp) break;
+        fp = prev;
+    }
+    return out[0..n];
+}
+
 /// 所有保护页的地址（vm.init 不映射它们），按地址从低到高。
 /// 三个数组在 .bss 里谁先谁后由链接器定，所以要排序。用插入排序：std.mem.sort 在栈上放一个 4 KiB 的缓存，
 /// 这里是在启动栈上调用的（kmain 那一串初始化是启动栈用得最深的地方）。
@@ -113,6 +148,33 @@ pub fn guardOwner(addr: usize) ?Owner {
 fn inGuard(addr: usize, guard: *[page_size]u8) bool {
     const g = @intFromPtr(guard);
     return addr >= g and addr - g < page_size;
+}
+
+var test_frames: [64]usize align(8) = @splat(0);
+
+fn inTestFrames(addr: usize) bool {
+    return inStack(addr, std.mem.sliceAsBytes(&test_frames));
+}
+
+test "调用栈：沿帧指针链走，链断了、指针出了栈都停下" {
+    // 三个栈帧：fp 指向帧的上沿，fp-16 是上一个 fp，fp-8 是返回地址
+    const base = @intFromPtr(&test_frames);
+    const f0 = base + 8 * 8; // 最里面的
+    const f1 = base + 20 * 8;
+    const f2 = base + 40 * 8;
+    test_frames[6] = f1;
+    test_frames[7] = 0x8020_0010;
+    test_frames[18] = f2;
+    test_frames[19] = 0x8020_0020;
+    test_frames[38] = 0x1234_0000; // 指向栈外：走到这里就停
+    test_frames[39] = 0x8020_0030;
+    var out: [8]usize = undefined;
+    try std.testing.expectEqualSlices(usize, &.{ 0x8020_0010, 0x8020_0020, 0x8020_0030 }, backtrace(f0, &inTestFrames, &out));
+    // out 满了就停
+    try std.testing.expectEqual(2, backtrace(f0, &inTestFrames, out[0..2]).len);
+    // 不对齐、不在栈里的起点
+    try std.testing.expectEqual(0, backtrace(f0 + 1, &inTestFrames, &out).len);
+    try std.testing.expectEqual(0, backtrace(0x1000, &inTestFrames, &out).len);
 }
 
 test "保护页：每块栈一页，按页对齐，排好序；栈底下面一页就是保护页" {

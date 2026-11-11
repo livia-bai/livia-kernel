@@ -13,6 +13,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const riscv = @import("riscv.zig");
 const hart = @import("hart.zig");
+const kstat = @import("kstat.zig");
 
 const no_hart = std.math.maxInt(usize);
 
@@ -36,9 +37,12 @@ pub const Spinlock = struct {
         // amoswap.w.aq：换进 true，换出来的是 false 才算拿到。acquire 语义保证临界区里的访存
         // 不会被提前到拿到锁之前。等锁时顺便看看是不是有别的 hart 在 panic：
         // 锁可能在已经停下的 hart 手里，永远等不到
-        while (l.locked.swap(true, .acquire)) {
-            hart.checkPanic();
-            std.atomic.spinLoopHint();
+        if (l.locked.swap(true, .acquire)) {
+            kstat.inc(.lock_contended);
+            while (l.locked.swap(true, .acquire)) {
+                hart.checkPanic();
+                std.atomic.spinLoopHint();
+            }
         }
         l.hart = hart.id();
         held[hart.id()] += 1;

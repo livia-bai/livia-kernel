@@ -2,6 +2,13 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-11 内核的计数器（kstat）；panic 时打印调用栈；进程内核栈调到 24 KiB
+
+- 新增：内核的计数器（`src/kstat.zig`）：系统调用、上下文切换、时钟中断、核间中断、`wakeup`（调用、真扫了进程表、叫醒的进程）、自旋锁要等的次数、三种缺页、TLB 全量刷新、缓冲区缓存的命中和没命中、磁盘的读写和 flush、文件系统的提交和作废。每个 hart 一份，名字是 `abi.Counters` 的字段名。系统调用 `kstat`（39）返回它们和栈的高水位，用户程序 `kstat` 打印出来。
+- 新增：内核 panic 时打印调用栈（`backtrace: 0x... 0x...`）：内核编译时保留帧指针，`kstack.backtrace` 沿帧指针链往上走，帧指针不在内核栈里就停。`qemu_test.py` 看到 panic 时用 llvm-symbolizer 换成源码位置。
+- 改动：进程内核栈 16 KiB → 24 KiB（Debug 模式下最深用到 14 KiB 多）。
+- 新增：QEMU 测试用例 `kstat`。
+
 ## 2026-11-11 内核自己量栈用到过多深；测试脚本的常量从构建导出
 
 - 新增：内核栈的高水位。启动时 `kstack.paintAll` 把所有的栈（进程内核栈、启动栈、陷阱栈）都写上金丝雀的图案，关机时 `kstack.deepest` 从栈底找第一个被改过的字，打印 `[stack] deepest use: process P of 16384, boot B of 32768, trap T of 16384 bytes`。`qemu_test.py` 要求每种栈至少留 2048 字节。实测 Debug 模式下进程内核栈最深 13912 字节，比文档里以前记的 11624 字节深。

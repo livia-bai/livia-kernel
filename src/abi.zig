@@ -102,6 +102,8 @@ pub const Syscall = enum(usize) {
     /// lstat(path_ptr, path_len, ptr) 把 path 的 Stat 写进用户内存，返回 0。path 是符号链接的话是链接自己的
     /// （种类 symlink，长度是目标的长度），不跟着走
     lstat = 38,
+    /// kstat(ptr) 把内核的计数器和栈的高水位（KStat）写进用户内存，返回 0
+    kstat = 39,
     _,
 };
 
@@ -330,6 +332,54 @@ pub const ScrubInfo = extern struct {
     blocks: u64,
     /// 最后提交的事务号
     generation: u64,
+};
+
+/// kstat 返回的内核计数器：开机以来的累计值，所有 hart 加起来（内核里每个 hart 一份，见 kstat.zig）。
+/// 内核按字段名计数，所以加一个计数器就是在这里加一个字段，再在要数的地方 kstat.inc(.名字)。
+pub const Counters = extern struct {
+    /// 系统调用
+    syscalls: u64 = 0,
+    /// 调度器切到一个进程
+    context_switches: u64 = 0,
+    /// 时钟中断（所有 hart 的）
+    timer_interrupts: u64 = 0,
+    /// 发出的核间中断
+    ipis_sent: u64 = 0,
+    /// wakeup 被调用的次数；其中真的扫了进程表的次数（有进程睡在散列到同一格的通道上）；叫醒的进程数
+    wakeup_calls: u64 = 0,
+    wakeup_scans: u64 = 0,
+    processes_woken: u64 = 0,
+    /// 拿自旋锁时锁已经被别的 hart 拿着、要等的次数
+    lock_contended: u64 = 0,
+    /// 缺页（U 模式的和内核替用户访问的）：分配清零的页、从程序文件读进来的页、写时复制
+    faults_zero: u64 = 0,
+    faults_file: u64 = 0,
+    faults_cow: u64 = 0,
+    /// 整个 TLB 的刷新（sfence.vma zero, zero）
+    tlb_full_flushes: u64 = 0,
+    /// 缓冲区缓存：要的块已经在缓存里，或者要读盘
+    bio_hits: u64 = 0,
+    bio_misses: u64 = 0,
+    /// 磁盘请求
+    disk_reads: u64 = 0,
+    disk_writes: u64 = 0,
+    disk_flushes: u64 = 0,
+    /// 文件系统的事务：提交（写了超级块）、作废（真改过东西，要重走整棵树）、作废时什么都没改过
+    fs_commits: u64 = 0,
+    fs_aborts: u64 = 0,
+    fs_clean_aborts: u64 = 0,
+};
+
+/// kstat 返回的东西。
+pub const KStat = extern struct {
+    counters: Counters,
+    /// 各种内核栈用到过的最深处（字节，所有 hart、所有进程槽位里最大的）和它们的大小
+    stack_process: u64,
+    stack_process_size: u64,
+    stack_boot: u64,
+    stack_boot_size: u64,
+    stack_trap: u64,
+    stack_trap_size: u64,
 };
 
 const max_errno = 4095;

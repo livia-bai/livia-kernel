@@ -182,11 +182,14 @@ proc.scheduler();
 pub const panic = std.debug.FullPanic(kernelPanic);
 
 fn kernelPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
-    _ = first_trace_addr;
     riscv.disableInterrupts();
     hart.beginPanic();
     uart.print("\n!!! KERNEL PANIC on hart {d}: {s}\n", .{ hart.id(), msg });
-    uart.write("system halted.\n");
+    var frames: [24]usize = undefined;
+    uart.write("backtrace:");
+    if (first_trace_addr) |a| uart.print(" 0x{x}", .{a});
+    for (kstack.backtrace(@frameAddress(), &kstack.contains, &frames)) |ra| uart.print(" 0x{x}", .{ra});
+    uart.write("\nsystem halted.\n");
     hart.halt();
 }
 
@@ -202,6 +205,14 @@ pub fn halt() noreturn {           // hart.zig
 - **别的 hart 也要停下**：`hart.beginPanic()` 用原子变量记下“hart N 在 panic”（已经有别的 hart 在 panic 的话，自己直接停下，两份 panic 信息交错在一起谁也看不清）。别的 hart 在下一次输出一个字符（`uart` 的 `putc`）、等锁时每转一圈（`Spinlock.acquire`）、调度器每一轮开头都会调用 `hart.checkPanic()`，看到了就自己 `halt()`。这三个地方覆盖了所有会一直跑下去的路径：在 U 模式里死循环的进程每 10 ms 就会因为时钟中断回到调度器。没有核间中断，所以不是立刻停下，最多晚一个时钟周期。xv6 的做法类似（`panicked` 标志，别的 hart 在 `printf` 里卡住）。
 - panic 的 hart 输出不拿 `uart.tx_lock`：锁可能就在它自己手里（比如在 `print` 里出错），也可能在已经停下的 hart 手里（[devices.md](devices.md#串口uartzig)）。
 - 先关中断再打印，然后（`halt`）把 `sie` 清零，停在 `wfi` 循环里。清零 `sie` 是因为 `wfi` 看的是 `sie & sip`，不看 `sstatus.SIE`：panic 之后没人再预约时钟中断，它会一直挂着；`sie.STIE` 还开着的话，`wfi` 每次都立刻返回，停机就成了忙等，QEMU 占满一个 CPU 核（实测 97%～99%，清零 `sie` 之后是 0%）。规范允许 `wfi` 无故返回，所以仍然放在循环里。
+- **调用栈**：内核编译时保留帧指针（`build.zig` 里 `.omit_frame_pointer = false`，所有模式都是）。RISC-V 的帧指针 `s0` 指向调用者的 `sp`，下面 8 字节是返回地址、再下面 8 字节是调用者的 `s0`，`kstack.backtrace` 顺着这条链往上走，最多 24 层；帧指针不对齐、或者不在任何一块内核栈里（`kstack.contains`）就停下，panic 时栈可能已经坏了，不顺着坏指针读。陷阱处理程序 `handleTrap` 的帧里存着被打断的代码的 `s0`，所以链会从陷阱栈接到进程内核栈上，到用户程序的栈就停。安全检查失败时 `first_trace_addr` 是出错的位置，先打印。打印的是地址，`llvm-symbolizer -e zig-out/bin/kernel 0x...` 换成源码位置，`qemu_test.py` 看到 panic 时自动换。临时让 `getpid` 系统调用 `@panic` 实测过（safe 和 Debug 一样）：
+
+  ```
+  !!! KERNEL PANIC on hart 0: test backtrace
+  backtrace: 0x80215272 0x8020ba48 0x8020b380
+  ```
+
+  换出来是 `src/syscall.zig:36`（`dispatch`）、`src/trap.zig:218`（`handleTrap`）、`src/trap.zig:148`（`trapEntry`）。函数名 llvm-symbolizer 给的多是 `.L0`（链接器留下的局部标签盖住了函数名），所以测试脚本只取文件和行号。
 - 内核 panic 后 QEMU 不会退出，管道测试会超时（`timeout` 返回 124），见 [testing.md](testing.md)。
 
 用户程序出错不会走到这里：U 模式的异常只结束那个进程（[process.md](process.md#结束进程)）。

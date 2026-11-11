@@ -33,6 +33,7 @@ const spinlock = @import("spinlock.zig");
 const proc = @import("proc.zig");
 const fsys = @import("fsys.zig");
 const abi = @import("abi.zig");
+const kstat = @import("kstat.zig");
 
 pub const user_base = abi.user_base;
 pub const user_end = abi.user_end;
@@ -133,6 +134,7 @@ fn mapMmio(base: usize, size: usize) MapError!void {
 
 /// 切换到 root 描述的地址空间。
 pub fn activate(root: *PageTable) void {
+    kstat.add(.tlb_full_flushes, 2);
     riscv.sfenceVma();
     riscv.write(.satp, riscv.satp_sv39 | (@intFromPtr(root) >> 12));
     riscv.sfenceVma();
@@ -142,7 +144,10 @@ pub fn activate(root: *PageTable) void {
 /// 单元测试在主机上运行，没有 TLB 可刷。
 fn flushTlb(va: ?usize) void {
     if (comptime !builtin.cpu.arch.isRISCV()) return;
-    if (va) |a| riscv.sfenceVmaPage(a) else riscv.sfenceVma();
+    if (va) |a| riscv.sfenceVmaPage(a) else {
+        kstat.inc(.tlb_full_flushes);
+        riscv.sfenceVma();
+    }
 }
 
 /// 第 level 级（0、1、2）一个叶子映射的大小：4 KiB、2 MiB、1 GiB。
@@ -491,15 +496,19 @@ pub fn fault(s: *Space, va: usize, access: Access, may_sleep: bool) FaultError!v
     const base = std.mem.alignBackward(usize, va, page.size);
     if (leafOf(s.root, base)) |pte| {
         if (allows(.{ .r = pte.r, .w = pte.w, .x = pte.x }, access)) return;
-        if (access == .write and pte.cow) return breakCow(s.root, base) catch |err| switch (err) {
-            error.NotCow => unreachable,
-            error.OutOfMemory => error.CowOutOfMemory,
-        };
+        if (access == .write and pte.cow) {
+            kstat.inc(.faults_cow);
+            return breakCow(s.root, base) catch |err| switch (err) {
+                error.NotCow => unreachable,
+                error.OutOfMemory => error.CowOutOfMemory,
+            };
+        }
         return error.BadAddress;
     }
     const r = s.regionOf(base) orelse return error.BadAddress;
     if (!allows(r.perm, access)) return error.BadAddress;
     if (r.file_len > 0 and s.backing == .file and !may_sleep) return error.WouldSleep;
+    if (r.file_len > 0) kstat.inc(.faults_file) else kstat.inc(.faults_zero);
     const p = try page.alloc(); // 清零的：段里文件之外的部分（.bss）、堆、栈都是 0
     errdefer page.free(p);
     if (r.file_len > 0) try s.backing.read(r.file_off, p[0..r.file_len]);

@@ -21,6 +21,7 @@
 const std = @import("std");
 const abi = @import("abi.zig");
 const proc = @import("proc.zig");
+const kstat = @import("kstat.zig");
 const Spinlock = @import("spinlock.zig").Spinlock;
 const Sleeplock = @import("sleeplock.zig").Sleeplock;
 
@@ -200,7 +201,12 @@ pub fn read(blockno: u64) Error!*Buf {
 /// 发现内容不对的调用方把 valid 设回 false，下次再读盘。
 pub fn load(b: *Buf) bool {
     std.debug.assert(b.lock.holding());
-    if (b.valid) return false;
+    if (b.valid) {
+        kstat.inc(.bio_hits);
+        return false;
+    }
+    kstat.inc(.bio_misses);
+    kstat.inc(.disk_reads);
     device.?.transfer(b.blockno, b.data, false);
     b.valid = true;
     return true;
@@ -224,11 +230,13 @@ pub fn invalidate() void {
 /// 把缓冲区写回磁盘，写完才返回。调用方拿着它的睡眠锁。
 pub fn write(b: *Buf) void {
     std.debug.assert(b.lock.holding() and b.valid);
+    kstat.inc(.disk_writes);
     device.?.transfer(b.blockno, b.data, true);
 }
 
 /// 等之前写的块（write 返回过的）都落盘。只能由进程调用（要睡着等设备）。
 pub fn flush() void {
+    kstat.inc(.disk_flushes);
     if (device.?.flush) |f| f();
 }
 

@@ -18,6 +18,7 @@ const bio = @import("bio.zig");
 const fsys = @import("fsys.zig");
 const fs = @import("fs.zig");
 const kstack = @import("kstack.zig");
+const kstat = @import("kstat.zig");
 const Fs = fsys.Fs;
 
 comptime {
@@ -28,6 +29,7 @@ const TrapFrame = @import("trap.zig").TrapFrame;
 
 /// 返回值会写回用户程序的 a0。
 pub fn dispatch(frame: *TrapFrame) usize {
+    kstat.inc(.syscalls);
     const args = frame.regs[10..16]; // a0..a5
     const number: abi.Syscall = @fromBackingInt(frame.regs[17]); // a7
     return switch (number) {
@@ -69,6 +71,7 @@ pub fn dispatch(frame: *TrapFrame) usize {
         .readlink => readlink(args[0], args[1], args[2], args[3]),
         .getcwd => getcwd(args[0], args[1]),
         .lstat => lstat(args[0], args[1], args[2]),
+        .kstat => kstatCall(args[0]),
         _ => abi.fail(.nosys),
     };
 }
@@ -593,6 +596,22 @@ fn procinfo(ptr: usize, n: usize) usize {
 
 fn meminfo(ptr: usize) usize {
     const info: abi.MemInfo = .{ .free_pages = page.freePages(), .total_pages = page.total_pages, .page_size = page.size };
+    vm.copyToUser(space(), ptr, std.mem.asBytes(&info)) catch return abi.fail(.fault);
+    return 0;
+}
+
+/// 内核的计数器和栈的高水位（kstat.zig、kstack.deepest）。
+fn kstatCall(ptr: usize) usize {
+    const u = kstack.deepest();
+    const info: abi.KStat = .{
+        .counters = kstat.sum(),
+        .stack_process = u.process,
+        .stack_process_size = kstack.Process.stack_size,
+        .stack_boot = u.boot,
+        .stack_boot_size = kstack.Boot.stack_size,
+        .stack_trap = u.trap,
+        .stack_trap_size = kstack.Trap.stack_size,
+    };
     vm.copyToUser(space(), ptr, std.mem.asBytes(&info)) catch return abi.fail(.fault);
     return 0;
 }

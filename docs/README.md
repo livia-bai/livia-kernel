@@ -55,6 +55,7 @@ livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 
 | `src/page.zig` | [page-allocator.md](page-allocator.md) | |
 | `src/vm.zig` | [paging.md](paging.md) | [syscalls.md](syscalls.md#访问用户内存)、[process.md](process.md#按需分页) |
 | `src/proc.zig` | [process.md](process.md) | |
+| `src/kstat.zig` | [syscalls.md](syscalls.md#调用列表) | [user-programs.md](user-programs.md#kstat) |
 | `src/canary.zig` | [process.md](process.md#进程表) | [boot.md](boot.md#每个-hart-的启动栈) |
 | `src/kstack.zig` | [process.md](process.md#进程表) | [trap.md](trap.md#内核栈溢出)、[paging.md](paging.md#内核页表)、[boot.md](boot.md#每个-hart-的启动栈) |
 | `src/spinlock.zig` | [process.md](process.md#锁) | [boot.md](boot.md#panic) |
@@ -70,6 +71,7 @@ livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 
 | `user/hello.zig`、`user/fault.zig`、`user/spin.zig`、`user/ticker.zig` | [user-programs.md](user-programs.md#示例程序) | |
 | `user/echo.zig`、`user/cat.zig`、`user/wc.zig` | [user-programs.md](user-programs.md#echocatwc) | [shell.md](shell.md#管道) |
 | `user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`、`user/mv.zig`、`user/ln.zig` | [user-programs.md](user-programs.md#lsmkdirrmmvln) | [fs.md](fs.md) |
+| `user/kstat.zig` | [user-programs.md](user-programs.md#kstat) | [syscalls.md](syscalls.md#调用列表) |
 | `user/scrub.zig` | [user-programs.md](user-programs.md#scrub) | [fs.md](fs.md#检查整个文件系统checkscrub) |
 | `user/test.zig`、`user/expr.zig`、`user/seq.zig`、`user/sleep.zig`、`user/head.zig`、`user/tail.zig`、`user/grep.zig`、`user/cp.zig`、`user/touch.zig`、`user/tee.zig`、`user/xargs.zig` | [user-programs.md](user-programs.md#写脚本用的程序) | [shell.md](shell.md) |
 | `user/tests/*.zig`、`user/tests/noperm.ld` | [testing.md](testing.md#回归测试程序) | [build.md](build.md#用户程序) |

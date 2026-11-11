@@ -28,7 +28,7 @@ pub const Syscall = enum(usize) {
     blockcount = 21, readblock = 22, writeblock = 23,
     open = 24, mkdir = 25, unlink = 26, chdir = 27, fstat = 28, readdir = 29,
     scrub = 30, rename = 31, lseek = 32, link = 33, mknod = 34,
-    symlink = 35, readlink = 36, getcwd = 37, lstat = 38,
+    symlink = 35, readlink = 36, getcwd = 37, lstat = 38, kstat = 39,
     _,
 };
 pub const Major = enum(u16) { console = 1, null = 2, zero = 3, _ };   // 设备文件的设备号
@@ -142,6 +142,7 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 36 | `readlink` | `a0`、`a1` = 路径的地址、长度，`a2`、`a3` = 缓冲区的地址、长度 | 写了几个字节；`-EINVAL`（不是符号链接）、`-ENOENT`、`-ENOTDIR`、`-ELOOP`、`-EIO`、`-ENODEV`、`-EFAULT` | 符号链接的目标写进缓冲区，不以 0 结尾，放不下就截断（和 Linux 一样）。最后一段不跟着走 |
 | 37 | `getcwd` | `a0` = 缓冲区地址，`a1` = 缓冲区长度 | 路径的长度；`-ERANGE`（放不下）、`-ENOENT`（当前目录被删掉了）、`-EIO`、`-ENODEV`、`-EFAULT` | 当前目录的绝对路径，不以 0 结尾。是真实的位置：经过符号链接 `chdir` 进来的，得到的是目标目录的路径（[fs.md](fs.md#当前目录的路径getcwd)） |
 | 38 | `lstat` | `a0`、`a1` = 路径的地址、长度，`a2` = `Stat` 的地址 | 0；`-ENOENT`、`-ENOTDIR`、`-ELOOP`、`-ENAMETOOLONG`、`-EIO`、`-ENODEV`、`-EFAULT` | 路径自己的 `Stat`，最后一段是符号链接时不跟着走（种类 `symlink`，长度是目标的长度）。不用打开文件，所以内核不认识的设备文件也查得到 |
+| 39 | `kstat` | `a0` = `KStat` 的地址 | 0；`-EFAULT` | 内核的计数器（`abi.Counters`：系统调用、上下文切换、`wakeup`、缺页、TLB 刷新、缓冲区缓存、磁盘请求、文件系统的提交和作废……，开机以来所有 hart 加起来）和各种内核栈用到过的最深处（[process.md](process.md#进程表)）。用户程序 `kstat` 把它们打印出来 |
 | 其他 | | | `-ENOSYS` | |
 
 ### 分发
@@ -361,7 +362,7 @@ pub fn fprint(fd: Fd, comptime fmt: []const u8, args: anytype) void
 - 系统调用在陷阱处理程序里执行，**全程关着中断**，所以每个调用都要短。一个很长的 `write` 会在输出期间挡住时钟中断，但不会丢失中断：挂起的中断在 `sret` 回到 U 模式后立刻被处理（这时进程马上让出 CPU），计时也不会少，`timer` 按预约时刻补上错过的 tick（[devices.md](devices.md#定时器timerzig)）。
 - 会等待的调用（`yield`、`sleep`、`read`、管道的 `write`、`wait`）不在里面开中断等待，而是切回调度器，由调度器开着中断去处理别的事。
 - `exec` 一次加载整个程序（分配页、从文件系统读内容），`fork` 一次复制整个地址空间，`sbrk` 一次映射所有新的页，期间都关着中断。现在的程序都只有几十 KiB，没有问题；`sbrk` 一次要上百 MiB 时会关着中断清零这么多页，`t_sbrk` 里长到超过物理内存（约 125 MiB）再失败、回滚，QEMU 里测试照常通过。
-- 运行在当前进程自己的内核栈上（16 KiB），系统调用里不要放大的局部数组，也不要按值复制大的结构体（[fs.md](fs.md#接进内核fsyszig)：8 KiB 的位图按值传过一次，把栈撑爆了）。局部数组最大的是 `exec` 复制参数和路径用的约 1.8 KiB（参数 1024 字节、`Arg` 数组和切片各 256 字节、路径 256 字节）；栈用得最深的是文件系统的调用（实测 Debug 模式约 11.4 KiB，[process.md](process.md#进程表)）。
+- 运行在当前进程自己的内核栈上（24 KiB），系统调用里不要放大的局部数组，也不要按值复制大的结构体（[fs.md](fs.md#接进内核fsyszig)：8 KiB 的位图按值传过一次，把栈撑爆了）。局部数组最大的是 `exec` 复制参数和路径用的约 1.8 KiB（参数 1024 字节、`Arg` 数组和切片各 256 字节、路径 256 字节）；栈用得最深的是文件系统的调用（实测 Debug 模式约 14 KiB，[process.md](process.md#进程表)）。
 - 文件系统的调用读写磁盘，要等磁盘时和 `read` 一样切回调度器。读的调用在快照上读、不拿锁，改的调用拿着睡眠锁 `fsys.write_lock`（[fs.md](fs.md#接进内核fsyszig)）。
 - `exit`、`shutdown` 和成功的 `exec` 不返回；其他调用返回后，用户程序从 `ecall` 的下一条指令继续执行，除 `a0` 以外的寄存器都不变。
 

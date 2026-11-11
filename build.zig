@@ -56,6 +56,8 @@ pub fn build(b: *std.Build) void {
             // 内核链接在 0x80200000，超出了默认 medlow 模型能寻址的 ±2GiB 范围，
             // medany 改用 PC 相对寻址，代码放在哪都能访问到。
             .code_model = .medany,
+            // 保留帧指针（s0）：panic 时沿着它打印调用栈（kstack.backtrace），所有优化模式都要
+            .omit_frame_pointer = false,
         }),
     });
     kernel.setLinkerScript(b.path("linker.ld"));
@@ -81,7 +83,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "test" },  .{ .name = "expr" },  .{ .name = "seq" },
         .{ .name = "sleep" }, .{ .name = "head" },  .{ .name = "tail" },
         .{ .name = "grep" },  .{ .name = "cp" },    .{ .name = "touch" },
-        .{ .name = "tee" },   .{ .name = "xargs" },
+        .{ .name = "tee" },   .{ .name = "xargs" }, .{ .name = "kstat" },
     };
     const test_programs = [_]UserProgram{
         .{ .name = "t_sys", .dir = "user/tests" },

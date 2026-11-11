@@ -184,7 +184,7 @@ def case_shell(q, c, mode):
     c.contains(q.command("uptime"), r"up \d+\.\d\ds\n", "uptime")
     c.contains(q.command("nope"), r"unknown command: nope", "unknown command")
     # /bin 里的程序按名字排序（测试程序 t_* 也在里面）
-    c.contains(q.command("run"), r"programs: cat cp echo expr fault grep head hello init ln ls mkdir mv rm scrub seq sh sleep spin"
+    c.contains(q.command("run"), r"programs: cat cp echo expr fault grep head hello init kstat ln ls mkdir mv rm scrub seq sh sleep spin"
                r"( t_\w+)+ tail tee test ticker touch wc xargs\n", "run without a name")
     c.contains(q.command("run nope"), r"no such program: nope\nprograms: ", "run nope")
     # 不写 run，直接写程序名；管道、重定向照样能用。不是内置命令也不是程序的才是 unknown command
@@ -978,9 +978,23 @@ def case_smp(q, c, mode):
 
 
 # 每个用例覆盖的文件。改了 CORE 里的文件（或者没列出的内核文件）就跑全部用例。
+def case_kstat(q, c, mode):
+    """kstat 打印的计数器：放在最后跑，前面的用例做过的事都数进去了。"""
+    out = q.command("kstat")
+    counters = {k: int(v) for k, v in re.findall(r"^(\w+) +(\d+)$", out, re.M)}
+    for name in ["syscalls", "context_switches", "timer_interrupts", "wakeup_calls", "faults_zero", "faults_file",
+                 "tlb_full_flushes", "bio_misses", "disk_reads"]:
+        c.expect(counters.get(name, 0) > 0, f"kstat: {name} should be > 0:\n{indent(out)}")
+    # 绝大多数 wakeup 没人在等，不扫进程表（proc.sleepers）
+    c.expect(counters.get("wakeup_scans", 0) < counters.get("wakeup_calls", 0), f"kstat: wakeup_scans >= wakeup_calls:\n{indent(out)}")
+    for kind in ["process", "boot", "trap"]:
+        c.contains(out, rf"(?m)^stack_{kind} +\d+ of \d+ bytes$", "kstat")
+    exited(c, out, "kstat", 0)
+
+
 CORE = ["build.zig", "linker.ld", "src/main.zig", "src/riscv.zig", "src/trap.zig", "src/vm.zig", "src/page.zig",
         "src/dtb.zig", "src/uart.zig", "src/proc.zig", "src/syscall.zig", "src/abi.zig", "src/spinlock.zig", "src/hart.zig", "src/ipi.zig",
-        "src/canary.zig", "src/kstack.zig",
+        "src/canary.zig", "src/kstack.zig", "src/kstat.zig",
         "src/file.zig", "user/start.zig", "user/sys.zig", "user/init.zig", "user/sh.zig", "tools/qemu_test.py"]
 NOT_KERNEL = ["src/tests.zig"]  # 只在单元测试里用
 CASES = {
@@ -1014,6 +1028,7 @@ CASES = {
                      "user/cat.zig", "user/echo.zig", "user/wc.zig", "user/scrub.zig", "user/mv.zig", "user/ln.zig", "user/tests/t_fs.zig",
                      "user/tests/t_fsmp.zig"]),
     "smp": (case_smp, ["src/timer.zig", "src/plic.zig", "src/pipe.zig", "user/spin.zig", "user/tests/t_smp.zig"]),
+    "kstat": (case_kstat, ["user/kstat.zig"]),
 }
 
 
@@ -1144,8 +1159,20 @@ def run_session(kernel, disk, log_path, names, mode, smp):
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(q.text())
     if "KERNEL PANIC" in q.text():
-        session.failures.append("KERNEL PANIC in the serial output")
+        session.failures.append("KERNEL PANIC in the serial output" + symbolize(kernel, q.text()))
     return results
+
+
+def symbolize(kernel, text):
+    """把 panic 打印的调用栈（backtrace: 0x... 0x...）换成源码的位置，有 llvm-symbolizer 的话。"""
+    m = re.search(r"^backtrace:(( 0x[0-9a-f]+)*)$", text, re.M)
+    tool = shutil.which("llvm-symbolizer")
+    if not m or not tool or not m.group(1).strip():
+        return ""
+    r = subprocess.run([tool, "--functions=none", "-e", kernel] + m.group(1).split(),
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    lines = [os.path.relpath(l, ROOT) if l.startswith(ROOT) else l for l in r.stdout.splitlines() if l.strip()]
+    return "\n" + indent("\n".join(lines))
 
 
 def run_mode(mode, names, smps):

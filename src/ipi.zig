@@ -17,6 +17,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const riscv = @import("riscv.zig");
+const kstat = @import("kstat.zig");
 const sbi = @import("sbi.zig");
 const hart = @import("hart.zig");
 
@@ -67,6 +68,7 @@ pub fn wakeIdle(n: usize) void {
 
 /// 给 hart id 发一个核间中断。单元测试在主机上运行，什么也不做。
 pub fn send(id: usize) void {
+    kstat.inc(.ipis_sent);
     if (comptime !builtin.cpu.arch.isRISCV()) return;
     std.debug.assert(id != hart.id());
     const err = sbi.sendIpi(1, id);

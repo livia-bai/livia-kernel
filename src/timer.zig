@@ -8,6 +8,7 @@ const riscv = @import("riscv.zig");
 const sbi = @import("sbi.zig");
 const hart = @import("hart.zig");
 const proc = @import("proc.zig");
+const kstat = @import("kstat.zig");
 const Spinlock = @import("spinlock.zig").Spinlock;
 
 pub const tick_hz = 100;
@@ -52,6 +53,7 @@ fn arm() void {
 /// 时钟中断处理：预约下一次。启动 hart 上还要给 ticks 加 1，叫醒 sleep 系统调用里的进程，
 /// 它们自己数时间到了没有（xv6 的 clockintr）。
 pub fn onInterrupt() void {
+    kstat.inc(.timer_interrupts);
     arm();
     if (hart.id() != timekeeper) return;
     lock.acquire();

@@ -30,6 +30,7 @@ const std = @import("std");
 const btree = @import("btree.zig");
 const bio = @import("bio.zig");
 const proc = @import("proc.zig");
+const kstat = @import("kstat.zig");
 const Spinlock = @import("spinlock.zig").Spinlock;
 const Key = btree.Key;
 const Node = btree.Node;
@@ -215,6 +216,7 @@ pub const Volume = struct {
     /// 后一次保证 pending 里的块（旧树的）再被分配、改写之前，指向新树的超级块已经在盘上。
     pub fn commit(v: *Volume) Error!void {
         if (!v.dirty) return;
+        kstat.inc(.fs_commits);
         bio.flush();
         try writeSuper(.{
             .csum = 0,
@@ -298,7 +300,8 @@ pub const Volume = struct {
     /// 什么都没改过（dirty 为 false：没分配、没释放过块，根也没变，和 commit 一样看它）就不用重走整棵树：
     /// 查找阶段就失败的操作（Exists、NotFound……）最常见，不该每次都读遍所有节点。
     pub fn abort(v: *Volume) Error!void {
-        if (!v.dirty) return;
+        if (!v.dirty) return kstat.inc(.fs_clean_aborts);
+        kstat.inc(.fs_aborts);
         v.root = v.committed;
         try v.rescan();
     }

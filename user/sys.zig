@@ -451,6 +451,13 @@ pub fn meminfo() abi.MemInfo {
     return info;
 }
 
+/// 内核的计数器和栈的高水位（见 abi.KStat）。
+pub fn kstat() abi.KStat {
+    var info: abi.KStat = undefined;
+    _ = syscall(.kstat, @intFromPtr(&info), 0, 0);
+    return info;
+}
+
 pub fn shutdown() noreturn {
     _ = syscall(.shutdown, 0, 0, 0);
     unreachable;

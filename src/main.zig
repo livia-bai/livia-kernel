@@ -24,12 +24,17 @@ const kstack = @import("kstack.zig");
 pub const panic = std.debug.FullPanic(kernelPanic);
 
 fn kernelPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
-    _ = first_trace_addr;
     riscv.disableInterrupts();
     // 别的 hart 下一次输出、等锁或者调度时会看到，自己停下
     hart.beginPanic();
     uart.print("\n!!! KERNEL PANIC on hart {d}: {s}\n", .{ hart.id(), msg });
-    uart.write("system halted.\n");
+    // 调用栈：返回地址，用 llvm-symbolizer -e zig-out/bin/kernel 换成函数名和行号（qemu_test.py 会自动换）。
+    // 安全检查失败时 first_trace_addr 是出错的地方，先打印它；然后从这里沿帧指针往上走
+    var frames: [24]usize = undefined;
+    uart.write("backtrace:");
+    if (first_trace_addr) |a| uart.print(" 0x{x}", .{a});
+    for (kstack.backtrace(@frameAddress(), &kstack.contains, &frames)) |ra| uart.print(" 0x{x}", .{ra});
+    uart.write("\nsystem halted.\n");
     hart.halt();
 }
 

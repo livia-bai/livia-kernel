@@ -49,6 +49,7 @@ const fs = @import("fs.zig");
 const fsys = @import("fsys.zig");
 const canary = @import("canary.zig");
 const kstack = @import("kstack.zig");
+const kstat = @import("kstat.zig");
 const Spinlock = spinlock.Spinlock;
 
 /// 内核里只嵌着 init（见 build.zig）：第一个进程要在挂载文件系统之前加载。别的程序都从文件系统的 /bin 加载（exec）。
@@ -176,7 +177,7 @@ fn frameOf(p: *Process) *trap.TrapFrame {
     return @ptrCast(@alignCast(stack[stack.len - @sizeOf(trap.TrapFrame) ..]));
 }
 
-/// 进程 p 的内核栈（槽位 i 用 kstack.process[i]，16 KiB，静态分配：页分配器只能一页一页地给，给不出连续的 16 KiB）。
+/// 进程 p 的内核栈（槽位 i 用 kstack.process[i]，24 KiB，静态分配：页分配器只能一页一页地给，给不出连续的几页）。
 /// 栈下面是保护页（kstack.zig），最底下放着金丝雀（canary.zig），allocSlot 写上，sched、回到 U 模式之前检查。
 fn stackOf(p: *Process) *[kstack.Process.stack_size]u8 {
     const slot = (@intFromPtr(p) - @intFromPtr(&table)) / @sizeOf(Process);
@@ -508,6 +509,7 @@ pub fn scheduler(boot_stack: []u8) noreturn {
             p.hart = hart.id();
             c.proc = p;
             vm.activate(p.space.root);
+            kstat.inc(.context_switches);
             switchContext(&c.context, &p.context);
             // 进程让出了 CPU，切回来时又拿着它的锁。先切回内核页表再放开锁：它可能已经结束，
             // 父进程拿到它的锁才能回收它、释放它的页表，那时这个 hart 不能还在用这张页表
@@ -599,7 +601,9 @@ pub fn sleep(chan: *const anyopaque, lock: *Spinlock) void {
 /// 叫醒了几个，就给最多几个空闲的 hart 发核间中断，让它们马上来运行。
 /// 调用方要拿过保护条件的锁（sleep 的 lock）：拿着它调用，或者放开它之后调用。
 pub fn wakeup(chan: *const anyopaque) void {
+    kstat.inc(.wakeup_calls);
     if (sleepersOf(chan).load(.monotonic) == 0) return;
+    kstat.inc(.wakeup_scans);
     const me = current();
     var woken: usize = 0;
     for (&table) |*p| {
@@ -611,6 +615,7 @@ pub fn wakeup(chan: *const anyopaque) void {
             woken += 1;
         }
     }
+    kstat.add(.processes_woken, woken);
     ipi.wakeIdle(woken);
 }
 
