@@ -239,7 +239,6 @@ pub fn userinit() SpawnError!void {
     files[abi.stderr] = file.dup(console);
     startFrame(frameOf(p), image);
     fill(p, .{
-        .state = .runnable,
         .pid = next_pid.fetchAdd(1, .monotonic),
         .name = .init("init"),
         .space = space,
@@ -248,6 +247,7 @@ pub fn userinit() SpawnError!void {
     });
     // 在放开锁之前设置：别的 hart 要先拿到这把锁才能运行 init，那时一定看得到 init_proc
     init_proc = p;
+    makeRunnable(p);
 }
 
 pub const ForkError = error{ TooManyProcesses, OutOfMemory };
@@ -275,7 +275,6 @@ pub fn fork() ForkError!usize {
     for (&files, parent.files) |*c, f| c.* = if (f) |x| file.dup(x) else null;
     const pid = next_pid.fetchAdd(1, .monotonic);
     fill(child, .{
-        .state = .runnable,
         .pid = pid,
         .name = parent.name,
         .space = space,
@@ -285,7 +284,7 @@ pub fn fork() ForkError!usize {
         .cwd = parent.cwd,
     });
     // 空闲的 hart 马上来运行子进程，不用等父进程让出 CPU
-    ipi.wakeIdle(1);
+    makeRunnable(child);
     return pid;
 }
 
@@ -540,7 +539,7 @@ pub fn sleep(chan: *const anyopaque, lock: *Spinlock) void {
 /// 叫醒所有睡在 chan 上的进程。只改状态，不切换，中断处理程序里也能调用。
 /// 没人睡在（散列到同一格的）通道上就直接返回（见 sleepers）。
 /// 跳过当前进程：它在运行，不会在睡；调用方可能还拿着它的锁。
-/// 叫醒了几个，就给最多几个空闲的 hart 发核间中断，让它们马上来运行。
+/// 叫醒的每个都经过 makeRunnable：叫醒了几个，就给最多几个空闲的 hart 发核间中断，让它们马上来运行。
 /// 调用方要拿过保护条件的锁（sleep 的 lock）：拿着它调用，或者放开它之后调用。
 pub fn wakeup(chan: *const anyopaque) void {
     kstat.inc(.wakeup_calls);
@@ -553,12 +552,21 @@ pub fn wakeup(chan: *const anyopaque) void {
         p.lock.acquire();
         defer p.lock.release();
         if (p.state == .sleeping and p.chan == chan) {
-            p.state = .runnable;
+            makeRunnable(p);
             woken += 1;
         }
     }
     kstat.add(.processes_woken, woken);
-    ipi.wakeIdle(woken);
+}
+
+/// 把一个不在运行的进程（睡着的、刚建好的）改成 runnable，叫一个登记为空闲的 hart 马上来运行它（ipi.wakeIdle）。
+/// 让别的进程变成 runnable 都经过这里（wakeup、markKilled、fork、userinit）：原来是一条约定，“改成 runnable 的地方
+/// 要调用 ipi.wakeIdle”，漏了的话空闲的 hart 要等 10 ms 的时钟中断才会来。调用方拿着 p.lock。
+/// 进程自己让出 CPU（yield）时不用：它在自己的 hart 上切回调度器，这个调度器接着扫描就会看到它。
+fn makeRunnable(p: *Process) void {
+    std.debug.assert(p.lock.holding() and p.state != .running);
+    p.state = .runnable;
+    ipi.wakeIdle(1);
 }
 
 /// 当前进程调用了 exit。由系统调用处理程序调用，不返回。
@@ -704,10 +712,7 @@ pub fn kill(pid: usize, reason: []const u8) KillError!void {
 fn markKilled(p: *Process, reason: []const u8) void {
     if (p.killed == null) p.killed = reason;
     switch (p.state) {
-        .sleeping => {
-            p.state = .runnable;
-            ipi.wakeIdle(1);
-        },
+        .sleeping => makeRunnable(p),
         // 正在别的 hart 上运行：打断它。在 U 模式里的话马上陷入内核，回到 U 模式之前结束；
         // 在内核里（中断关着）的话，中断挂着，它本来就会在回到 U 模式之前检查 killed，这个中断只是多余的一次。
         // 拿着 p.lock，p.hart 不会变；它可能刚好在切走，那样别的进程会收到一个什么也不做的中断

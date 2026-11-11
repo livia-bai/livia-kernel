@@ -409,7 +409,7 @@ pub fn onInterrupt() void                // 收到时清掉 sip.SSIP
 
 核间中断（IPI）就是一个 hart 打断另一个 hart。S 模式自己发不了（要写只有 M 模式能访问的 CLINT），请 OpenSBI 代发（`sbi.sendIpi`，[riscv-sbi.md](riscv-sbi.md#用到的扩展)）；目标 hart 的 `sip.SSIP` 被置 1，收到 S 模式软件中断。中断不带任何信息，只是让目标 hart 进一次陷阱处理程序，`ipi.onInterrupt` 清掉 `SSIP`（不清的话一开中断又会进来），别的什么都不做。用在两件事上：
 
-**叫醒空闲的 hart**（`wakeIdle`）。`wakeup` 叫醒了几个进程，就叫最多几个空闲的 hart；`kill` 叫醒一个睡着的进程、`fork` 建好一个子进程时各叫一个。被叫的 hart 如果在 `wfi`，立刻醒来；如果还在扫描，中断挂在 `sip` 里，接下来的 `wfi` 立刻返回。下一轮开头开中断时处理掉它，接着扫描，看到新的 `runnable` 进程。
+**叫醒空闲的 hart**（`wakeIdle`）。让别的进程变成 `runnable` 都经过 `makeRunnable(p)`（拿着 `p.lock`，断言 `p` 不在运行）：它改状态、`wakeIdle(1)` 叫一个空闲的 hart。`wakeup` 叫醒几个进程就叫了几次，`kill` 叫醒睡着的进程、`fork` 建好子进程、`userinit` 建好 init 时各一次。原来这是一条约定（“改成 `runnable` 的地方要调用 `wakeIdle`”），每个地方自己写；收进一个函数之后，新加的路径不会漏。被叫的 hart 如果在 `wfi`，立刻醒来；如果还在扫描，中断挂在 `sip` 里，接下来的 `wfi` 立刻返回。下一轮开头开中断时处理掉它，接着扫描，看到新的 `runnable` 进程。
 
 - **扫描之前登记，不是扫完才登记**：hart B 扫到槽位 k（不是 `runnable`）之后、`wfi` 之前，hart A 把槽位 k 改成 `runnable`。如果 B 扫完才登记，A 可能在那之前读 `idle`、看不到 B，B 就白睡一觉。B 在扫描之前登记，而 A 是拿着槽位 k 的锁改状态、放开锁之后才读 `idle`：要么 B 拿到这把锁时已经看到 `runnable`，要么 A 拿到锁在 B 放开之后，那么 B 的登记（在 B 放开锁之前）一定对 A 可见，A 会发核间中断过来。和调度器“关着中断扫描再 `wfi`”防的是同一种竞争，只是跨 hart。
 - **认领**：`wakeIdle` 用 `cmpxchg` 把一个空闲 hart 的位清掉，成功了才给它发。两个 hart 同时叫醒进程时不会都去叫同一个空闲的 hart，另一个会去叫下一个。被叫的 hart 下一轮开头重新登记。

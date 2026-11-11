@@ -2,6 +2,10 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-11 进程变成 runnable 只经过 makeRunnable
+
+- 改动：`wakeup`、`markKilled`、`fork`、`userinit` 把进程改成 `runnable` 都经过 `proc.makeRunnable`：断言拿着进程锁、进程不在运行，改状态，`ipi.wakeIdle(1)`。原来各处自己改状态、自己叫空闲的 hart。
+
 ## 2026-11-11 ELF 加载器搬进 loader.zig
 
 - 改动：ELF 加载器（`Source`、`Image`、`load`、`loadSegment`、`loadImage`）和命令行参数的压栈（`pushArgs`）从 `proc.zig` 搬到新文件 `src/loader.zig`，单元测试跟着搬过去。`proc.zig` 只管进程的生命周期。

@@ -67,7 +67,7 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 - `tp`：在内核里是当前 hart 的编号（`hart.id()`）；从 U 模式陷入时 `trapEntry` 换回内核的值，回到 U 模式时 `trapExit` 换成用户的。内核不能把 `tp` 挪作他用（[docs/trap.md](docs/trap.md#tp-约定)）。
 - `sstatus.FS` 保持 Off：`kmain`、`kmainSecondary` 一开始就清掉 OpenSBI 留下的 Dirty，进入 U 模式的 `sstatus` 从内核当前的值派生，所以用户程序也不能用浮点（[docs/riscv-sbi.md](docs/riscv-sbi.md#位定义)）。
 - 内核代码（陷阱处理、系统调用、调度器扫描进程表）全程关中断执行；只有调度器每一轮开头开一下中断（[docs/trap.md](docs/trap.md#中断开关不变量)）。
-- 调度器先关中断再扫描进程表、再 `wfi`，下一轮开头才开中断；扫描之前先 `ipi.setIdle(true)` 登记成空闲，挑中进程时清掉（[docs/process.md](docs/process.md#调度器)）。让进程变成 `runnable` 的地方（`wakeup`、`markKilled`、`fork`）要调用 `ipi.wakeIdle`，否则空闲的 hart 要等 10 ms 才来运行它（[docs/process.md](docs/process.md#核间中断)）。
+- 调度器先关中断再扫描进程表、再 `wfi`，下一轮开头才开中断；扫描之前先 `ipi.setIdle(true)` 登记成空闲，挑中进程时清掉（[docs/process.md](docs/process.md#调度器)）。让别的进程变成 `runnable` 只能经过 `proc.makeRunnable`（它调用 `ipi.wakeIdle`，否则空闲的 hart 要等 10 ms 才来运行它）（[docs/process.md](docs/process.md#核间中断)）。
 - 进程切换只在关中断、拿着这个进程的锁时进行，并且总是调度器 ↔ 进程：`proc.scheduler` 拿着进程锁切到进程，进程拿上自己的锁、改掉自己的状态后只通过 `proc.sched`（`yield`/`yieldTimeslice`/`sleep`/`finish`）切回，切回来之后由调用方放开锁；新进程在 `forkretC` 里放开（[docs/process.md](docs/process.md#调度器)）。调度器先换回内核页表再放开进程锁。`startFrame` 构造的 `TrapFrame`（init、`exec`）的 `sstatus` 必须清掉 `SIE`。
 - 进程的 `state`、`hart`、`pid`、`name`、`chan`、`killed`、`xstatus`、`ticks` 只在拿着它的锁时读写，`parent` 只在拿着 `wait_lock` 时读写；新进程拿着锁一次填好再放开（`fill` 不覆盖锁）（[docs/process.md](docs/process.md#锁)）。
 - 进程的 `TrapFrame` 总在它内核栈的最顶端（`proc.frameOf`）：`trapEntry`、`trapExit` 设 `sscratch`、`fork` 复制父进程的 `TrapFrame` 都依赖这一点。
