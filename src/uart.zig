@@ -89,6 +89,9 @@ var rx_buf: [256]u8 = undefined;
 var rx_head: u8 = 0;
 var rx_tail: u8 = 0;
 
+/// 接收缓冲区最多装几个字符（rx_head 追上 rx_tail 前一格就算满了）。一次 read 最多读到这么多
+pub const rx_capacity = rx_buf.len - 1;
+
 /// 保护接收缓冲区。中断处理程序也要拿它：拿着它的代码都关着中断，同一个 hart 上不会被中断打断，
 /// 所以不会自己等自己；多核时串口中断可能在另一个 hart 上处理。
 pub var rx_lock: Spinlock = .init("uart rx");

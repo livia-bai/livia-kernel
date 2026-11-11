@@ -455,6 +455,8 @@ pub fn yield() void {
 ```zig
 pub fn sleep(chan: *const anyopaque, lock: *Spinlock) void {
     const p = current().?;
+    const count = sleepersOf(chan);
+    _ = count.fetchAdd(1, .monotonic);
     p.lock.acquire();
     lock.release();
     p.chan = chan;
@@ -462,10 +464,12 @@ pub fn sleep(chan: *const anyopaque, lock: *Spinlock) void {
     sched();
     p.chan = null;
     p.lock.release();
+    _ = count.fetchSub(1, .monotonic);
     lock.acquire();
 }
 
 pub fn wakeup(chan: *const anyopaque) void {
+    if (sleepersOf(chan).load(.monotonic) == 0) return;
     const me = current();
     for (&table) |*p| {
         if (p == me) continue;
@@ -500,6 +504,8 @@ while (p.nread == p.nwrite and p.write_open) {
 ```
 
 **为什么不会丢 `wakeup`**（lost wakeup：`wakeup` 发生在睡下之前，等的人永远睡下去）：`sleep` 先拿上自己的进程锁，再放开 `lock`，然后才改状态、切走；调度器切回来之后才放开进程锁。所以从“调用方检查完条件”到“真正切走”，这个进程一直拿着 `lock` 或者自己的进程锁（交接时两把都拿着）。改条件的一方要先拿 `lock` 才能改，改完调用 `wakeup` 又要拿进程锁才能看状态，于是它看到的要么是还没检查条件之前（那调用方会看到新的条件，不睡），要么是已经完全睡下、切走之后（`sleeping`，叫醒它）。进程锁还保证了另一件事：`wakeup` 不会在这个进程还没切走时就把它改成 `runnable`，让另一个 hart 的调度器在它还在原来的栈上运行时恢复它。
+
+**没人在等就不扫进程表**（`sleepers`）：`wakeup` 调得很频繁（每次放开睡眠锁、每次管道读写、每个磁盘中断、每个时钟 tick），而绝大多数时候没有进程在等：B 树查找每经过一层节点放一次缓冲区的睡眠锁，原来每次都要扫 64 个槽位、拿 64 次进程锁。现在按通道地址散列成 32 格，每格一个原子计数，`sleep` 拿着 `lock` 时加 1、醒来减 1，`wakeup` 看到这一格是 0 就直接返回。不同的通道散列到同一格只是多扫一遍，不会漏。它也不会丢 `wakeup`：`sleep` 加 1 在放开 `lock` 之前，改条件的一方在拿上 `lock` 之后才改条件、才 `wakeup`（拿着 `lock` 调用，或者像串口中断那样放开之后调用），`lock` 的放开和拿上把加 1 排在了读计数之前。计数不保护别的数据，所以用 `monotonic`。这是 xv6 没有的优化；彻底的做法是每个条件一个等待队列，只走真正在等的进程。
 
 **`wakeup` 跳过当前进程**：它正在运行，不会是 `sleeping`；而调用方可能正拿着它的锁，再拿就是同一个 hart 重复加锁（xv6 也跳过 `myproc()`）。
 

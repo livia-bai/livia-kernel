@@ -84,29 +84,6 @@ pub fn unlock() void {
     write_lock.release();
 }
 
-/// 文件系统的错误换成系统调用的错误码。
-pub fn errno(err: anyerror) abi.Errno {
-    return switch (err) {
-        error.NotFound => .noent,
-        error.Exists => .exist,
-        error.NotDir => .notdir,
-        error.IsDir => .isdir,
-        error.NotEmpty => .notempty,
-        error.NameTooLong => .nametoolong,
-        error.InvalidName => .inval,
-        error.NoSpace => .nospc,
-        error.FileTooBig => .fbig,
-        error.BadAddress => .fault,
-        error.NoDevice => .nodev,
-        error.IsDirLink => .perm,
-        error.TooManyLinks => .mlink,
-        error.SymlinkLoop => .loop,
-        error.NotSymlink => .inval,
-        error.TextBusy => .txtbsy,
-        else => .io, // Corrupt 等：磁盘上的东西不对
-    };
-}
-
 /// fs.read 的 out：写进内核内存。
 pub const KernelOut = struct {
     buf: []u8,

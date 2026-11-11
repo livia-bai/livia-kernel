@@ -165,6 +165,8 @@ pub fn dispatch(frame: *TrapFrame) usize {
 
 `proc.exit` 和 `shutdown` 是 `noreturn`，可以直接放在 `switch` 表达式里。其余的大多是一个小函数：把参数交给 `proc` 或 `vm` 里的函数，把 Zig 的错误换成 `abi.fail(错误码)`。
 
+**错误码**：内核里的错误按名字查 `syscall.errnos` 这张表换成错误码（`errno(err)`、`failWith(err)`）。表是一个匿名结构体，字段名是错误名、值是错误码（`.NotFound = .noent`、`.Corrupt = .io`……）；`errno` 对错误集做 `inline else`，在编译期逐个查表，表里没有的错误直接编译失败（`syscall.errnos has no errno for error.X`）。所以新加一个错误不会悄悄变成 `-EIO`（这个内核里 `EIO` 的意思是“磁盘上的数据不对”），原来的 `fsys.errno(anyerror)` 有一个 `else => .io` 兜底，就会这样。同一个名字在不同调用里的意思要一样：原始区域的块号超出范围原来是 `OutOfRange`（`-EINVAL`），和文件系统里“指针坏了”的 `OutOfRange`（`-EIO`）撞了名字，改成了 `InvalidArgument`。
+
 会等待的调用（`yield`、`sleep`、`read`、管道的 `write`、`wait`）在里面切回调度器，等这个进程再被调度时才返回，然后 `handleTrap` 照常把返回值写进 `a0`、检查 `killed`、回到 U 模式。`sleep` 和 xv6 的 `sys_sleep` 一样，拿着 `timer.lock` 在循环里 `proc.sleep(&timer.ticks, &timer.lock)`，每个 tick 醒来一次，数够了 tick（或者被 kill 了）才返回（[process.md](process.md#sleepwakeup)）。
 
 ## write
@@ -173,7 +175,7 @@ pub fn dispatch(frame: *TrapFrame) usize {
 fn write(fd: usize, ptr: usize, len: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
     vm.prefault(space(), ptr, len);
-    return file.write(f, space(), ptr, len) catch |err| fileError(err);
+    return file.write(f, space(), ptr, len) catch |err| failWith(err);
 }
 ```
 
@@ -198,12 +200,14 @@ fn write(fd: usize, ptr: usize, len: usize) usize {
 fn read(fd: usize, ptr: usize, len: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
     if (len == 0) return 0;
-    vm.checkUser(space(), ptr, len, true) catch return abi.fail(.fault);
-    return file.read(f, space(), ptr, len) catch |err| fileError(err);
+    const n = file.readLimit(f, len);
+    vm.checkUser(space(), ptr, n, true) catch return abi.fail(.fault);
+    return file.read(f, space(), ptr, n) catch |err| failWith(err);
 }
 ```
 
-- **先检查整个目标范围可写，再读**（`vm.checkUser`）：从串口的缓冲区取出来的字符放不回去，要是取出来才发现用户给的地址写不进去，这些字符就丢了。所以坏地址立刻返回 `-EFAULT`，不阻塞、不消耗输入。检查的同时把范围里还没分配的页都分配好（按需分页），所以之后拿着锁写进去一定成功；代价是整个缓冲区都分配了，哪怕只读到几个字节（`tail` 因此一次最多读 64 KiB，[user-programs.md](user-programs.md#写脚本用的程序)）。
+- **先检查整个目标范围可写，再读**（`vm.checkUser`）：从串口的缓冲区取出来的字符放不回去，要是取出来才发现用户给的地址写不进去，这些字符就丢了。所以坏地址立刻返回 `-EFAULT`，不阻塞、不消耗输入。检查的同时把范围里还没分配的页都分配好（按需分页），所以之后拿着锁写进去一定成功。
+- **检查之前先截短 `len`**（`file.readLimit`）：串口一次最多给出接收缓冲区里的 255 个字符，管道一次最多给出缓冲区里的 2048 字节，`/dev/null` 什么都没有。程序给一个 1 MiB 的缓冲区读管道，只检查、分配开头的一页，不会为没用到的部分提前分配 256 页。文件（和 `/dev/zero`）一次可能读满 `len`，不截短，整个缓冲区都要先分配（`tail` 因此一次最多读 64 KiB，[user-programs.md](user-programs.md#写脚本用的程序)）。
 - `len = 0` 直接返回 0，不检查指针、不阻塞。
 - 没有数据时阻塞，至少读到一个字节才返回；有多少就读多少（最多 `len`），不等凑满。**返回 0 表示读到了结尾**：管道的写端都关了，或者在串口上按了 Ctrl-D。
 - 串口：**不回显、不做行编辑**，原样返回收到的字节（回车是 `\r`），shell 自己回显；Ctrl-C 不会被读到。管道：写进去什么读出来什么。文件：从读写位置开始读，不阻塞，到末尾返回 0。细节见 [files.md](files.md)。

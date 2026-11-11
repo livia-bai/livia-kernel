@@ -95,17 +95,23 @@ fn refOf(comptime who: []const u8, page: *align(size) Page) *u8 {
 
 /// 分配一页并清零，引用数为 1。
 pub fn alloc() error{OutOfMemory}!*align(size) Page {
+    const page = try allocUninit();
+    @memset(page, 0);
+    return page;
+}
+
+/// 分配一页，不清零（内容是上一个用它的人留下的），引用数为 1。只给马上整页覆盖它的调用方用
+/// （写时复制、复制根页表），省掉一次白做的清零。
+pub fn allocUninit() error{OutOfMemory}!*align(size) Page {
     const pool = &pools[hart.id()];
     pool.lock.acquire();
     var node = pool.list.popFirst();
     if (node != null) pool.count -= 1;
     pool.lock.release();
     if (node == null) node = steal(pool);
-    // 清零放在锁外面：这一页已经是自己的了
     const page: *align(size) Page = @ptrCast(@alignCast(node orelse return error.OutOfMemory));
     // 从空闲链表里摘下来的页只有自己知道，别人不会同时改它的引用数
     @atomicStore(u8, refOf("page.alloc", page), 1, .release);
-    @memset(page, 0);
     return page;
 }
 

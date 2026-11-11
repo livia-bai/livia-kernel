@@ -15,6 +15,7 @@ pub fn freePages() usize      // 当前空闲的页数（各个 hart 的链表�
 
 pub fn init(start: usize, end: usize, reserved: []const dtb.Region) void
 pub fn alloc() error{OutOfMemory}!*align(size) Page   // 返回清零的一页，引用数为 1
+pub fn allocUninit() error{OutOfMemory}!*align(size) Page   // 不清零，只给马上整页覆盖的调用方
 pub fn free(page: *align(size) Page) void              // 放掉一个引用，减到 0 才回到空闲链表
 pub fn share(page: *align(size) Page) void             // 加一个引用（fork 时父子共用）
 pub fn isExclusive(page: *align(size) Page) bool       // 引用数是不是 1（写时复制时用）
@@ -87,6 +88,12 @@ page.init(vm.kernelEnd(), info.memory.end(), info.reserved());
 
 ```zig
 pub fn alloc() error{OutOfMemory}!*align(size) Page {
+    const page = try allocUninit();
+    @memset(page, 0);
+    return page;
+}
+
+pub fn allocUninit() error{OutOfMemory}!*align(size) Page {
     const pool = &pools[hart.id()];
     pool.lock.acquire();
     var node = pool.list.popFirst();
@@ -95,7 +102,6 @@ pub fn alloc() error{OutOfMemory}!*align(size) Page {
     if (node == null) node = steal(pool);           // 自己的空了，去别的 hart 那里拿一批
     const page: *align(size) Page = @ptrCast(@alignCast(node orelse return error.OutOfMemory));
     @atomicStore(u8, refOf("page.alloc", page), 1, .release);
-    @memset(page, 0);
     return page;
 }
 
@@ -114,6 +120,7 @@ pub fn free(page: *align(size) Page) void {
 - `refOf` 检查地址是否在分配器管理的范围内，不在就 panic（`page.free: 0x.. was not handed out by the page allocator`）。这能抓住“把一个不是页分配器给的指针拿来释放”这类错误；它在开发 U 模式时确实抓到过一次（进程退出后内核状态被破坏，拿着垃圾值去释放）。
 - 重复释放靠引用数发现（见[引用数](#引用数)）。
 - 释放时不清零（分配时清）。
+- `allocUninit` 不清零，只给马上用 `@memcpy` 整页覆盖它的两个地方：写时复制（`vm.breakCow`）和复制内核根页表（`vm.createUserSpace`）。清零白做一遍，而且是整整 4 KiB 的写。别的地方一律用 `alloc`：新页表必须全是无效项，给用户程序的页不能留着别人的数据。
 
 ## 谁在用
 

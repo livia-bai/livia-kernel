@@ -162,6 +162,24 @@ pub fn close(f: *File) void {
     if (kind == .pipe) pipe.close(p, writable);
 }
 
+/// 一次 read 最多能从 f 读到多少字节：串口、管道一次最多给出缓冲区里有的，/dev/null 什么都没有。
+/// read 系统调用先按它截短 len 再检查、分配目标范围：程序给一个很大的缓冲区读串口、管道时，
+/// 实际只会写进开头的一小段，不该为整个缓冲区提前分配好所有的页（按需分页省下的内存就白省了）。
+pub fn readLimit(f: *const File, len: usize) usize {
+    return switch (f.kind) {
+        .none => unreachable,
+        .console => @min(len, uart.rx_capacity),
+        .pipe => @min(len, pipe.size),
+        .inode => len,
+        .device => switch (f.major) {
+            .console => @min(len, uart.rx_capacity),
+            .null => 0,
+            .zero => len,
+            _ => unreachable, // openDevice 不会打开不认识的设备
+        },
+    };
+}
+
 /// 从 f 读最多 len 个字节到用户地址空间 space 的 ptr，返回读到的字节数，0 表示读到了结尾。
 /// 调用方先检查过 [ptr, ptr+len) 可写（见 syscall.read）。
 pub fn read(f: *File, space: *vm.Space, ptr: usize, len: usize) Error!usize {

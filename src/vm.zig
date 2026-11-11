@@ -301,7 +301,7 @@ const Region = struct {
 
 /// 新建一个空的用户地址空间：复制内核的根页表（第 1 项在内核页表里是空的，留给用户程序）。
 pub fn createUserSpace() error{OutOfMemory}!Space {
-    const root: *PageTable = @ptrCast(try page.alloc());
+    const root: *PageTable = @ptrCast(try page.allocUninit()); // 整页马上被覆盖
     @memcpy(root, kernel_root); // 不写成 root.* = kernel_root.*：Debug 模式下会先在栈上复制一份 4 KiB
     return .{ .root = root };
 }
@@ -451,7 +451,7 @@ pub fn breakCow(root: *PageTable, va: usize) CowError!void {
     // 只有映射着这一页的进程自己 fork 才会给它加引用，所以这里看到“只剩自己”，之后也不会变。
     // 看到还有别人的话，先复制、再放掉引用：别人这时也可能在复制它，放掉之前内容一定还在
     if (!page.isExclusive(old)) {
-        const new = try page.alloc();
+        const new = try page.allocUninit(); // 整页马上被覆盖
         @memcpy(new, old);
         pte.ppn = @intCast(@intFromPtr(new) >> 12);
         page.free(old);

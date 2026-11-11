@@ -554,6 +554,20 @@ pub fn yieldTimeslice() void {
     p.lock.release();
 }
 
+/// 按通道地址散列的睡眠者计数：睡在散列到第 i 格的通道上的进程有几个。wakeup 看到 0 就直接返回，
+/// 不用扫整张进程表、拿 max_procs 把锁（放开睡眠锁、管道读写、磁盘中断、每个时钟 tick 都要 wakeup，
+/// 绝大多数时候没人在等）。不同的通道散列到同一格只是多扫一次，不会漏。
+///
+/// 为什么不会丢唤醒：sleep 拿着条件锁 lock 时加 1，之后才放开 lock；改条件的一方要先拿 lock 才能改，
+/// 改完（或者放开 lock 之后）才 wakeup。所以它读计数时，lock 的放开和拿上已经把这次加 1 排在了前面。
+/// 计数只靠这个先后关系，不用来保护别的数据，monotonic 就够了。
+var sleepers: [32]std.atomic.Value(u32) = @splat(.init(0));
+
+fn sleepersOf(chan: *const anyopaque) *std.atomic.Value(u32) {
+    // 通道多是结构体里的字段，低几位常常一样，先右移
+    return &sleepers[(@intFromPtr(chan) >> 3) % sleepers.len];
+}
+
 /// 当前进程睡在 chan 上，直到别人调用 wakeup(chan)。
 ///
 /// 醒来不代表等的条件已经满足（同一个 chan 上可能有好几个进程在等不同的东西，也可能被 kill 叫醒），
@@ -565,6 +579,8 @@ pub fn yieldTimeslice() void {
 /// 不会丢掉 wakeup（lost wakeup），也不会在这个进程还没切走时就被另一个 hart 的调度器运行。
 pub fn sleep(chan: *const anyopaque, lock: *Spinlock) void {
     const p = current().?;
+    const count = sleepersOf(chan);
+    _ = count.fetchAdd(1, .monotonic); // 在放开 lock 之前，见 sleepers
     p.lock.acquire();
     lock.release();
     p.chan = chan;
@@ -572,13 +588,17 @@ pub fn sleep(chan: *const anyopaque, lock: *Spinlock) void {
     sched();
     p.chan = null;
     p.lock.release();
+    _ = count.fetchSub(1, .monotonic);
     lock.acquire();
 }
 
 /// 叫醒所有睡在 chan 上的进程。只改状态，不切换，中断处理程序里也能调用。
+/// 没人睡在（散列到同一格的）通道上就直接返回（见 sleepers）。
 /// 跳过当前进程：它在运行，不会在睡；调用方可能还拿着它的锁。
 /// 叫醒了几个，就给最多几个空闲的 hart 发核间中断，让它们马上来运行。
+/// 调用方要拿过保护条件的锁（sleep 的 lock）：拿着它调用，或者放开它之后调用。
 pub fn wakeup(chan: *const anyopaque) void {
+    if (sleepersOf(chan).load(.monotonic) == 0) return;
     const me = current();
     var woken: usize = 0;
     for (&table) |*p| {
@@ -1051,8 +1071,16 @@ test "ELF 加载器拒绝坏文件" {
     try std.testing.expectError(error.BadElf, testLoad(@embedFile("t_noperm")));
 }
 
+/// 测试用：表里直接摆好的 sleeping 进程没走 sleep，替它们记上睡眠者计数。
+fn testSleepers(procs: []const Process) void {
+    for (procs) |*p| if (p.state == .sleeping) {
+        _ = sleepersOf(p.chan.?).fetchAdd(1, .monotonic);
+    };
+}
+
 /// 测试用：清空进程表和全局状态。
 fn testReset() void {
+    sleepers = @splat(.init(0));
     table = @splat(.{});
     cpus = @splat(.{});
     init_proc = null;
@@ -1063,14 +1091,15 @@ test "wakeup 只叫醒睡在同一个通道上的进程；kill 只做标记，�
     const expectEqual = std.testing.expectEqual;
     testReset();
     defer testReset();
-    var a: u8 = 0;
-    var b: u8 = 0;
+    var a: u64 = 0;
+    var b: u64 = 0;
     table[0] = .{ .state = .sleeping, .pid = 1, .chan = &a };
     table[1] = .{ .state = .sleeping, .pid = 2, .chan = &a };
     table[2] = .{ .state = .sleeping, .pid = 3, .chan = &b };
     table[3] = .{ .state = .runnable, .pid = 4 };
     table[4] = .{ .state = .zombie, .pid = 5 };
     init_proc = &table[0];
+    testSleepers(&table);
 
     wakeup(&a);
     try expectEqual(.runnable, table[0].state);
@@ -1129,6 +1158,7 @@ test "wait 只找自己的子进程，按 pid 挑；子进程结束时交给 ini
     const sh = &table[1];
     init.* = .{ .state = .sleeping, .pid = 1 };
     init.chan = init; // 在 wait 里睡着
+    testSleepers(&table);
     sh.* = .{ .state = .running, .pid = 2, .parent = init };
     table[2] = .{ .state = .runnable, .pid = 3, .parent = sh };
     table[3] = .{ .state = .zombie, .pid = 4, .parent = sh };

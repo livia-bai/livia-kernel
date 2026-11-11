@@ -2,6 +2,13 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-11 错误码按名字查表；read 不再为用不到的缓冲区分配页；wakeup 没人在等时不扫进程表
+
+- 改动：系统调用把内核的错误换成错误码统一走 `syscall.errnos`（错误名 → 错误码的表）：`errno` 在编译期逐个查表，表里没有的错误编译不过，不再有 `else => EIO` 兜底。`fsys.errno` 去掉了，各个系统调用里手写的 `switch` 换成 `failWith(err)`。原始区域的块号超出范围在内核里改叫 `InvalidArgument`（错误码还是 `-EINVAL`）。
+- 改动：`read` 先按文件的种类把长度截到这一次最多能读到的量（`file.readLimit`：串口 255 字节、管道 2048 字节、`/dev/null` 0），再检查、分配目标范围。读串口、管道时给一个很大的缓冲区，不再把整个缓冲区的页都提前分配好。
+- 改动：`proc.wakeup` 先看按通道地址散列的睡眠者计数（`proc.sleepers`，32 格），是 0 就直接返回，不再每次扫 64 个槽位、拿 64 把进程锁。
+- 改动：新增 `page.allocUninit`（不清零），写时复制和复制根页表用它，省掉一次马上就被覆盖的清零。
+
 ## 2026-11-11 提交前后 flush 磁盘；什么都没改的事务作废时不重走树
 
 - 修复：设备有写缓存时，文件系统的掉电安全没有保证：写完的块不一定按顺序落盘，超级块可能先于它指向的节点落盘。virtio 驱动协商 `VIRTIO_BLK_F_FLUSH`，新增 flush 请求（`virtio_disk.flush`）；`bio.Device` 多了 `flush`，`bio.flush()` 等之前写的块都落盘；`ctree.Volume.commit`（和 `format`）在写超级块前后各 flush 一次。启动日志的磁盘那一行末尾多了 `, flush`（设备不支持时是 `, write-through`）。

@@ -116,7 +116,6 @@ pub fn init() void                         // 挂载
 pub fn reader() error{NoDevice}!Reader     // 读：拿一个已提交的树的快照
 pub fn writer() error{NoDevice}!*Fs        // 改：拿着 write_lock 返回文件系统
 pub fn unlock() void                       // 放开 write_lock
-pub fn errno(err: anyerror) abi.Errno      // 文件系统的错误 → 系统调用的错误码
 
 // 正在运行的程序文件（按需分页从它读页），见下面
 pub fn holdText(ino: u64) error{TextBusy}!void

@@ -93,6 +93,71 @@ fn sleep(ms: usize) usize {
     return 0;
 }
 
+// ---- 错误码 ----
+
+/// 内核里的错误（按名字）对应哪个错误码。errno 在编译期查这张表：系统调用处理函数里可能出现的每一个错误都要在这里，
+/// 不在的编译不过，所以新加的错误不会悄悄变成 EIO（在这个内核里 EIO 的意思是“磁盘上的数据不对”）。
+const errnos = .{
+    // 文件系统（fs.Error，含 ctree.Error）
+    .NotFound = .noent,
+    .Exists = .exist,
+    .NotDir = .notdir,
+    .IsDir = .isdir,
+    .NotEmpty = .notempty,
+    .NameTooLong = .nametoolong,
+    .InvalidName = .inval,
+    .NoSpace = .nospc,
+    .FileTooBig = .fbig,
+    .IsDirLink = .perm,
+    .TooManyLinks = .mlink,
+    .SymlinkLoop = .loop,
+    .NotSymlink = .inval,
+    .TextBusy = .txtbsy,
+    .NoDevice = .nodev,
+    // 磁盘上的东西不对：校验和、结构（Corrupt），没有能用的超级块，块号超出磁盘（指针坏了），
+    // 条目的数据太大（只能是树坏了：fs.zig 自己不会写这么大的条目）
+    .Corrupt = .io,
+    .NotFormatted = .io,
+    .DiskTooLarge = .io,
+    .OutOfRange = .io,
+    .TooBig = .io,
+    .IoError = .io,
+    // 用户内存
+    .BadAddress = .fault,
+    // 打开的文件（file.Error）
+    .NotReadable = .badf,
+    .NotWritable = .badf,
+    .BrokenPipe = .pipe,
+    .NotSeekable = .spipe,
+    .InvalidArgument = .inval,
+    .TooManyFiles = .nfile,
+    .NoSuchDevice = .nxio,
+    // 进程、内存
+    .OutOfMemory = .nomem,
+    .TooManyProcesses = .again,
+    .NoSuchProgram = .noent,
+    .BadElf = .noexec,
+    .NoChildren = .child,
+    .NoSuchProcess = .srch,
+    .PermissionDenied = .perm,
+};
+
+/// 错误换成错误码（见 errnos）。err 的错误集是什么都行，只要里面每个错误都在表里。
+fn errno(err: anytype) abi.Errno {
+    switch (err) {
+        inline else => |e| {
+            const name = @errorName(e);
+            if (!@hasField(@TypeOf(errnos), name)) @compileError("syscall.errnos has no errno for error." ++ name);
+            return @field(errnos, name);
+        },
+    }
+}
+
+/// 出错的系统调用的返回值。
+fn failWith(err: anytype) usize {
+    return abi.fail(errno(err));
+}
+
 /// fd 对应的打开的文件，fd 超出范围或者没有打开时返回 null。
 fn fileOf(fd: usize) ?*file.File {
     if (fd >= abi.max_fds) return null;
@@ -111,32 +176,24 @@ fn installFd(f: *file.File) ?usize {
     return null;
 }
 
-fn fileError(err: file.Error) usize {
-    return abi.fail(switch (err) {
-        error.NotReadable, error.NotWritable => .badf,
-        error.BrokenPipe => .pipe,
-        error.NotSeekable => .spipe,
-        error.InvalidArgument => .inval,
-        else => fsys.errno(err), // 文件系统里的文件：磁盘满了、读到坏块等
-    });
-}
-
 /// 写 fd。中途遇到坏地址就停下，返回已经写出的字节数；一个字节都没写出才返回错误（见 file.write）。
 /// 用户内存是拿着锁（串口的输出锁、管道的锁、文件系统的写锁）复制的，那时读不了盘：
 /// 来源在程序文件的页里（比如字符串常量）、还没读进来的话，先读好（vm.prefault）。
 fn write(fd: usize, ptr: usize, len: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
     vm.prefault(space(), ptr, len);
-    return file.write(f, space(), ptr, len) catch |err| fileError(err);
+    return file.write(f, space(), ptr, len) catch |err| failWith(err);
 }
 
 /// 读 fd。先检查整个目标范围可写：从串口的缓冲区取出来的字符放不回去，不能取出来之后才发现写不进去。
 /// 检查时顺便把还没分配的页都分配好（按需分页），之后拿着锁写进去时不用再读盘。
+/// 检查之前先按文件的种类把 len 截到这一次最多能读到的量（file.readLimit）：只分配真会写到的页。
 fn read(fd: usize, ptr: usize, len: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
     if (len == 0) return 0;
-    vm.checkUser(space(), ptr, len, true) catch return abi.fail(.fault);
-    return file.read(f, space(), ptr, len) catch |err| fileError(err);
+    const n = file.readLimit(f, len);
+    vm.checkUser(space(), ptr, n, true) catch return abi.fail(.fault);
+    return file.read(f, space(), ptr, n) catch |err| failWith(err);
 }
 
 fn close(fd: usize) usize {
@@ -159,10 +216,7 @@ fn dup(fd: usize) usize {
 fn pipe(fds_ptr: usize) usize {
     // 先检查能写：fd 装进 fd 表以后再失败，就要再一个个撤销
     vm.checkUser(space(), fds_ptr, 2 * @sizeOf(u32), true) catch return abi.fail(.fault);
-    const r, const w = file.openPipe() catch |err| return abi.fail(switch (err) {
-        error.TooManyFiles => .nfile,
-        error.OutOfMemory => .nomem,
-    });
+    const r, const w = file.openPipe() catch |err| return failWith(err);
     const files = &proc.current().?.files;
     const rfd = installFd(r) orelse {
         file.close(r);
@@ -181,31 +235,22 @@ fn pipe(fds_ptr: usize) usize {
 }
 
 fn sbrk(increment: usize) usize {
-    return proc.sbrk(@bitCast(increment)) catch |err| abi.fail(switch (err) {
-        error.OutOfMemory => .nomem,
-        error.InvalidArgument => .inval,
-    });
+    return proc.sbrk(@bitCast(increment)) catch |err| failWith(err);
 }
 
-fn blockError(err: bio.Error) usize {
-    return abi.fail(switch (err) {
-        error.NoDevice => .nodev,
-        error.OutOfRange => .inval,
-    });
-}
-
-/// 原始区域的第 blockno 块在磁盘上是第几块（fsys.raw_base 起）。
-fn rawBlock(blockno: usize) bio.Error!u64 {
+/// 原始区域的第 blockno 块在磁盘上是第几块（fsys.raw_base 起）。块号超出原始区域是 InvalidArgument
+/// （不是 OutOfRange：那是文件系统里的指针坏了，EIO）。通过了这里，bio 就不会再报 NoDevice、OutOfRange。
+fn rawBlock(blockno: usize) error{ NoDevice, InvalidArgument }!u64 {
     if (fsys.raw_count == 0) return error.NoDevice;
-    if (blockno >= fsys.raw_count) return error.OutOfRange;
+    if (blockno >= fsys.raw_count) return error.InvalidArgument;
     return fsys.raw_base + blockno;
 }
 
 /// 读原始区域的一块到用户内存。先检查整个目标范围可写（顺便复制好写时复制的页），之后的 copyToUser 一定成功。
 fn readBlock(blockno: usize, ptr: usize) usize {
     vm.checkUser(space(), ptr, abi.block_size, true) catch return abi.fail(.fault);
-    const n = rawBlock(blockno) catch |err| return blockError(err);
-    const b = bio.read(n) catch |err| return blockError(err);
+    const n = rawBlock(blockno) catch |err| return failWith(err);
+    const b = bio.read(n) catch unreachable; // rawBlock 检查过了
     defer bio.release(b);
     vm.copyToUser(space(), ptr, b.data) catch unreachable;
     return 0;
@@ -214,8 +259,8 @@ fn readBlock(blockno: usize, ptr: usize) usize {
 /// 用户内存的一块写到磁盘。整块覆盖，不用先读；先检查来源可读，复制到一半失败的话缓冲区里会留下半新半旧的内容。
 fn writeBlock(blockno: usize, ptr: usize) usize {
     vm.checkUser(space(), ptr, abi.block_size, false) catch return abi.fail(.fault);
-    const n = rawBlock(blockno) catch |err| return blockError(err);
-    const b = bio.get(n) catch |err| return blockError(err);
+    const n = rawBlock(blockno) catch |err| return failWith(err);
+    const b = bio.get(n) catch unreachable; // rawBlock 检查过了
     defer bio.release(b);
     vm.copyFromUser(space(), b.data, ptr) catch unreachable;
     b.valid = true;
@@ -239,7 +284,7 @@ fn open(path_ptr: usize, path_len: usize, flags: usize) usize {
     const readable = access != abi.open_write;
     const writable = access != abi.open_read;
     var buf: [abi.max_path]u8 = undefined;
-    const path = userPath(path_ptr, path_len, &buf) catch |err| return abi.fail(fsys.errno(err));
+    const path = userPath(path_ptr, path_len, &buf) catch |err| return failWith(err);
     const cwd = proc.current().?.cwd;
     // 可能要建文件、截断的才拿写锁，只是打开已有的文件在快照上找
     const modifies = flags & abi.open_create != 0 or (flags & abi.open_trunc != 0 and writable);
@@ -252,16 +297,13 @@ fn open(path_ptr: usize, path_len: usize, flags: usize) usize {
         defer r.end();
         break :blk openPath(&r.fs, cwd, path, flags, writable);
     };
-    const st = result catch |err| return abi.fail(fsys.errno(err));
+    const st = result catch |err| return failWith(err);
     // 设备文件：读写交给设备，文件系统里只有它的 inode
     const opened = if (st.kind == .device)
         file.openDevice(st.ino, @fromBackingInt(st.major), readable, writable)
     else
         file.openInode(st.ino, readable, writable, flags & abi.open_append != 0);
-    const f = opened catch |err| return abi.fail(switch (err) {
-        error.TooManyFiles => .nfile,
-        error.NoSuchDevice => .nxio,
-    });
+    const f = opened catch |err| return failWith(err);
     return installFd(f) orelse {
         file.close(f);
         return abi.fail(.mfile);
@@ -291,26 +333,26 @@ const PathOp = enum { mkdir, unlink, chdir };
 /// mkdir、unlink、chdir：只有一个路径参数。
 fn pathOp(path_ptr: usize, path_len: usize, op: PathOp) usize {
     var buf: [abi.max_path]u8 = undefined;
-    const path = userPath(path_ptr, path_len, &buf) catch |err| return abi.fail(fsys.errno(err));
+    const path = userPath(path_ptr, path_len, &buf) catch |err| return failWith(err);
     const p = proc.current().?;
     switch (op) {
         .mkdir, .unlink => {
             const root = fsys.writer() catch return abi.fail(.nodev);
             defer fsys.unlock();
             if (op == .mkdir) {
-                _ = root.run(Fs.create, .{ p.cwd, path, .dir }) catch |err| return abi.fail(fsys.errno(err));
+                _ = root.run(Fs.create, .{ p.cwd, path, .dir }) catch |err| return failWith(err);
             } else {
                 // 删掉正在运行的程序文件的最后一个名字：TextBusy
                 const guarded = fsys.beginRemove(root, p.cwd, path) catch return abi.fail(.txtbsy);
                 defer if (guarded) fsys.endModify();
-                root.run(Fs.unlink, .{ p.cwd, path }) catch |err| return abi.fail(fsys.errno(err));
+                root.run(Fs.unlink, .{ p.cwd, path }) catch |err| return failWith(err);
             }
         },
         .chdir => {
             var r = fsys.reader() catch return abi.fail(.nodev);
             defer r.end();
-            const ino = r.fs.resolve(p.cwd, path) catch |err| return abi.fail(fsys.errno(err));
-            const st = r.fs.stat(ino) catch |err| return abi.fail(fsys.errno(err));
+            const ino = r.fs.resolve(p.cwd, path) catch |err| return failWith(err);
+            const st = r.fs.stat(ino) catch |err| return failWith(err);
             if (st.kind != .dir) return abi.fail(.notdir);
             p.cwd = ino;
         },
@@ -324,15 +366,15 @@ fn pathOp(path_ptr: usize, path_len: usize, op: PathOp) usize {
 fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) usize {
     var old_buf: [abi.max_path]u8 = undefined;
     var new_buf: [abi.max_path]u8 = undefined;
-    const old = userPath(old_ptr, old_len, &old_buf) catch |err| return abi.fail(fsys.errno(err));
-    const new = userPath(new_ptr, new_len, &new_buf) catch |err| return abi.fail(fsys.errno(err));
+    const old = userPath(old_ptr, old_len, &old_buf) catch |err| return failWith(err);
+    const new = userPath(new_ptr, new_len, &new_buf) catch |err| return failWith(err);
     const cwd = proc.current().?.cwd;
     const root = fsys.writer() catch return abi.fail(.nodev);
     defer fsys.unlock();
     const same = if (root.resolveNoFollow(cwd, old)) |a| (if (root.resolveNoFollow(cwd, new)) |b| a == b else |_| false) else |_| false;
     const guarded = if (same) false else fsys.beginRemove(root, cwd, new) catch return abi.fail(.txtbsy);
     defer if (guarded) fsys.endModify();
-    root.run(Fs.rename, .{ cwd, old, new }) catch |err| return abi.fail(fsys.errno(err));
+    root.run(Fs.rename, .{ cwd, old, new }) catch |err| return failWith(err);
     return 0;
 }
 
@@ -340,11 +382,11 @@ fn rename(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) usize 
 fn link(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) usize {
     var old_buf: [abi.max_path]u8 = undefined;
     var new_buf: [abi.max_path]u8 = undefined;
-    const old = userPath(old_ptr, old_len, &old_buf) catch |err| return abi.fail(fsys.errno(err));
-    const new = userPath(new_ptr, new_len, &new_buf) catch |err| return abi.fail(fsys.errno(err));
+    const old = userPath(old_ptr, old_len, &old_buf) catch |err| return failWith(err);
+    const new = userPath(new_ptr, new_len, &new_buf) catch |err| return failWith(err);
     const root = fsys.writer() catch return abi.fail(.nodev);
     defer fsys.unlock();
-    root.run(Fs.link, .{ proc.current().?.cwd, old, new }) catch |err| return abi.fail(fsys.errno(err));
+    root.run(Fs.link, .{ proc.current().?.cwd, old, new }) catch |err| return failWith(err);
     return 0;
 }
 
@@ -352,10 +394,10 @@ fn link(old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) usize {
 fn mknod(path_ptr: usize, path_len: usize, major: usize) usize {
     if (major == 0 or major > std.math.maxInt(u16)) return abi.fail(.inval);
     var buf: [abi.max_path]u8 = undefined;
-    const path = userPath(path_ptr, path_len, &buf) catch |err| return abi.fail(fsys.errno(err));
+    const path = userPath(path_ptr, path_len, &buf) catch |err| return failWith(err);
     const root = fsys.writer() catch return abi.fail(.nodev);
     defer fsys.unlock();
-    _ = root.run(Fs.mknod, .{ proc.current().?.cwd, path, @as(u16, @intCast(major)) }) catch |err| return abi.fail(fsys.errno(err));
+    _ = root.run(Fs.mknod, .{ proc.current().?.cwd, path, @as(u16, @intCast(major)) }) catch |err| return failWith(err);
     return 0;
 }
 
@@ -363,23 +405,23 @@ fn mknod(path_ptr: usize, path_len: usize, major: usize) usize {
 fn symlink(target_ptr: usize, target_len: usize, path_ptr: usize, path_len: usize) usize {
     var target_buf: [abi.max_path]u8 = undefined;
     var path_buf: [abi.max_path]u8 = undefined;
-    const target = userPath(target_ptr, target_len, &target_buf) catch |err| return abi.fail(fsys.errno(err));
-    const path = userPath(path_ptr, path_len, &path_buf) catch |err| return abi.fail(fsys.errno(err));
+    const target = userPath(target_ptr, target_len, &target_buf) catch |err| return failWith(err);
+    const path = userPath(path_ptr, path_len, &path_buf) catch |err| return failWith(err);
     const root = fsys.writer() catch return abi.fail(.nodev);
     defer fsys.unlock();
-    _ = root.run(Fs.symlink, .{ proc.current().?.cwd, target, path }) catch |err| return abi.fail(fsys.errno(err));
+    _ = root.run(Fs.symlink, .{ proc.current().?.cwd, target, path }) catch |err| return failWith(err);
     return 0;
 }
 
 /// 符号链接的目标写进用户内存，放不下就截断（和 Linux 一样），返回写了几个字节。在快照上读。
 fn readlink(path_ptr: usize, path_len: usize, buf_ptr: usize, buf_len: usize) usize {
     var buf: [abi.max_path]u8 = undefined;
-    const path = userPath(path_ptr, path_len, &buf) catch |err| return abi.fail(fsys.errno(err));
+    const path = userPath(path_ptr, path_len, &buf) catch |err| return failWith(err);
     var r = fsys.reader() catch return abi.fail(.nodev);
     defer r.end();
-    const ino = r.fs.resolveNoFollow(proc.current().?.cwd, path) catch |err| return abi.fail(fsys.errno(err));
+    const ino = r.fs.resolveNoFollow(proc.current().?.cwd, path) catch |err| return failWith(err);
     var target: [fs.max_symlink]u8 = undefined;
-    const t = r.fs.readlink(ino, &target) catch |err| return abi.fail(fsys.errno(err));
+    const t = r.fs.readlink(ino, &target) catch |err| return failWith(err);
     const n = @min(t.len, buf_len);
     vm.copyToUser(space(), buf_ptr, t[0..n]) catch return abi.fail(.fault);
     return n;
@@ -392,7 +434,7 @@ fn getcwd(buf_ptr: usize, buf_len: usize) usize {
     var out: [abi.max_path]u8 = undefined;
     const path = r.fs.dirPath(proc.current().?.cwd, &out) catch |err| return abi.fail(switch (err) {
         error.NameTooLong => .range, // 比 max_path 还长：用户的缓冲区不会比它大，当作放不下
-        else => fsys.errno(err),
+        else => errno(err),
     });
     if (path.len > buf_len) return abi.fail(.range);
     vm.copyToUser(space(), buf_ptr, path) catch return abi.fail(.fault);
@@ -402,11 +444,11 @@ fn getcwd(buf_ptr: usize, buf_len: usize) usize {
 /// path 自己（是符号链接的话不跟着走）的 Stat。
 fn lstat(path_ptr: usize, path_len: usize, ptr: usize) usize {
     var buf: [abi.max_path]u8 = undefined;
-    const path = userPath(path_ptr, path_len, &buf) catch |err| return abi.fail(fsys.errno(err));
+    const path = userPath(path_ptr, path_len, &buf) catch |err| return failWith(err);
     var r = fsys.reader() catch return abi.fail(.nodev);
     defer r.end();
-    const ino = r.fs.resolveNoFollow(proc.current().?.cwd, path) catch |err| return abi.fail(fsys.errno(err));
-    const s = r.fs.stat(ino) catch |err| return abi.fail(fsys.errno(err));
+    const ino = r.fs.resolveNoFollow(proc.current().?.cwd, path) catch |err| return failWith(err);
+    const s = r.fs.stat(ino) catch |err| return failWith(err);
     vm.copyToUser(space(), ptr, std.mem.asBytes(&abiStat(s))) catch return abi.fail(.fault);
     return 0;
 }
@@ -417,7 +459,7 @@ fn abiStat(s: fs.Stat) abi.Stat {
 
 fn lseek(fd: usize, offset: usize, whence: usize) usize {
     const f = fileOf(fd) orelse return abi.fail(.badf);
-    return file.seek(f, @bitCast(offset), whence) catch |err| fileError(err);
+    return file.seek(f, @bitCast(offset), whence) catch |err| failWith(err);
 }
 
 fn fstat(fd: usize, ptr: usize) usize {
@@ -430,7 +472,7 @@ fn fstat(fd: usize, ptr: usize) usize {
         .inode, .device => {
             var r = fsys.reader() catch return abi.fail(.nodev);
             defer r.end();
-            const s = r.fs.stat(f.ino) catch |err| return abi.fail(fsys.errno(err));
+            const s = r.fs.stat(f.ino) catch |err| return failWith(err);
             st = abiStat(s);
         },
     }
@@ -449,7 +491,7 @@ fn readdir(fd: usize, ptr: usize) usize {
     var r = fsys.reader() catch return abi.fail(.nodev);
     defer r.end();
     var ent: abi.Dirent = undefined;
-    const found = r.fs.readdir(f.ino, f.off, &ent.name) catch |err| return abi.fail(fsys.errno(err));
+    const found = r.fs.readdir(f.ino, f.off, &ent.name) catch |err| return failWith(err);
     const d = found orelse return 0;
     ent.ino = d.ino;
     ent.kind = @fromBackingInt(@backingInt(d.kind));
@@ -468,7 +510,7 @@ fn scrub(ptr: usize) usize {
     const root = fsys.writer() catch return abi.fail(.nodev);
     defer fsys.unlock();
     bio.invalidate();
-    const st = root.check() catch |err| return abi.fail(fsys.errno(err));
+    const st = root.check() catch |err| return failWith(err);
     const info: abi.ScrubInfo = .{
         .files = st.files,
         .devices = st.devices,
@@ -487,10 +529,7 @@ fn scrub(ptr: usize) usize {
 }
 
 fn fork() usize {
-    return proc.fork() catch |err| abi.fail(switch (err) {
-        error.TooManyProcesses => .again,
-        error.OutOfMemory => .nomem,
-    });
+    return proc.fork() catch |err| failWith(err);
 }
 
 /// 把程序的路径和命令行参数都复制进内核（参数放在栈上的 buf 里），再交给 proc.exec：
@@ -498,7 +537,7 @@ fn fork() usize {
 /// 成功时返回 argc：handleTrap 把返回值写进 a0，正好是新程序看到的 argc（a1 由 proc.exec 设好）。
 fn exec(path_ptr: usize, path_len: usize, argv_ptr: usize, argc: usize) usize {
     var path_buf: [abi.max_path]u8 = undefined;
-    const path = userPath(path_ptr, path_len, &path_buf) catch |err| return abi.fail(fsys.errno(err));
+    const path = userPath(path_ptr, path_len, &path_buf) catch |err| return failWith(err);
 
     if (argc > abi.max_args) return abi.fail(.toobig);
     var argv: [abi.max_args]abi.Arg = undefined;
@@ -514,17 +553,7 @@ fn exec(path_ptr: usize, path_len: usize, argv_ptr: usize, argc: usize) usize {
         used += a.len;
     }
 
-    proc.exec(path, args[0..argc]) catch |err| return abi.fail(switch (err) {
-        error.NoSuchProgram => .noent,
-        error.OutOfMemory => .nomem,
-        error.BadElf => .noexec,
-        error.IoError => .io,
-        error.NoDevice => .nodev,
-        error.NotDir => .notdir,
-        error.NameTooLong => .nametoolong,
-        error.SymlinkLoop => .loop,
-        error.TextBusy => .txtbsy,
-    });
+    proc.exec(path, args[0..argc]) catch |err| return failWith(err);
     return argc;
 }
 
@@ -532,23 +561,17 @@ fn exec(path_ptr: usize, path_len: usize, argv_ptr: usize, argc: usize) usize {
 /// 写状态失败时不回收，返回 -EFAULT：子进程还在，可以再 wait 一次。
 fn wait(pid: usize, status_ptr: usize, options: usize) usize {
     if (options & ~abi.wait_nohang != 0) return abi.fail(.inval);
-    const found = proc.wait(pid, options & abi.wait_nohang != 0, status_ptr) catch |err| return abi.fail(switch (err) {
-        error.NoChildren => .child,
-        error.BadAddress => .fault,
-    });
+    const found = proc.wait(pid, options & abi.wait_nohang != 0, status_ptr) catch |err| return failWith(err);
     return found orelse 0;
 }
 
 fn kill(pid: usize) usize {
-    proc.kill(pid, "kill()") catch |err| return abi.fail(switch (err) {
-        error.NoSuchProcess => .srch,
-        error.PermissionDenied => .perm,
-    });
+    proc.kill(pid, "kill()") catch |err| return failWith(err);
     return 0;
 }
 
 fn setfg(pid: usize) usize {
-    proc.setForeground(pid) catch return abi.fail(.srch);
+    proc.setForeground(pid) catch |err| return failWith(err);
     return 0;
 }
 
