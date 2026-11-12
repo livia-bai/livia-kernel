@@ -2,6 +2,11 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-12 切换地址空间时不再作废整个 TLB
+
+- 改动：`vm.activate` 写 `satp` 之后只执行一次 `sfence.vma zero, t0`（新增 `riscv.sfenceVmaAsid`、`vm.flushUserTlb`），只作废 ASID 0 的非全局项，带 G 位的内核映射留在 TLB 里；写 `satp` 之前的那次 `sfence.vma` 去掉了。`fork`、`sbrk` 缩小改完页表也只作废用户映射。整个 TLB 只在启动时（`vm.enable`）作废。调度器一来一回从 4 次全量刷新变成 2 次只作废用户映射的刷新。
+- 新增：计数器 `tlb_user_flushes`；`tlb_full_flushes` 现在只数启动时的那几次。
+
 ## 2026-11-11 进程变成 runnable 只经过 makeRunnable
 
 - 改动：`wakeup`、`markKilled`、`fork`、`userinit` 把进程改成 `runnable` 都经过 `proc.makeRunnable`：断言拿着进程锁、进程不在运行，改状态，`ipi.wakeIdle(1)`。原来各处自己改状态、自己叫空闲的 hart。

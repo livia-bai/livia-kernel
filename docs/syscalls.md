@@ -1,6 +1,6 @@
 # 系统调用
 
-涉及文件：`src/abi.zig`（内核和用户程序共用）、`src/syscall.zig`（内核实现）、`user/sys.zig`（用户态封装）、`src/vm.zig` 的 `copyFromUser`、`copyToUser`、`checkUser`；文件相关的调用见 [files.md](files.md)
+涉及文件：`src/abi.zig`（内核和用户程序共用）、`src/syscall.zig`（内核实现）、`user/sys.zig`（用户态封装）、`src/vm.zig` 的 `copyFromUser`、`copyToUser`、`pinSrc`/`pinSrcPrefix`/`pinDst`；文件相关的调用见 [files.md](files.md)
 
 ## 调用约定
 
@@ -204,16 +204,14 @@ pub fn dispatch(frame: *TrapFrame) ?usize {
 ## write
 
 ```zig
-fn write(fd: usize, ptr: usize, len: usize) usize {
-    const f = fileOf(fd) orelse return abi.fail(.badf);
-    vm.prefault(space(), ptr, len);
-    return file.write(f, space(), ptr, len) catch |err| failWith(err);
+pub fn write(f: *file.File, data: UserSlice) file.Error!usize {
+    return file.write(f, vm.pinSrcPrefix(space(), data.ptr, data.len), data.len);
 }
 ```
 
-`vm.prefault` 先把来源里**来自程序文件、还没读进来**的页（比如字符串常量所在的只读数据页）读好：下面串口、管道、文件都是拿着锁复制用户内存的，那时读不了盘（[访问用户内存](#访问用户内存)）。
+`vm.pinSrcPrefix` 先把来源开头能读的那一段 pin 好：**来自程序文件、还没读进来**的页（比如字符串常量所在的只读数据页）在这里读进来。下面串口、管道、文件都是拿着锁复制用户内存的，那时读不了盘，只能用 pin 好的范围（[访问用户内存](#访问用户内存)）。
 
-`fileOf` 查当前进程的 fd 表：`fd >= max_fds` 或者那一项是空的，返回 `-EBADF`。不可写的文件（管道的读端）也是 `-EBADF`。真正的写由 `file.write` 按文件的种类分给串口、管道或文件系统（[files.md](files.md)）。串口和管道遵守同一个约定：
+参数类型 `*file.File` 由 `dispatch` 解码：查当前进程的 fd 表，`fd >= max_fds` 或者那一项是空的，返回 `-EBADF`。不可写的文件（管道的读端）也是 `-EBADF`。真正的写由 `file.write` 按文件的种类分给串口、管道或文件系统（[files.md](files.md)）。串口和管道遵守同一个约定：
 
 - 用户内存先**复制**到内核（串口：栈上 128 字节的缓冲区；管道：直接复制进管道的缓冲区），再输出。内核从不直接解引用用户给的指针。
 - 每一块都不跨页（块大小取缓冲区大小、剩余长度、到页尾的距离三者的最小值）。所以一块复制失败，就说明这一页整个不能读，而之前的块都已经完整写出了。这保证了返回值的含义是精确的：
@@ -229,17 +227,14 @@ fn write(fd: usize, ptr: usize, len: usize) usize {
 ## read
 
 ```zig
-fn read(fd: usize, ptr: usize, len: usize) usize {
-    const f = fileOf(fd) orelse return abi.fail(.badf);
-    if (len == 0) return 0;
-    const n = file.readLimit(f, len);
-    vm.checkUser(space(), ptr, n, true) catch return abi.fail(.fault);
-    return file.read(f, space(), ptr, n) catch |err| failWith(err);
+pub fn read(f: *file.File, buf: UserSlice) !usize {
+    if (buf.len == 0) return 0;
+    return file.read(f, try vm.pinDst(space(), buf.ptr, file.readLimit(f, buf.len)));
 }
 ```
 
-- **先检查整个目标范围可写，再读**（`vm.checkUser`）：从串口的缓冲区取出来的字符放不回去，要是取出来才发现用户给的地址写不进去，这些字符就丢了。所以坏地址立刻返回 `-EFAULT`，不阻塞、不消耗输入。检查的同时把范围里还没分配的页都分配好（按需分页），所以之后拿着锁写进去一定成功。
-- **检查之前先截短 `len`**（`file.readLimit`）：串口一次最多给出接收缓冲区里的 255 个字符，管道一次最多给出缓冲区里的 2048 字节，`/dev/null` 什么都没有。程序给一个 1 MiB 的缓冲区读管道，只检查、分配开头的一页，不会为没用到的部分提前分配 256 页。文件（和 `/dev/zero`）一次可能读满 `len`，不截短，整个缓冲区都要先分配（`tail` 因此一次最多读 64 KiB，[user-programs.md](user-programs.md#写脚本用的程序)）。
+- **先 pin 整个目标范围（检查可写），再读**（`vm.pinDst`）：从串口的缓冲区取出来的字符放不回去，要是取出来才发现用户给的地址写不进去，这些字符就丢了。所以坏地址立刻返回 `-EFAULT`，不阻塞、不消耗输入。pin 的同时把范围里还没分配的页都分配好（按需分页）、写时复制的页复制好，所以之后拿着锁用 `PinnedDst.copyOut` 写进去一定成功。
+- **pin 之前先截短 `len`**（`file.readLimit`）：串口一次最多给出接收缓冲区里的 255 个字符，管道一次最多给出缓冲区里的 2048 字节，`/dev/null` 什么都没有。程序给一个 1 MiB 的缓冲区读管道，只 pin、分配开头的一页，不会为没用到的部分提前分配 256 页。文件（和 `/dev/zero`）一次可能读满 `len`，不截短，整个缓冲区都要先分配（`tail` 因此一次最多读 64 KiB，[user-programs.md](user-programs.md#写脚本用的程序)）。
 - `len = 0` 直接返回 0，不检查指针、不阻塞。
 - 没有数据时阻塞，至少读到一个字节才返回；有多少就读多少（最多 `len`），不等凑满。**返回 0 表示读到了结尾**：管道的写端都关了，或者在串口上按了 Ctrl-D。
 - 串口：**不回显、不做行编辑**，原样返回收到的字节（回车是 `\r`），shell 自己回显；Ctrl-C 不会被读到。管道：写进去什么读出来什么。文件：从读写位置开始读，不阻塞，到末尾返回 0。细节见 [files.md](files.md)。
@@ -249,44 +244,41 @@ fn read(fd: usize, ptr: usize, len: usize) usize {
 ## exec
 
 ```zig
-fn exec(path_ptr: usize, path_len: usize, argv_ptr: usize, argc: usize) usize
+pub fn exec(path_arg: UserSlice, argv_arg: UserSlice) !Replaced
 ```
 
 1. 路径复制进内核（和 `open` 一样最长 256 字节，长了是 `-ENAMETOOLONG`）。
 2. `argc > max_args` 返回 `-E2BIG`。从 `argv_ptr` 复制 `argc` 个 `Arg`（每个 16 字节，`{ ptr, len }`），再把每个参数的字节依次复制进栈上 2048 字节（`max_arg_bytes`）的缓冲区，总长超过 `max_arg_bytes` 返回 `-E2BIG`。任何一个指针坏了都是 `-EFAULT`。长度为 0 的参数不检查 `ptr`。
 3. 交给 `proc.exec(path, args)`：参数这时已经在内核里了，`exec` 换掉旧的地址空间之后照样能用。它在文件系统里找程序（没有 `/` 的名字在 `/bin` 里找）、在一个快照上加载（[process.md](process.md#exec)）。
-4. 成功时返回 `argc`：`handleTrap` 把返回值写进 `a0`，正好是新程序看到的 `argc`；`a1` 和 `sp` 由 `proc.exec` 设成栈上 `Arg` 数组的地址（[process.md](process.md#命令行参数)）。
+4. 成功时返回 `.replaced`：`TrapFrame` 已经换成新程序的，`a0` = `argc`、`a1` 和 `sp`（栈上 `Arg` 数组的地址）都由 `proc.startFrame` 设好了，`dispatch` 看到 `Replaced` 就不再写 `a0`（[process.md](process.md#命令行参数)）。
 
 所有检查都在换掉地址空间之前做完，所以失败时原来的程序照常运行，看到的是错误码。回归测试 `t_args check` 测了参数太多、太长、坏指针、正好用满上限、没有参数这几种情况；`t_fork` 测了找不到的名字和路径、空名字、太长的路径、坏 ELF、目录、路径中间是文件。
 
 ## close、dup、pipe
 
 ```zig
-fn close(fd: usize) usize   // 清掉 fd 表的这一项，file.close 减引用数
-fn dup(fd: usize) usize     // file.dup 加引用数，放进编号最小的空闲 fd
-fn pipe(fds_ptr: usize) usize
+pub fn close(fd: OpenFd) void       // 清掉 fd 表的这一项，file.close 减引用数
+pub fn dup(f: *file.File) !usize    // file.dup 加引用数，放进编号最小的空闲 fd
+pub fn pipe(fds_ptr: usize) !void
 ```
 
 - `dup` 返回**编号最小**的空闲 fd，这是 shell 重定向标准输入输出的基础：`close(1); dup(p[1])` 之后，1 号 fd 就是管道的写端（xv6 的写法，所以不需要 `dup2`）。fd 表满了返回 `-EMFILE`，引用数加上去的又减回来。
-- `pipe` 先用 `checkUser` 确认能写两个 `u32`，再创建管道、把两端装进 fd 表，最后写回 fd。顺序是为了失败时好撤销：任何一步失败（文件表满了、内存不够、fd 表放不下两个），已经做了的都撤销掉，不留下半个管道。
+- `pipe` 先用 `pinDst` 确认能写两个 `u32`，再创建管道、把两端装进 fd 表，最后写回 fd。顺序是为了失败时好撤销：任何一步失败（文件表满了、内存不够、fd 表放不下两个），已经做了的都撤销掉，不留下半个管道。
 - fd 表、文件表、管道的结构见 [files.md](files.md)。
 
 ## wait
 
 ```zig
-fn wait(pid: usize, status_ptr: usize, options: usize) usize {
-    if (options & ~abi.wait_nohang != 0) return abi.fail(.inval);
-    const found = proc.wait(pid, options & abi.wait_nohang != 0, status_ptr) catch |err| return abi.fail(switch (err) {
-        error.NoChildren => .child,
-        error.BadAddress => .fault,
-    });
-    return found orelse 0;
+pub fn wait(pid: usize, status_ptr: usize, options: usize) !usize {
+    if (options & ~abi.wait_nohang != 0) return error.InvalidArgument;
+    const status = if (status_ptr == 0) null else try vm.pinDst(space(), status_ptr, @sizeOf(u32));
+    return try proc.wait(pid, options & abi.wait_nohang != 0, status) orelse 0;
 }
 ```
 
 - 怎么找、怎么等子进程、怎么写状态和回收见 [process.md](process.md#wait回收子进程)：这些都要拿着 `wait_lock` 和子进程的锁做，所以整个放在 `proc.wait` 里，系统调用这一层只转换错误码。
 - 结束状态是一个 `u32`：正常退出时是退出码（0..255），被杀（异常、`kill`、Ctrl-C）时是 `abi.killed_status`（`0x100`）。
-- **写状态失败时不回收**，返回 `-EFAULT`：子进程还是 zombie，可以换个地址再 `wait`。状态是拿着锁写的，`proc.wait` 一开始先 `vm.prefault` 这 4 个字节（[访问用户内存](#访问用户内存)）。
+- **状态地址写不进去时不等、不回收**，返回 `-EFAULT`：状态是拿着锁写的，所以在等子进程之前就先 `pinDst` 这 4 个字节，pin 不了直接返回，子进程照样留着，可以换个地址再 `wait`（[访问用户内存](#访问用户内存)）。
 - 不认识的 options 位返回 `-EINVAL`。
 
 ## 访问用户内存

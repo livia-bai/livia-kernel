@@ -155,15 +155,17 @@ fn mapExcept(root: *PageTable, start: usize, end: usize, holes: []const usize, p
 
 ```zig
 pub fn activate(root: *PageTable) void {
-    riscv.sfenceVma();
     riscv.write(.satp, .{ .mode = .sv39, .ppn = @intCast(@intFromPtr(root) >> 12) });
-    riscv.sfenceVma();
+    flushUserTlb(); // sfence.vma zero, t0（t0 = 0）：作废 ASID 0 的非全局项
 }
 ```
 
 - `satp` = MODE（最高 4 位，8 = Sv39）| ASID（第 44..59 位，这里一直是 0）| 根页表的物理页号。
-- 规范规定写 `satp` 本身不保证之前对页表的修改已经生效，也不会作废 TLB。所以写之前和之后各执行一次 `sfence.vma`：之前的那次保证页表的写入对页表遍历可见，之后的那次作废旧地址空间留在 TLB 里的翻译。
-- 没有使用 ASID，所有地址空间都是 ASID 0，所以每次切换都要作废整个 TLB。内核映射带 G 位，规范允许实现保留它们，但不带参数的 `sfence.vma` 会连全局项一起作废，这里也没有依赖这个优化。
+- 规范规定写 `satp` 本身不保证之前对页表的修改已经生效，也不会作废 TLB。所以写完之后执行一次 `sfence.vma`：它作废旧地址空间留在 TLB 里的翻译，同时保证之前对页表的写入（可能是这个进程上次在别的 hart 上运行时写的）对之后的页表遍历可见。写 `satp` 之前不用再执行一次：从写 `satp` 到 `sfence.vma` 之间只有几条指令，用到的只有内核映射，而内核映射在每个地址空间里都一样。
+- **只作废用户映射**：没有使用 ASID，所有地址空间都是 ASID 0。`sfence.vma` 的 rs2 是 x0 时作废所有地址空间的所有项，连带 G 位的全局项一起；rs2 是别的寄存器时只作废那个 ASID 的**非全局**项。内核映射都带 G 位（`map` 给不带 U 位的映射置上 G），在每个根页表里都一样，所以切换时可以留着；用户映射不带 G 位，都会被作废。ASID 0 也要放进一个寄存器：`riscv.sfenceVmaAsid` 固定用 `t0`，不让编译器挑（常数 0 可能被分配成 `zero` 寄存器，意思就变了）。这要求内核映射一定带 G 位、用户映射一定不带，`map` 里的 `.g = !perm.u` 保证了这一点。
+- 启动时（`vm.init`、`vm.initHart` 调用的 `enable`）作废整个 TLB，前后各一次：OpenSBI 留下的翻译一项都不能信。
+- 原来每次切换前后各作废一次整个 TLB，调度器切到进程、切回内核页表一来一回 4 次。跑完全部 QEMU 测试（safe、4 核）时，`kstat` 的 `tlb_full_flushes` 从约 7.7 万次变成 4 次（每个 hart 启动时一次），换成了约 4.3 万次只作废用户映射的 `tlb_user_flushes`，大约每次上下文切换 2 次。QEMU 每次写 `satp` 都会清空它自己模拟的整个 TLB，所以在 QEMU 上测不出快了多少（推测）；在真实硬件上，内核映射不再每次都要重新遍历页表。
+- **为什么不用 ASID**：用了 ASID，切换时就不用作废用户映射。但一个进程会在几个 hart 之间换来换去，它在 hart 1 上改了自己的页表、只刷了 hart 1 的 TLB，hart 0 的 TLB 里还留着它的 ASID 的旧翻译，回到 hart 0 时就会用错。要像 Linux 那样每个 hart 记着每个 ASID 是哪一代的、用完一轮全部作废，代码多不少，而在 QEMU 上又看不到收益，所以没有做。
 - `satp` 和 TLB 都是每个 hart 自己的，`activate` 和 `sfence.vma` 只影响当前 hart。
 - `vm.init` 最后调用 `activate(kernel_root)` 打开分页；`proc.scheduler` 每次切到用户进程前切到它的地址空间，进程让出 CPU 后切回 `kernel_root`（父进程可能在别的 hart 上回收它的页表，之前这个 hart 必须先切走，见 [process.md](process.md#调度器)）；`proc.exec` 换地址空间时先切到新的，再释放旧的。一个用户地址空间同一时刻只在一个 hart 上使用，所以改用户页表（`sbrk` 缩小、`fork` 把父进程的页改成写时复制、`breakCow`、按需分页映射上新的页）后只刷当前 hart 的 TLB 就够了（[process.md](process.md#锁)）。写时复制让几个地址空间共用同一个物理页，但页表项是各自的：一个进程复制走自己那一份，只改它自己的页表项，别的进程的 TLB 里留着的还是它们自己的、仍然正确的翻译。
 
@@ -338,7 +340,7 @@ pub fn breakCow(root: *PageTable, va: usize) CowError!void
 - **“只剩自己在用”看到了就不会再变**：只有映射着这一页的进程自己 `fork` 才会给它加引用，而这个进程正在这里处理缺页。所以“看到引用数是 1 → 直接改回可写”不需要一直拿着页分配器的锁。
 - **两个进程同时在不同的 hart 上复制同一页**：两边都看到引用数是 2，各自分配、复制，然后各放掉一个引用，旧页减到 0 被释放。每一边都是先复制、再放掉引用，所以复制的时候旧页一定还在；放掉之后谁也不再映射它。结果正确，只是多复制了一次。
 - 用户栈和全局变量在 `fork` 之后也是共用的：父子进程从系统调用一返回就会写栈，各自复制一两页。
-- `vm.zig` 只有这里、`fault` 和 `cloneUserSpace` 执行 `sfence.vma`（`flushTlb`），单元测试在主机上运行时跳过；其他函数都不执行特权指令。
+- `vm.zig` 只有这里、`fault`、`cloneUserSpace`（`flushTlb`）和 `activate`、`enable`、`flushUserTlb` 执行 `sfence.vma`，`flushTlb`、`flushUserTlb` 在单元测试里（主机上）什么都不做；其他函数都不执行特权指令。
 
 单元测试（`vm.zig` 末尾）检查：`fork` 只分配了 4 张页表；两边的可写页都变成 `cow`，代码页不是；子进程先写时复制一份，父进程的不变；父进程再写时这一页只剩它在用，不复制、还是原来那一页；代码页、没映射的页、已经复制过的页 `breakCow` 返回 `NotCow`；`pinDst` 把 `cow` 页复制好；三方共用之后依次释放不漏页；`cloneUserSpace` 内存不够时不漏页；没有内存复制时 `breakCow` 返回 `OutOfMemory`、`fault` 返回 `CowOutOfMemory`、`copyToUser`/`pinDst` 返回 `BadAddress`，两边的页表项都不变；`fork` 之后两边都没访问过的页各自按需分配，内容都来自程序镜像。
 

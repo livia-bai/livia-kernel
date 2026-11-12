@@ -66,13 +66,15 @@ pub inline fn disableInterrupts() void           // clear(.sstatus, .{ .sie = tr
 pub inline fn interruptsEnabled() bool           // read(.sstatus).sie
 pub inline fn wfi() void
 pub inline fn sfenceVma() void                   // sfence.vma zero, zero
+pub inline fn sfenceVmaAsid(asid: u16) void      // sfence.vma zero, t0
+pub inline fn sfenceVmaPage(va: usize) void      // sfence.vma va, zero
 ```
 
 - 全部是 `inline` 加 `comptime` CSR 参数：每次调用都直接展开成一条指令。
 - 所有内联汇编都是 `asm volatile`，写操作都带 `.{ .memory = true }` clobber。`volatile` 防止编译器把“结果没被使用”的汇编删掉或合并；memory clobber 防止编译器把内存访问挪到 CSR 操作的另一边。例如关中断之后读环形缓冲区，读操作不能被提前到关中断之前。
 - `read` 没有 memory clobber，但有 `volatile`，不会被删除或合并（`time` 每次读的值都不一样）。
 - `wfi`：让 CPU 休眠直到有**使能的**中断挂起（看 `sie & sip`，不看 `sstatus.SIE`）。规范允许它随时返回，所以总是放在循环里使用。
-- `sfenceVma`：不带参数的 `sfence.vma` 作废所有地址空间的所有 TLB 项。改了当前正在用的页表、或者写了 `satp` 之后都要执行（见 [paging.md](paging.md#切换地址空间)）。
+- `sfenceVma`：不带参数的 `sfence.vma` 作废所有地址空间的所有 TLB 项，连带 G 位的全局项一起，只在启动时用。`sfenceVmaAsid` 只作废一个 ASID 的非全局项（ASID 放在 `t0` 里：rs2 写成 x0 意思就变成“所有地址空间”），切换地址空间、改了用户页表时用；`sfenceVmaPage` 只作废一页（见 [paging.md](paging.md#切换地址空间)）。
 
 ## SBI 调用（`sbi.zig`）
 

@@ -109,12 +109,12 @@ pub fn init(memory: dtb.Region, guards: []const usize) MapError!void {
     try mapMmio(plic.base, plic.mmio_size);
     try mapMmio(virtio_disk.mmio_base, virtio_disk.mmio_size);
 
-    activate(kernel_root);
+    enable();
 }
 
 /// 其他 hart 启动时调用：内核页表已经由启动 hart 建好，启动后不再改，各个 hart 共用，打开分页就行。
 pub fn initHart() void {
-    activate(kernel_root);
+    enable();
 }
 
 /// 恒等映射 [start, end)，跳过 holes 里的页（按地址排好序，都按页对齐）。洞之间的每一段照常尽量用大页。
@@ -132,22 +132,37 @@ fn mapMmio(base: usize, size: usize) MapError!void {
     try map(kernel_root, base, base, std.mem.alignForward(usize, size, page.size), .{ .r = true, .w = true });
 }
 
-/// 切换到 root 描述的地址空间。
-pub fn activate(root: *PageTable) void {
-    kstat.add(.tlb_full_flushes, 2);
-    riscv.sfenceVma();
-    riscv.write(.satp, .{ .mode = .sv39, .ppn = @intCast(@intFromPtr(root) >> 12) });
+/// 启动时打开分页（每个 hart 一次）：切到内核页表，作废整个 TLB，OpenSBI 留下的翻译一项都不能信。
+fn enable() void {
+    kstat.inc(.tlb_full_flushes);
+    riscv.sfenceVma(); // 让建页表的写入对页表遍历可见
+    riscv.write(.satp, .{ .mode = .sv39, .ppn = @intCast(@intFromPtr(kernel_root) >> 12) });
     riscv.sfenceVma();
 }
 
-/// 改了当前 hart 正在用的页表之后刷新 TLB（va 为 null 时整个刷掉，否则只刷这一页）。
+/// 切换到 root 描述的地址空间（用户地址空间，或者切回 kernel_root）。
+/// 所有地址空间都是 ASID 0，切过去之后作废这个 hart 的 TLB 里所有非全局的项（上一个地址空间的用户映射）；
+/// 内核映射带 G 位、在每个地址空间里都一样，留在 TLB 里（flushUserTlb）。写 satp 之前不用再 sfence：
+/// 写之后的这一次同样让之前对页表的写入（可能是别的 hart 写的）对之后的页表遍历可见，
+/// 中间那几条指令只用到全局的内核映射。
+pub fn activate(root: *PageTable) void {
+    riscv.write(.satp, .{ .mode = .sv39, .ppn = @intCast(@intFromPtr(root) >> 12) });
+    flushUserTlb();
+}
+
+/// 作废当前 hart 的 TLB 里所有用户映射（ASID 0 的非全局项），内核映射留着。
+/// 改了正在用的用户页表、改动不止一页时用（只改一页用 flushTlb(va)）。
 /// 单元测试在主机上运行，没有 TLB 可刷。
+pub fn flushUserTlb() void {
+    if (comptime !builtin.cpu.arch.isRISCV()) return;
+    kstat.inc(.tlb_user_flushes);
+    riscv.sfenceVmaAsid(0);
+}
+
+/// 改了当前 hart 正在用的页表之后刷新 TLB（va 为 null 时刷掉所有用户映射，否则只刷这一页）。
 fn flushTlb(va: ?usize) void {
     if (comptime !builtin.cpu.arch.isRISCV()) return;
-    if (va) |a| riscv.sfenceVmaPage(a) else {
-        kstat.inc(.tlb_full_flushes);
-        riscv.sfenceVma();
-    }
+    if (va) |a| riscv.sfenceVmaPage(a) else flushUserTlb();
 }
 
 /// 第 level 级（0、1、2）一个叶子映射的大小：4 KiB、2 MiB、1 GiB。

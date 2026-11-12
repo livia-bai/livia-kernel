@@ -374,7 +374,7 @@ pub fn sbrk(increment: isize) SbrkError!usize {
     if (new > old and (new - s.heap_start) / page.size > page.total_pages) return error.OutOfMemory;
     if (new < old) {
         vm.shrinkUser(s.root, old, new);
-        riscv.sfenceVma(); // 释放的页可能还在 TLB 里
+        vm.flushUserTlb(); // 释放的页可能还在 TLB 里
     }
     s.brk = new;
     return old;

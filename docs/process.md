@@ -333,7 +333,7 @@ pub const SbrkError = error{ OutOfMemory, InvalidArgument };
 照 xv6 的 `growproc`：堆是 `[heap_start, brk)`（都在 `p.space` 里），`brk` 按字节记，页按页分配。和 xv6 的 lazy allocation 实验一样，**按需分配**：
 
 - **变大**：只挪 `brk`，一页都不分配。新跨进来的页第一次被访问时缺页，`vm.fault` 才分配一页清零的 `RW-` 页（[按需分页](#按需分页)）。所以 `sbrk(4 MiB)` 之后只碰两页，只多用两页和装它们的页表。
-- **变小**：`vm.shrinkUser` 把整个落在新 `brk` 之后、已经分配了的页释放掉（没访问过的本来就没有），空出来的第 0 级页表也释放（[paging.md](paging.md#堆的增长和缩小)），然后 `sfence.vma`：这些页可能还在 TLB 里，不刷的话进程还能访问已经还给页分配器的页。
+- **变小**：`vm.shrinkUser` 把整个落在新 `brk` 之后、已经分配了的页释放掉（没访问过的本来就没有），空出来的第 0 级页表也释放（[paging.md](paging.md#堆的增长和缩小)），然后 `vm.flushUserTlb`：这些页可能还在 TLB 里，不刷的话进程还能访问已经还给页分配器的页。
 - **边界**：不能小于 `heap_start`（`InvalidArgument`，`-EINVAL`），不能长进栈下面的保护页（`vm.heap_limit`，超出是 `OutOfMemory`）。堆一共比整个物理内存（`page.total_pages`）还大时也是 `OutOfMemory`：肯定用不上，和 Linux 默认的 overcommit 检查一个意思。别的时候不看还有多少空闲的页，比空闲内存大的堆也能长成功，真的都用上时，访问它的进程因为没内存被结束（内核替它写的时候返回 `-EFAULT`）。`increment` 是有符号的，加减都检查溢出。
 - 回归测试 `t_sbrk` 检查了：新内存清零、按页分配（`brk` 所在页的页尾能写，下一页缺页）、缩小后被释放的页缺页、`fork` 复制堆、各种越界、超过物理内存时失败；按需分配：`sbrk(4 MiB)` 不用页，碰两页用 2～5 页（加页表），缩回去全部还回来；比空闲内存大的堆，子进程一页页写满时被结束（`qemu_test.py` 检查 `out of memory (demand paging)` 那一行），内核替进程写（读 `/dev/zero`）写到没内存时返回 `-EFAULT`。
 
@@ -784,4 +784,4 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 
 进程锁在调度器和进程之间交接（调度器拿、进程放，或者反过来），但交接的两边总在同一个 hart 上：调度器切到的进程就在这个 hart 上接着运行，进程切回的也是这个 hart 的调度器。所以每个 hart 记着的“拿着哪些锁”都对得上。
 
-**页表和 TLB**：每个进程同一时刻只在一个 hart 上运行（没有线程），用户页表只在这个 hart 的 TLB 里。进程换到另一个 hart 时，调度器 `vm.activate` 会 `sfence.vma`；离开时调度器切回内核页表也 `sfence.vma`。`sbrk` 缩小、`exec` 换地址空间时只刷当前 hart 的 TLB 就够了，不用跨 hart 刷（TLB shootdown）。内核页表启动后不再改，所有 hart 共用。
+**页表和 TLB**：每个进程同一时刻只在一个 hart 上运行（没有线程），用户页表只在这个 hart 的 TLB 里。进程换到另一个 hart 时，调度器 `vm.activate` 会作废这个 hart 的 TLB 里的用户映射；离开时调度器切回内核页表也作废一次（内核映射带 G 位，留着，[paging.md](paging.md#切换地址空间)）。`sbrk` 缩小、`exec` 换地址空间时只刷当前 hart 的 TLB 就够了，不用跨 hart 刷（TLB shootdown）。内核页表启动后不再改，所有 hart 共用。

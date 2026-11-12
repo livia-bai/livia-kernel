@@ -135,6 +135,16 @@ pub inline fn sfenceVma() void {
     asm volatile ("sfence.vma zero, zero" ::: .{ .memory = true });
 }
 
+/// 作废 ASID 为 asid 的所有非全局 TLB 项，带 G 位的（内核映射）留着。rs2 必须是 x0 之外的寄存器：
+/// 写成 x0 就是“所有地址空间、连全局项一起”，所以 asid 为 0 也要先放进一个寄存器（t0），不交给编译器挑
+/// （常数 0 可能被分配成 zero 寄存器）。
+pub inline fn sfenceVmaAsid(asid: u16) void {
+    asm volatile ("sfence.vma zero, t0"
+        :
+        : [asid] "{t0}" (@as(usize, asid)),
+        : .{ .memory = true });
+}
+
 /// 只作废虚拟地址 va 所在那一页的 TLB 项（所有地址空间的）。只改了一个页表项时用它，不用把整个 TLB 清空。
 pub inline fn sfenceVmaPage(va: usize) void {
     asm volatile ("sfence.vma %[va], zero"

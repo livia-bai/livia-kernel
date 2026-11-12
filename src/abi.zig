@@ -444,8 +444,10 @@ pub const Counters = extern struct {
     faults_zero: u64 = 0,
     faults_file: u64 = 0,
     faults_cow: u64 = 0,
-    /// 整个 TLB 的刷新（sfence.vma zero, zero）
+    /// 整个 TLB 的刷新（sfence.vma zero, zero，只在启动时每个 hart 一次）
     tlb_full_flushes: u64 = 0,
+    /// 只作废用户映射的刷新（sfence.vma zero, t0，ASID 0 的非全局项）：切换地址空间、fork、sbrk 缩小
+    tlb_user_flushes: u64 = 0,
     /// 缓冲区缓存：要的块已经在缓存里，或者要读盘
     bio_hits: u64 = 0,
     bio_misses: u64 = 0,

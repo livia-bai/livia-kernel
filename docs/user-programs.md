@@ -321,32 +321,33 @@ scrub: tree of 30 nodes, 1068 items, height 2; 6149 of 7168 blocks free, generat
 `kstat`（`user/kstat.zig`）调用 `kstat` 系统调用，打印内核的计数器和栈的高水位。计数器的名字就是 `abi.Counters` 的字段名，程序对字段做 `inline for` 逐个打印，内核加了计数器这里不用改。下面是跑完全部 QEMU 测试（safe、4 核）时的输出：
 
 ```
-syscalls           39163
-context_switches   18932
-timer_interrupts   3421
-ipis_sent          13245
-wakeup_calls       139037
-wakeup_scans       21238
-processes_woken    16715
-lock_contended     67406
-faults_zero        95612
-faults_file        1569
-faults_cow         3155
-tlb_full_flushes   77279
-bio_hits           97517
-bio_misses         2741
-disk_reads         2741
-disk_writes        5932
+syscalls           41405
+context_switches   20744
+timer_interrupts   3660
+ipis_sent          14937
+wakeup_calls       150782
+wakeup_scans       34685
+processes_woken    18264
+lock_contended     90563
+faults_zero        95625
+faults_file        1625
+faults_cow         3481
+tlb_full_flushes   4
+tlb_user_flushes   42874
+bio_hits           108264
+bio_misses         2728
+disk_reads         2728
+disk_writes        5929
 disk_flushes       2080
 fs_commits         1040
-fs_aborts          1
+fs_aborts          0
 fs_clean_aborts    57
-stack_process      9376 of 24576 bytes
-stack_boot         5120 of 32768 bytes
-stack_trap         632 of 16384 bytes
+stack_process      10160 of 24576 bytes
+stack_boot         6192 of 32768 bytes
+stack_trap         712 of 16384 bytes
 ```
 
-几个数说明了之前改动的效果：`wakeup` 调了 13.9 万次，只有 2.1 万次真的扫了进程表（[process.md](process.md#sleepwakeup)）；57 次失败的文件系统操作什么都没改，作废时不用重走整棵树（[btree.md](btree.md#事务和提交)），只有 1 次真的要重走。也能看出接下来值得量的地方：TLB 全量刷新 7.7 万次，差不多每次上下文切换 4 次（评审文档的 P2）。计数器是每个 hart 一份、只有自己加的普通整数（`src/kstat.zig`），读的时候把所有 hart 的加起来。
+几个数说明了之前改动的效果：`wakeup` 调了 15.1 万次，只有 3.5 万次真的扫了进程表（[process.md](process.md#sleepwakeup)）；57 次失败的文件系统操作什么都没改，作废时不用重走整棵树（[btree.md](btree.md#事务和提交)）；整个 TLB 只在每个 hart 启动时刷了一次，切换地址空间只作废用户映射，大约每次上下文切换 2 次（原来是每次 4 次全量刷新，[paging.md](paging.md#切换地址空间)）。每次跑的数都不太一样（几个 hart 谁先抢到进程是随机的）。计数器是每个 hart 一份、只有自己加的普通整数（`src/kstat.zig`），读的时候把所有 hart 的加起来。
 
 ### 写脚本用的程序
 
