@@ -2,6 +2,37 @@
 
 livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 内核每一部分是怎么做的、为什么这样做。仓库根目录的 [README.md](../README.md) 只有简介和上手步骤。
 
+## 精读路线
+
+想通过读代码学设计、不打算读完全部文档的话，按这个顺序读下面这些，一共两千行左右，都是最能体现设计的部分：
+
+1. [architecture.md](architecture.md)：先有全局的图景；再看 [design.md](design.md)，关键的设计决定和有意的简化都在那一页。
+2. `src/hart.zig`、`src/spinlock.zig`：最小的并发基础，以及加锁顺序怎么交给等级检查（[process.md](process.md#锁)）。
+3. `src/trap.zig`、`src/kstack.zig`、`src/canary.zig`：`sscratch` 的三种状态、陷阱栈、栈溢出时怎么失败（[trap.md](trap.md)）。`TrapFrame` 的保存和恢复汇编是用 `@offsetOf` 在编译期生成的。
+4. `src/page.zig`、`src/ipi.zig`：短，每一处并发都有论证（[page-allocator.md](page-allocator.md)、[process.md](process.md#核间中断)）。
+5. `src/proc.zig` 里的 `scheduler`、`sched`、`WaitQueue`、`fork`、`finish`、`wait`（[process.md](process.md)）。
+6. `src/vm.zig` 的 `fault`、`breakCow`、`pinSrc`/`pinDst`（[paging.md](paging.md#按需分页)）。
+7. [btree.md](btree.md)，再看 `src/ctree.zig` 的 `commit`、`abort` 和文件末尾的掉电、读写失败测试。
+
+`src/fs.zig` 的目录和文件内容、`src/file.zig`、`src/syscall.zig` 的各个处理函数、shell 和用户程序可以跳过；`src/abi.zig` 的 `params` 和 `syscall.zig` 的 `dispatch` 值得看一眼，系统调用的签名是怎么在编译期核对的。
+
+## 哪些模块可以当范本
+
+按“当成写法的范本来读”合不合适分三类。这是维护者的判断，也是一份公开的欠账清单。
+
+| 分类 | 文件 | 说明 |
+| --- | --- | --- |
+| 范本 | `trap.zig`、`kstack.zig`、`canary.zig`、`hart.zig` | 汇编由 comptime 生成，失败路径先设计好 |
+| 范本 | `spinlock.zig`、`ipi.zig`、`page.zig` | 加锁顺序由等级检查；无锁的部分都有几行论证 |
+| 范本 | `btree.zig`、`ctree.zig` | 写时复制、提交、快照读者，掉电和读写失败的穷举测试 |
+| 范本 | `riscv.zig`、`abi.zig`、`syscall.zig` 的 `dispatch` | CSR 的位、系统调用的签名和错误码都只写一次，别的地方在编译期和它核对 |
+| 够用 | `proc.zig` | 结构照 xv6；哪个字段归哪把锁管还只写在注释里，没有交给类型 |
+| 够用 | `vm.zig` | 按需分页、写时复制、pin 都清楚；`Space.regionOf` 写死了段、堆、栈三种区域，加新的映射种类要改好几处 |
+| 够用 | `file.zig`、`pipe.zig`、`sleeplock.zig`、`bio.zig`、`fsys.zig`、`loader.zig`、`dtb.zig`、`kstat.zig`、`main.zig`、`sbi.zig`、`plic.zig` | 清楚、有测试，没有特别值得学的写法 |
+| 待重构 | `fs.zig` | 一千七百多行，路径解析、目录、文件内容、检查放在一起，可以按这几块拆开 |
+| 待重构 | `timer.zig` | 每个 hart 固定 100 Hz，`sleep` 的进程每个 tick 都被叫醒；可以改成按到期时间排队 |
+| 待重构 | `uart.zig`、`virtio_disk.zig` | 外设地址按 QEMU `virt` 写死；串口输出拿着锁忙等发送寄存器 |
+
 ## 按功能
 
 建议按这个顺序读：
@@ -9,6 +40,7 @@ livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 
 | 文档 | 内容 |
 | --- | --- |
 | [architecture.md](architecture.md) | 总体结构：特权级、多核、物理内存布局、虚拟地址空间、模块关系、主要控制流、全局不变量 |
+| [design.md](design.md) | 关键的设计决定（选了什么、放弃了什么、代价）和有意的简化（和主流内核的差别） |
 | [build.md](build.md) | 构建系统：目标平台、优化模式、用户程序的编译和嵌入、QEMU 运行步骤 |
 | [boot.md](boot.md) | 启动流程：OpenSBI 交接、链接脚本、`_start`、每个 hart 的启动栈、`kmain` 的初始化顺序、启动其他 hart、交给调度器、panic 时让所有 hart 停下 |
 | [riscv-sbi.md](riscv-sbi.md) | CSR 访问和 SBI 调用 |
@@ -18,7 +50,7 @@ livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 
 | [page-allocator.md](page-allocator.md) | 物理页分配器、每一页的引用数 |
 | [paging.md](paging.md) | Sv39 分页：页表格式、建立映射、内核页表（内核栈的保护页）、用户地址空间、按需分页、`fork` 的写时复制 |
 | [user-programs.md](user-programs.md) | 用户程序：运行时（`start.zig`、`sys.zig`）、示例程序、写脚本用的程序（`test`、`expr`、`xargs`……）、怎么写新程序 |
-| [process.md](process.md) | 进程：进程表、ELF 加载器、按需分页、`userinit`/`fork`/`exec`、命令行参数、`sbrk`、xv6 式调度（每个 hart 的 `scheduler`、`sched`/`sleep`/`wakeup`）、核间中断、切换上下文、`exit`/`wait`/`kill`、Ctrl-C、锁和加锁顺序 |
+| [process.md](process.md) | 进程：进程表、ELF 加载器、按需分页、`userinit`/`fork`/`exec`、命令行参数、`sbrk`、xv6 式调度（每个 hart 的 `scheduler`、`sched`、等待队列 `WaitQueue`）、核间中断、切换上下文、`exit`/`wait`/`kill`、Ctrl-C、锁和加锁顺序 |
 | [disk.md](disk.md) | 磁盘：virtio 块设备驱动、睡眠锁、缓冲区缓存、读写块的系统调用 |
 | [btree.md](btree.md) | 写时复制 B 树（文件系统的基础，类似 btrfs）：节点格式、写时复制、事务和提交、空闲空间、掉电测试 |
 | [fs.md](fs.md) | 文件系统：inode、目录、文件内容（内联、数据块、洞、校验和），每个操作一个事务，接进内核（挂载、锁、系统调用、当前目录），`mkfs`，掉电测试 |
