@@ -247,19 +247,20 @@ fn allocDescs(comptime n: usize) ?[n]u16 {
 
 /// 读（write 为 false）或写一个块，做完才返回（这期间进程睡着，CPU 给别的进程用）。
 /// 只能由进程调用（要睡下）；data 在设备读写期间不能被别人碰，调用方拿着这个块的睡眠锁（bio.zig）。
-pub fn rw(block: u64, data: *[block_size]u8, write: bool) void {
+pub fn rw(block: u64, data: *[block_size]u8, write: bool) error{IoError}!void {
     std.debug.assert(block < blocks);
-    submit(if (write) request_out else request_in, block * sectors_per_block, data);
+    try submit(if (write) request_out else request_in, block * sectors_per_block, data);
 }
 
 /// 等之前做完的写都落盘（bio.Device.flush）。没协商到 flush 的设备是 write-through，不用做。
-pub fn flush() void {
-    if (has_flush) submit(request_flush, 0, null);
+pub fn flush() error{IoError}!void {
+    if (has_flush) try submit(request_flush, 0, null);
 }
 
 /// 发一个请求，等设备做完。data 为 null 的请求（flush）没有数据描述符。
-/// 设备报错（状态字节不为 0）就 panic：QEMU 上只有内核传错了参数才会出现。
-fn submit(kind: u32, sector: u64, data: ?*[block_size]u8) void {
+/// 设备报错（状态字节不为 0：VIRTIO_BLK_S_IOERR、S_UNSUPP）返回 IoError，交给文件系统处理（作废事务，
+/// 提交到一半的话不再修改，见 ctree.Volume.commit）。QEMU 上只有内核传错了参数才会出现。
+fn submit(kind: u32, sector: u64, data: ?*[block_size]u8) error{IoError}!void {
     lock.acquire();
     defer lock.release();
     const idx = while (true) {
@@ -293,9 +294,12 @@ fn submit(kind: u32, sector: u64, data: ?*[block_size]u8) void {
     while (!info[head].done) info[head].waiters.wait(&lock);
 
     const status = q.status[head];
-    if (status != 0) std.debug.panic("virtio disk: request type {d} at sector {d} failed with status {d}", .{ kind, sector, status });
     for (idx) |i| free[i] = true;
     free_waiters.wakeAll(&lock);
+    if (status != 0) {
+        uart.print("[disk] request type {d} at sector {d} failed with status {d}\n", .{ kind, sector, status });
+        return error.IoError;
+    }
 }
 
 /// 中断处理：确认中断，把 used 环里新做完的请求标成 done，叫醒等它们的进程。

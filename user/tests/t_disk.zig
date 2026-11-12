@@ -72,7 +72,28 @@ fn read(b: u64) bool {
     return true;
 }
 
+/// `t_disk eio N`：QEMU 用 blkdebug 让原始区域第 N 块的读写都失败（qemu_test.py 的 case_disk_errors）。
+/// 读写它都得到 IoError，内核不 panic；它两边的块照常能读，读出来的是镜像里的内容。
+fn ioErrors(b: u64) u8 {
+    for (0..2) |_| { // 两遍：第一次失败之后缓冲区不能被当成有效的
+        expect(sys.readBlock(b, &buf) == sys.Error.IoError, "readBlock({d}) should fail with IoError", .{b});
+        fill(&buf, inverted, .{b});
+        expect(sys.writeBlock(b, &buf) == sys.Error.IoError, "writeBlock({d}) should fail with IoError", .{b});
+    }
+    for ([_]u64{ b - 1, b + 1 }) |n| {
+        expect(read(n) and matches(&buf, original, .{n}), "block {d} next to the failing one", .{n});
+    }
+    sys.print("{d} checks, {d} failed\n", .{ checks, failures });
+    return failures;
+}
+
 pub fn main() u8 {
+    if (sys.arg(1)) |a| if (std.mem.eql(u8, a, "eio")) {
+        return ioErrors(std.fmt.parseInt(u64, sys.arg(2) orelse "", 10) catch {
+            sys.print("usage: t_disk [eio BLOCK]\n", .{});
+            return 2;
+        });
+    };
     expect(sys.blockCount() == disk_blocks, "blockCount() = {d}, expected {d}", .{ sys.blockCount(), disk_blocks });
 
     // 1. 每一块都读一遍（比缓冲区多得多，一路换掉旧的），内容和镜像一样

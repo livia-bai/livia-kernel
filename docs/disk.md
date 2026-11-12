@@ -101,7 +101,7 @@ pub fn flush() void   // 协商到 FLUSH 才发请求，否则什么都不做
 2. 填请求头、状态字节（先写成 `0xff`）、三个描述符；`info[head].done = false`。
 3. 把链的第一个描述符的下标放进 `avail.ring[avail.idx % num]`，**`fence`**，`avail.idx += 1`，**`fence`**，写 QueueNotify。设备看到新的 `idx` 时，前面写的描述符和 ring 必须已经可见；写 QueueNotify（MMIO）之前，`idx` 也必须已经可见。
 4. `while (!info[head].done) info[head].waiters.wait(&lock)`：进程睡着等，CPU 给别的进程。
-5. 醒来后看状态字节，不是 0 就 panic（QEMU 上只有内核给错了参数才会出现）；放回描述符，`free_waiters.wakeAll(&lock)`。
+5. 醒来后放回描述符，`free_waiters.wakeAll(&lock)`，再看状态字节：不是 0（`VIRTIO_BLK_S_IOERR` 是 1，`S_UNSUPP` 是 2）就打印 `[disk] request type T at sector S failed with status N`，返回 `IoError`。原来直接 panic；现在交给文件系统处理（作废事务，提交到一半的不再修改，[btree.md](btree.md#事务和提交)），`readblock`/`writeblock` 返回 `-EIO`。QEMU 上正常不会出现，回归测试用 QEMU 的 `blkdebug` 让某一块的读写失败（[testing.md](testing.md#qemu-测试toolsqemu_testpy)）。
 
 **写缓存**：写请求做完只说明设备收到了数据。设备（真实的磁盘，或者 QEMU 背后宿主机的页缓存）可能还把它放在缓存里，掉电会丢，几次写落盘的先后也不保证。写时复制的文件系统恰恰依赖顺序（新节点先落盘、超级块后落盘，[btree.md](btree.md#事务和提交)），所以提交时在超级块前后各 `flush` 一次。
 
@@ -169,7 +169,11 @@ pub const Buf = struct {
     node: std.DoublyLinkedList.Node,   // 桶里的链表
     data: *align(4096) [block_size]u8,
 };
-pub const Device = struct { blocks: u64, transfer: *const fn (u64, *[block_size]u8, bool) void };
+pub const Device = struct {
+    blocks: u64,
+    transfer: *const fn (u64, *[block_size]u8, bool) IoError!void,
+    flush: ?*const fn () IoError!void = null,
+};
 
 pub fn init(dev: ?Device) void
 pub fn read(blockno: u64) Error!*Buf    // 拿着睡眠锁返回，内容是磁盘上的
@@ -204,13 +208,13 @@ pub fn blockCount() u64
 
 **等下去不会死锁**：同时拿着好几个缓冲区的只有修改文件系统的一方（B 树的一条路径加上分裂出来的节点，再加一两个数据块，不到 20 个），而修改之间一个一个来（文件系统的写锁）；文件系统的读者、`readblock`、`writeblock` 一次只拿一个，拿着它的时候不去等别的缓冲区，用完就放开。所以修改的一方要等的缓冲区，迟早会被别人放开。
 
-`read` = `get` + `load`：`valid` 为 false 时 `device.transfer(blockno, data, false)` 读进来。`load` 返回这次是不是真的读了盘，写时复制 B 树只在读盘时验节点的校验和（[btree.md](btree.md#节点格式btreezig)）；发现内容不对的调用方把 `valid` 设回 false，下次重新读盘。几个进程同时 `read` 同一块时，第一个拿到睡眠锁的去读盘，后面的醒来时看到 `valid` 已经是 true，不再读。
+`read` = `get` + `load`：`valid` 为 false 时 `device.transfer(blockno, data, false)` 读进来；读失败返回 `IoError`，`valid` 还是 false（`read` 顺便放开缓冲区）。`load` 返回这次是不是真的读了盘，写时复制 B 树只在读盘时验节点的校验和（[btree.md](btree.md#节点格式btreezig)）；发现内容不对的调用方把 `valid` 设回 false，下次重新读盘。几个进程同时 `read` 同一块时，第一个拿到睡眠锁的去读盘，后面的醒来时看到 `valid` 已经是 true，不再读。
 
 `get` 给要整块覆盖的调用方用：`writeblock` 系统调用整块写，不用先读旧的内容。覆盖完自己把 `valid` 设成 true 再 `write`。
 
 ### 写和放开
 
-- `write` 要求拿着睡眠锁、`valid` 为 true，同步写回磁盘（write-through）：返回时数据已经交给设备了，但设备有写缓存的话还不一定落盘。
+- `write` 要求拿着睡眠锁、`valid` 为 true，同步写回磁盘（write-through）：返回时数据已经交给设备了，但设备有写缓存的话还不一定落盘。失败时返回 `IoError`，并把缓冲区标成 `valid = false`：盘上那一块是什么不知道了，缓存里的内容不能再当成盘上的。
 - `flush` 等之前 `write` 过的块都落盘（交给 `Device.flush`；为 null 的设备没有写缓存，什么都不做）。
 - `invalidate` 逐个桶拿锁，把 `refcnt` 为 0 的缓冲区都标成 `valid = false`，之后再读它们都要重新读盘。给 `scrub` 用：校验和只在读盘时核对，要核对磁盘上的内容就不能用缓存里的（[fs.md](fs.md#检查整个文件系统checkscrub)）。写都是同步的，缓存里没有还没写下去的内容，作废不会丢东西；`valid` 本来由缓冲区的睡眠锁保护，`refcnt` 为 0 说明没人拿着、也没人在等这把睡眠锁，所以拿着桶的锁改它也安全。
 - `release` 放开睡眠锁，拿桶的锁 `refcnt -= 1`；减到 0 就记下 `stamp`，有人在换块（`evicting` 不为 0）的话叫醒它。拿着睡眠锁时别人换不掉这个缓冲区，所以 `release` 用 `blockno` 算出来的桶就是它所在的桶。
@@ -220,7 +224,7 @@ pub fn blockCount() u64
 `bio` 不直接调用 `virtio_disk`，而是通过 `init(dev)` 交进来的 `Device`（块数和一个读写函数）。内核里 `kmain` 交进去 virtio 磁盘：
 
 ```zig
-bio.init(if (virtio_disk.blocks > 0) .{ .blocks = virtio_disk.blocks, .transfer = virtio_disk.rw } else null);
+bio.init(if (virtio_disk.blocks > 0) .{ .blocks = virtio_disk.blocks, .transfer = virtio_disk.rw, .flush = virtio_disk.flush } else null);
 ```
 
 单元测试交进去一块内存，记着读写了几次，在主机上测缓存的行为（命中不读盘、换掉的是最久没用的、拿着的缓冲区不会被换掉、`write` 写回、超出范围、没有磁盘）。B 树、文件系统的单元测试和主机上的 `mkfs` 也这样在内存里跑。
@@ -240,13 +244,12 @@ bio.init(if (virtio_disk.blocks > 0) .{ .blocks = virtio_disk.blocks, .transfer 
 | 22 | `readblock(blockno, ptr)` | 原始区域的第 `blockno` 块读进用户内存 `ptr`（4096 字节）。先 `pinDst` 整个目标（检查可写，顺便复制好写时复制的页），再 `bio.read`，拿着缓冲区的睡眠锁 `copyOut` |
 | 23 | `writeblock(blockno, ptr)` | 用户内存的 4096 字节写到原始区域的第 `blockno` 块，写完才返回。先 `pinSrc` 来源，再 `bio.get`（不读旧内容）、`copyIn`、`bio.write` |
 
-都返回 0；块号超出原始区域是 `-EINVAL`，没有磁盘是 `-ENODEV`，指针不对是 `-EFAULT`（[syscalls.md](syscalls.md#调用列表)）。先检查指针再碰缓冲区：复制到一半失败的话，缓冲区里会留下半新半旧的内容（写），或者白读一次盘（读）。shell 的 `disk` 命令打印 `blockcount`。
+都返回 0；块号超出原始区域是 `-EINVAL`，没有磁盘是 `-ENODEV`，指针不对是 `-EFAULT`，设备报错是 `-EIO`（[syscalls.md](syscalls.md#调用列表)）。先检查指针再碰缓冲区：复制到一半失败的话，缓冲区里会留下半新半旧的内容（写），或者白读一次盘（读）。shell 的 `disk` 命令打印 `blockcount`。
 
 **原始区域**：块号从文件系统之后算起（`fsys.raw_base`，就是超级块里记的文件系统块数），所以这三个调用碰不到文件系统用着的块，不会绕过事务把它写坏。磁盘上没有文件系统时整个磁盘都是原始区域。回归测试 `t_disk` 用它测驱动和缓冲区缓存。
 
 ## 限制和以后可以做的
 
 - 只有一个队列、16 个描述符，最多同时 5 个请求在设备里；没有协商 event idx、间接描述符，每个请求都写一次 QueueNotify。
-- 设备报错直接 panic，没有把错误交回调用方。
 - 缓冲区缓存是 write-through：每次 `write` 都等磁盘写完。以后文件系统的事务可以把一批块攒着一起写。
 - 换块要拿 `evict_lock`、扫所有桶，比找缓存着的块慢；缓存一直不命中时，换块的进程之间还是要排队。

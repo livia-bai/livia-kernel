@@ -597,7 +597,11 @@ pub const Fs = struct {
     fn readData(fs: *Fs, e: BlockExtent) Error!*bio.Buf {
         if (e.blockno < 2 or e.blockno >= fs.vol.blocks) return error.Corrupt;
         const b = try bio.get(e.blockno);
-        if (bio.load(b) and csum(b.data) != e.head.csum) {
+        const fresh = bio.load(b) catch |err| {
+            bio.release(b);
+            return err;
+        };
+        if (fresh and csum(b.data) != e.head.csum) {
             b.valid = false;
             bio.release(b);
             return error.Corrupt;
@@ -663,13 +667,14 @@ pub const Fs = struct {
         defer bio.release(b);
         @memset(b.data, 0);
         @memcpy(b.data[0 .. size - h], buf[h..size]);
-        try fs.vol.update(extentKey(ino, 0), std.mem.asBytes(&fs.writeData(b, blk)));
+        const e = try fs.writeData(b, blk);
+        try fs.vol.update(extentKey(ino, 0), std.mem.asBytes(&e));
     }
 
     /// 算校验和、写下数据块，返回指向它的条目。
-    fn writeData(fs: *Fs, b: *bio.Buf, blk: u64) BlockExtent {
+    fn writeData(fs: *Fs, b: *bio.Buf, blk: u64) Error!BlockExtent {
         b.valid = true;
-        bio.write(b);
+        try bio.write(b);
         return .{ .head = .{ .kind = .block, .csum = csum(b.data) }, .blockno = blk, .generation = fs.vol.transid };
     }
 
@@ -697,7 +702,7 @@ pub const Fs = struct {
             }
         }
         try in.get(at, b.data[a..][0..m]);
-        const e = fs.writeData(b, blk);
+        const e = try fs.writeData(b, blk);
         if (old) |o| {
             fs.vol.freeData(o.blockno, o.generation);
             try fs.vol.update(key, std.mem.asBytes(&e));
@@ -903,7 +908,7 @@ var test_crashed = false;
 var test_writes: usize = 0;
 var test_vol: Volume = .{};
 
-fn testTransfer(block: u64, data: *[block_size]u8, write_: bool) void {
+fn testTransfer(block: u64, data: *[block_size]u8, write_: bool) bio.IoError!void {
     if (!write_) {
         data.* = test_disk[block];
         return;

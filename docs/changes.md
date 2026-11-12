@@ -2,6 +2,12 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-12 磁盘读写失败交回文件系统，不再 panic
+
+- 改动：virtio 磁盘的请求失败（状态字节不为 0）时打印出错的请求、返回 `IoError`，原来直接 panic。`bio.Device.transfer`、`flush`，`bio.load`、`read`、`write`、`flush` 都可能返回 `IoError`；写失败时缓冲区标成无效。
+- 改动：文件系统遇到读写失败时作废事务；提交时写超级块或者它之后的 `flush` 失败（不知道盘上的超级块指向哪棵树），卷设上 `broken`，之后的修改都返回 `IoError`，读照常，重新挂载后恢复。`readblock`/`writeblock` 返回 `-EIO`。
+- 新增：`ctree.zig` 的单元测试在每一次设备操作时注入一次读写失败；`t_disk eio N` 和 `qemu_test.py` 的 disk 用例用 QEMU 的 `blkdebug` 让一块的读写失败。
+
 ## 2026-11-12 等待用 WaitQueue，不再用任意地址作通道
 
 - 改动：`proc.sleep(chan, lock)` / `proc.wakeup(chan)` 换成 `proc.WaitQueue`：每个等待条件旁边放一个队列（`Pipe.readers`/`writers`、`timer.waiters`、`uart.rx_waiters`、`Sleeplock.waiters`、`virtio_disk` 的 `free_waiters` 和每个请求的 `waiters`、`bio.evict_waiters`、`Volume.readers_done`、`Process.child_exit`），`q.wait(lock)` 排进去睡下，`q.wakeAll(lock)` 只叫醒排着的进程，队列空着时什么锁都不拿。原来的 `wakeup` 要扫整张进程表；按通道地址散列的睡眠者计数（`sleepers`）也去掉了。

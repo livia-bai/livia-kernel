@@ -169,7 +169,7 @@ pub fn readText(ino: u64, off: u64, dst: []u8) error{IoError}!void
 | `scrub` | 先作废缓存，再 `check` 整个文件系统（[检查](#检查整个文件系统checkscrub)） |
 | `exec` | 在 `/bin`（或给的路径）里找程序，占住它（`holdText`），在一个新的快照上读 ELF 的文件头和程序头；段的内容等缺页时再读（`readText`，[process.md](process.md#按需分页)） |
 
-路径先复制进内核栈上的缓冲区（最长 `abi.max_path` = 256 字节，长了是 `ENAMETOOLONG`）。错误码：`SymlinkLoop` → `ELOOP`，`NotSymlink` → `EINVAL`，`NotFound` → `ENOENT`，`Exists` → `EEXIST`，`NotDir` → `ENOTDIR`，`IsDir` → `EISDIR`，`NotEmpty` → `ENOTEMPTY`，`NameTooLong` → `ENAMETOOLONG`，`InvalidName` → `EINVAL`，`NoSpace` → `ENOSPC`，`FileTooBig` → `EFBIG`，`BadAddress` → `EFAULT`，`Corrupt` 等磁盘上的东西不对 → `EIO`。
+路径先复制进内核栈上的缓冲区（最长 `abi.max_path` = 256 字节，长了是 `ENAMETOOLONG`）。错误码：`SymlinkLoop` → `ELOOP`，`NotSymlink` → `EINVAL`，`NotFound` → `ENOENT`，`Exists` → `EEXIST`，`NotDir` → `ENOTDIR`，`IsDir` → `EISDIR`，`NotEmpty` → `ENOTEMPTY`，`NameTooLong` → `ENAMETOOLONG`，`InvalidName` → `EINVAL`，`NoSpace` → `ENOSPC`，`FileTooBig` → `EFBIG`，`BadAddress` → `EFAULT`，`Corrupt` 等磁盘上的东西不对、`IoError`（磁盘读写失败，[btree.md](btree.md#事务和提交)） → `EIO`。
 
 **内核栈**：系统调用在 24 KiB 的进程内核栈上运行，B 树的操作走得很深。开发时内核栈被撑爆过一次（Debug 模式用到 54 KiB）：`std.bit_set` 的 `isSet`、`count` 按值接收整个位图，每调用一次在栈上复制 8 KiB；`x.* = y.*` 复制 4 KiB 的块也会先放在栈上。改成自己写的 `Bitmap`（方法接收指针）和 `@memcpy` 之后，实测跑完全部 QEMU 测试（包括 `t_fs`、掉电后重新启动、从文件系统 `exec`），最深 Debug 13912 字节、safe 8992 字节、small 8632 字节（内核关机时自己量、自己打印，见 [process.md](process.md#进程表)）。路径解析（`walk`）跟着符号链接走时不递归，只在栈上多放一个 256 字节的缓冲区。
 

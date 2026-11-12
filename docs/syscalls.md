@@ -125,8 +125,8 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 19 | `pipe` | `a0` = 两个 `u32` 的地址 | 0；`-EFAULT`、`-EMFILE`、`-ENFILE`、`-ENOMEM` | 创建管道，读端、写端的 fd 写进 `a0` 指向的地方（[files.md](files.md#管道)） |
 | 20 | `sbrk` | `a0` = 增量（有符号） | 原来的堆末尾；`-ENOMEM`、`-EINVAL` | 堆变大或变小（[process.md](process.md#sbrk堆)）。`sbrk(0)` 只查询。变大时不分配页，用到时才分配（按需分页），所以比空闲内存大也能成功；堆比整个物理内存还大时才是 `-ENOMEM` |
 | 21 | `blockcount` | 无 | 磁盘的原始区域（文件系统之后的块）有多少块，没有磁盘时是 0 | 每块 `abi.block_size` = 4096 字节（[disk.md](disk.md#系统调用)） |
-| 22 | `readblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`（块号超出原始区域）、`-ENODEV`、`-EFAULT` | 经过缓冲区缓存读原始区域的一块，4096 字节写进缓冲区 |
-| 23 | `writeblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`、`-ENODEV`、`-EFAULT` | 缓冲区的 4096 字节写到原始区域的这一块，写完才返回 |
+| 22 | `readblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`（块号超出原始区域）、`-ENODEV`、`-EFAULT`、`-EIO`（设备报错） | 经过缓冲区缓存读原始区域的一块，4096 字节写进缓冲区 |
+| 23 | `writeblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`、`-ENODEV`、`-EFAULT`、`-EIO` | 缓冲区的 4096 字节写到原始区域的这一块，写完才返回 |
 | 24 | `open` | `a0` = 路径地址，`a1` = 路径长度，`a2` = flags | 新的 fd；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-EEXIST`、`-ENAMETOOLONG`、`-EINVAL`、`-ELOOP`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT`、`-ENFILE`、`-EMFILE`、`-ENXIO`（不认识的设备）、`-ETXTBSY`（截断正在运行的程序文件） | 打开文件、目录或设备文件（[fs.md](fs.md#接进内核fsyszig)，设备见 [files.md](files.md#设备文件)）。flags：`open_read`/`open_write`/`open_rdwr` 加上 `open_create`（没有就建一个空文件）、`open_trunc`（可写时截成 0 字节）、`open_append`（0x800，每次写都写在末尾）；别的位、读写方式是 3 都是 `-EINVAL`。目录只能只读地打开。相对路径从当前目录开始。跟着符号链接走；带 `open_create` 时最后一段是悬空的符号链接的话，建的是它指向的文件 |
 | 25 | `mkdir` | `a0` = 路径地址，`a1` = 路径长度 | 0；`-EEXIST`、`-ENOENT`、`-ENOTDIR`、`-EINVAL`、`-ENAMETOOLONG`、`-ENOSPC` 等 | 建一个空目录 |
 | 26 | `unlink` | 同上 | 0；`-ENOENT`、`-ENOTEMPTY`、`-EINVAL`、`-ETXTBSY`（正在运行的程序文件的最后一个名字）等 | 删掉一个名字（文件、设备文件或空目录）。是最后一个名字的话文件也删掉，打开着它的 fd 之后读写是 `-ENOENT` |

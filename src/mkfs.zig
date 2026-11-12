@@ -21,7 +21,7 @@ const block_size = fs.block_size;
 var disk: [][block_size]u8 = &.{};
 var vol: ctree.Volume = .{};
 
-fn transfer(block: u64, data: *[block_size]u8, write: bool) void {
+fn transfer(block: u64, data: *[block_size]u8, write: bool) bio.IoError!void {
     if (write) disk[block] = data.* else data.* = disk[block];
 }
 

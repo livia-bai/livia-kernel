@@ -33,13 +33,16 @@ const nbucket = 13;
 /// 还没装过块的缓冲区的 blockno（check 不让任何块号等于它）
 const no_block = std.math.maxInt(u64);
 
+/// 设备报告读写失败。写失败时盘上那一块的内容不确定：可能没写、写了一半、也可能其实写完了。
+pub const IoError = error{IoError};
+
 /// 磁盘：有多少块，怎么读写一块（同步，做完才返回，可以睡），怎么让写过的块都落盘。
 pub const Device = struct {
     blocks: u64,
-    transfer: *const fn (block: u64, data: *[block_size]u8, write: bool) void,
+    transfer: *const fn (block: u64, data: *[block_size]u8, write: bool) IoError!void,
     /// 让之前写完的块都真正落到盘上（设备有写缓存时，写完的块可能还在缓存里，掉电会丢、落盘的顺序也不定）。
     /// null：设备没有写缓存，写完就落盘了（mkfs、大部分单元测试）
-    flush: ?*const fn () void = null,
+    flush: ?*const fn () IoError!void = null,
 };
 
 pub const Buf = struct {
@@ -85,7 +88,9 @@ var evicting: std.atomic.Value(usize) = .init(0);
 var evict_waiters: proc.WaitQueue = .{};
 var device: ?Device = null;
 
-pub const Error = error{ NoDevice, OutOfRange };
+/// get 的错误：没有磁盘，块号超出范围。read 还可能读盘失败
+pub const GetError = error{ NoDevice, OutOfRange };
+pub const Error = GetError || IoError;
 
 /// 清空缓存，换上磁盘 dev（null 表示没有磁盘）。kmain 调用一次；单元测试每次换一块内存当磁盘。
 pub fn init(dev: ?Device) void {
@@ -102,7 +107,7 @@ pub fn blockCount() u64 {
     return if (device) |d| d.blocks else 0;
 }
 
-fn check(blockno: u64) Error!Device {
+fn check(blockno: u64) GetError!Device {
     const dev = device orelse return error.NoDevice;
     if (blockno >= dev.blocks) return error.OutOfRange;
     return dev;
@@ -115,7 +120,7 @@ fn bucketOf(blockno: u64) *Bucket {
 /// 块 blockno 的缓冲区，拿着睡眠锁返回，不读磁盘：valid 为 false 时内容是别的块留下的。
 /// 要整块覆盖的调用方用它，省掉一次读；覆盖完把 valid 设成 true，再 write。
 /// 所有缓冲区都有人在用时睡着等。只能由进程调用。
-pub fn get(blockno: u64) Error!*Buf {
+pub fn get(blockno: u64) GetError!*Buf {
     _ = try check(blockno);
     const bk = bucketOf(blockno);
     bk.lock.acquire();
@@ -194,14 +199,17 @@ fn takeOldest() ?*Buf {
 /// 块 blockno 的缓冲区，拿着睡眠锁返回，内容是磁盘上的（不在缓存里就读进来）。
 pub fn read(blockno: u64) Error!*Buf {
     const b = try get(blockno);
-    _ = load(b);
+    _ = load(b) catch |err| {
+        release(b);
+        return err;
+    };
     return b;
 }
 
 /// get 拿到的缓冲区内容无效的话从磁盘读进来。返回这次是不是真的读了磁盘：
 /// 文件系统只在读盘时验校验和，缓存里的内容验过了就不用每次都算（ctree.zig）。
-/// 发现内容不对的调用方把 valid 设回 false，下次再读盘。
-pub fn load(b: *Buf) bool {
+/// 发现内容不对的调用方把 valid 设回 false，下次再读盘。读失败时 valid 还是 false，返回 IoError。
+pub fn load(b: *Buf) IoError!bool {
     std.debug.assert(b.lock.holding());
     if (b.valid) {
         kstat.inc(.bio_hits);
@@ -209,7 +217,7 @@ pub fn load(b: *Buf) bool {
     }
     kstat.inc(.bio_misses);
     kstat.inc(.disk_reads);
-    device.?.transfer(b.blockno, b.data, false);
+    try device.?.transfer(b.blockno, b.data, false);
     b.valid = true;
     return true;
 }
@@ -230,16 +238,21 @@ pub fn invalidate() void {
 }
 
 /// 把缓冲区写回磁盘，写完才返回。调用方拿着它的睡眠锁。
-pub fn write(b: *Buf) void {
+/// 失败时把缓冲区作废（valid = false）：盘上那一块是什么不知道，缓存里的内容不能再当成盘上的。
+pub fn write(b: *Buf) IoError!void {
     std.debug.assert(b.lock.holding() and b.valid);
     kstat.inc(.disk_writes);
-    device.?.transfer(b.blockno, b.data, true);
+    device.?.transfer(b.blockno, b.data, true) catch |err| {
+        b.valid = false;
+        return err;
+    };
 }
 
 /// 等之前写的块（write 返回过的）都落盘。只能由进程调用（要睡着等设备）。
-pub fn flush() void {
+/// 失败时不知道哪些落盘了（文件系统见 ctree.Volume.commit）。
+pub fn flush() IoError!void {
     kstat.inc(.disk_flushes);
-    if (device.?.flush) |f| f();
+    if (device.?.flush) |f| try f();
 }
 
 /// 用完了：放开睡眠锁。没人用了就记下现在的时刻（LRU），有进程在等空闲缓冲区的话叫醒它。
@@ -266,7 +279,15 @@ var test_disk: [test_blocks][block_size]u8 = undefined;
 var test_reads: usize = 0;
 var test_writes: usize = 0;
 
-fn testTransfer(block: u64, data: *[block_size]u8, write_: bool) void {
+/// 这一次读写失败（下标按读写的次数算，从 0 开始），之后照常
+var test_fail_at: ?usize = null;
+
+fn testTransfer(block: u64, data: *[block_size]u8, write_: bool) IoError!void {
+    if (test_fail_at) |n| if (test_reads + test_writes == n) {
+        test_fail_at = null;
+        if (write_) test_writes += 1 else test_reads += 1;
+        return error.IoError;
+    };
     if (write_) {
         test_writes += 1;
         test_disk[block] = data.*;
@@ -280,6 +301,7 @@ fn testInit() void {
     for (&test_disk, 0..) |*blk, i| @memset(blk, @truncate(i));
     test_reads = 0;
     test_writes = 0;
+    test_fail_at = null;
     init(.{ .blocks = test_blocks, .transfer = testTransfer });
 }
 
@@ -331,7 +353,7 @@ test "write 写回磁盘；get 不读磁盘；拿着的缓冲区不会被换掉�
     const b = try get(3);
     @memset(b.data, 0xab);
     b.valid = true;
-    write(b);
+    try write(b);
     try expectEqual(0, test_reads);
     try expectEqual(1, test_writes);
     try expectEqual(0xab, test_disk[3][block_size - 1]);

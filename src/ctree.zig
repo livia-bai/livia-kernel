@@ -62,6 +62,8 @@ pub const Error = error{
     DiskTooLarge,
     NoDevice,
     OutOfRange,
+    /// 磁盘读写失败（bio.IoError）。提交到一半失败之后，这个卷不再接受修改，也是它（见 broken）
+    IoError,
 };
 
 pub const Super = extern struct {
@@ -134,6 +136,10 @@ pub const Volume = struct {
     /// 当前事务开始以来改过东西没有（没改的话 commit 不写超级块，abort 不用重走树）。
     /// 分配、释放块（alloc、free）和换根的地方都要设它：改根之前总要先分配一个块，或者像 collapseRoot 那样自己设
     dirty: bool = false,
+    /// 提交到一半时读写失败了（写超级块、或者它之后的 flush）：不知道盘上的超级块指向旧树还是新树，
+    /// 两棵树的块都不能再分配、改写，所以之后的修改（reserve、alloc、commit）都返回 IoError，直到重新挂载。
+    /// 读者照常在已提交的树上读。作废事务时重走树失败了也这样（位图算到一半）
+    broken: bool = false,
     /// 用着的块：当前的树、已提交的树、超级块。pending：已提交的树用着、当前的树不用了的块
     used: Bitmap = .{},
     pending: Bitmap = .{},
@@ -165,16 +171,16 @@ pub const Volume = struct {
         const b = try bio.get(root_block);
         Node.of(b.data).init(0, root_block, 1);
         b.valid = true;
-        writeNode(b);
-        bio.release(b);
+        defer bio.release(b);
+        try writeNode(b);
         const empty = try bio.get(0);
+        defer bio.release(empty);
         @memset(empty.data, 0);
         empty.valid = true;
-        bio.write(empty);
-        bio.release(empty);
-        bio.flush(); // 根节点先落盘，见 commit
+        try bio.write(empty);
+        try bio.flush(); // 根节点先落盘，见 commit
         try writeSuper(.{ .csum = 0, .magic = magic, .generation = 1, .blocks = blocks, .root = root_block, .root_generation = 1, .root_level = 0 });
-        bio.flush();
+        try bio.flush();
     }
 
     /// 读两个超级块，用校验和对、事务号大的那个；走一遍树，算出用着的块。
@@ -192,6 +198,7 @@ pub const Volume = struct {
         v.limbo_count = 0;
         v.readers = 0;
         v.old_readers = 0;
+        v.broken = false;
         v.blocks = s.blocks;
         v.generation = s.generation;
         v.committed = .{ .blockno = s.root, .generation = s.root_generation, .level = s.root_level };
@@ -216,10 +223,21 @@ pub const Volume = struct {
     ///
     /// 设备可能有写缓存（bio.flush），超级块前后各 flush 一次：前一次保证超级块落盘时它指向的节点、数据块都已经在盘上；
     /// 后一次保证 pending 里的块（旧树的）再被分配、改写之前，指向新树的超级块已经在盘上。
+    ///
+    /// 读写失败时（bio.IoError）：第一次 flush 失败，超级块还没动，盘上还是已提交的树，作废这个事务就行。
+    /// 写超级块或者第二次 flush 失败，就不知道盘上的超级块指向哪棵树了：写失败的那一块可能其实写下去了，
+    /// 也可能没有。这时内存里还按旧树算（generation、committed 都不变，读者照常），但两棵树的块都不能再动：
+    /// 旧树的块要是按“作废了”重新分配、改写，而盘上其实是新树，新树又在 pending 里……所以设上 broken，不再修改，
+    /// 重新挂载时按盘上真有的超级块来。
     pub fn commit(v: *Volume) Error!void {
+        if (v.broken) return error.IoError;
         if (!v.dirty) return;
         kstat.inc(.fs_commits);
-        bio.flush();
+        bio.flush() catch |err| {
+            try v.abort();
+            return err;
+        };
+        errdefer v.broken = true;
         try writeSuper(.{
             .csum = 0,
             .magic = magic,
@@ -229,7 +247,7 @@ pub const Volume = struct {
             .root_generation = v.root.generation,
             .root_level = v.root.level,
         });
-        bio.flush();
+        try bio.flush();
         v.snap_lock.acquire();
         v.generation = v.transid;
         v.committed = v.root;
@@ -301,10 +319,12 @@ pub const Volume = struct {
     /// 作废当前事务：退回已提交的树。当前事务新写的节点都在已提交的树没用的块上，不用管它们。
     /// 什么都没改过（dirty 为 false：没分配、没释放过块，根也没变，和 commit 一样看它）就不用重走整棵树：
     /// 查找阶段就失败的操作（Exists、NotFound……）最常见，不该每次都读遍所有节点。
+    /// 重走树时读盘失败的话，位图只算了一半，设上 broken（见 commit）。
     pub fn abort(v: *Volume) Error!void {
         if (!v.dirty) return kstat.inc(.fs_clean_aborts);
         kstat.inc(.fs_aborts);
         v.root = v.committed;
+        errdefer v.broken = true;
         try v.rescan();
     }
 
@@ -314,6 +334,7 @@ pub const Volume = struct {
     /// 掉电测试马上就能撞上（按顺序往后找的 next fit 要绕一圈才会重用，掩盖了这种错误）。
     /// 不等读者：调用方可能拿着已提交的树的缓冲区（cow），读者也可能正在等它。节点的分配靠事先 reserve。
     fn alloc(v: *Volume) Error!u64 {
+        if (v.broken) return error.IoError;
         v.reclaim();
         for (&v.used.masks, 0..) |*m, i| {
             if (m.* == std.math.maxInt(u64)) continue;
@@ -342,6 +363,7 @@ pub const Volume = struct {
 
     /// 保证接下来的操作分配 n 个块不会失败。算上 limbo 才够的话，等旧树的读者读完。
     fn reserve(v: *Volume, n: u64) Error!void {
+        if (v.broken) return error.IoError;
         v.reclaim();
         if (v.free_count >= n) return;
         if (v.free_count + v.limbo_count < n) return error.NoSpace;
@@ -352,6 +374,7 @@ pub const Volume = struct {
     /// 调用方把内容写下去，再在树里插一个指向它的条目（data_refs 要认得这个条目）。
     /// 没有空闲块、limbo 里有的话等旧树的读者读完，所以调用方不能拿着已提交的树的缓冲区。
     pub fn allocData(v: *Volume) Error!u64 {
+        if (v.broken) return error.IoError;
         v.reclaim();
         if (v.free_count == 0 and v.limbo_count > 0) v.waitReaders();
         return v.alloc();
@@ -374,7 +397,10 @@ pub const Volume = struct {
         if (blockno < super_blocks or blockno >= v.blocks) return error.Corrupt;
         const b = try bio.get(blockno);
         const n = Node.of(b.data);
-        const fresh = bio.load(b);
+        const fresh = bio.load(b) catch |err| {
+            bio.release(b);
+            return err;
+        };
         const h = n.header();
         if ((fresh and !n.csumOk()) or h.blockno != blockno or h.generation != generation or h.level != level or
             (level > 0 and h.nritems == 0) or (level > 0 and h.nritems > btree.max_ptrs))
@@ -386,9 +412,9 @@ pub const Volume = struct {
         return b;
     }
 
-    fn writeNode(b: *bio.Buf) void {
+    fn writeNode(b: *bio.Buf) bio.IoError!void {
         Node.of(b.data).setCsum();
-        bio.write(b);
+        try bio.write(b);
     }
 
     /// 分配一个新的空节点，拿着它的缓冲区返回（还没写盘）。
@@ -518,21 +544,27 @@ pub const Volume = struct {
             unreachable;
         }
 
-        /// 写下改过的节点，放开所有缓冲区。
-        fn finish(p: *Path) void {
+        /// 写下改过的节点，放开所有缓冲区。有写失败的，其余的照样写完、放开，返回 IoError（调用方作废事务）。
+        fn finish(p: *Path) bio.IoError!void {
+            var result: bio.IoError!void = {};
             for (p.bufs[0..max_levels], p.dirty) |b, d| {
                 if (b) |x| {
-                    if (d) writeNode(x);
+                    if (d) writeNode(x) catch |err| {
+                        result = err;
+                    };
                     bio.release(x);
                 }
             }
             for (p.extra) |b| {
                 if (b) |x| {
-                    writeNode(x);
+                    writeNode(x) catch |err| {
+                        result = err;
+                    };
                     bio.release(x);
                 }
             }
             p.* = .{};
+            return result;
         }
 
         /// 出错了：不写，放开所有缓冲区（调用方接着作废事务）。
@@ -582,7 +614,15 @@ pub const Volume = struct {
             try v.abort();
             return err;
         };
-        p.finish();
+        try v.finishOrAbort(&p);
+    }
+
+    /// 写下路径上改过的节点（Path.finish），写失败的话作废事务。
+    fn finishOrAbort(v: *Volume, p: *Path) Error!void {
+        p.finish() catch |err| {
+            try v.abort();
+            return err;
+        };
     }
 
     fn descendOrAbort(v: *Volume, key: Key) Error!Path {
@@ -664,7 +704,7 @@ pub const Volume = struct {
             p.node(level + 1).ptrRemove(p.slots[level + 1]);
             p.dirty[level + 1] = true;
         }
-        p.finish();
+        try v.finishOrAbort(&p);
         v.collapseRoot() catch |err| {
             try v.abort();
             return err;
@@ -704,7 +744,7 @@ pub const Volume = struct {
         std.debug.assert(found);
         @memcpy(leaf.itemData(i), data);
         p.dirty[0] = true;
-        p.finish();
+        try v.finishOrAbort(&p);
     }
 
     // ---- 走树、检查 ----
@@ -784,7 +824,7 @@ fn writeSuper(s: Super) Error!void {
     @memcpy(b.data[0..@sizeOf(Super)], std.mem.asBytes(&s));
     std.mem.writeInt(u32, b.data[0..4], superCsum(b.data), .little);
     b.valid = true;
-    bio.write(b);
+    try bio.write(b);
 }
 
 /// 读第 slot 个超级块，校验和、魔数、槽位不对时返回 null。
@@ -813,20 +853,39 @@ var test_cache_seed: u64 = 0;
 var test_cache: std.ArrayListUnmanaged(struct { block: u64, data: [block_size]u8 }) = .empty;
 var test_flushes: usize = 0;
 
-fn testTransfer(block: u64, data: *[block_size]u8, write: bool) void {
-    if (!write) {
-        // 设备的读能看到还在缓存里的写：从最新的往前找
-        var i = test_cache.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (test_cache.items[i].block == block) {
-                data.* = test_cache.items[i].data;
-                return;
-            }
-        }
-        data.* = test_disk[block];
-        return;
+/// 读写失败：第 test_fail_at 次设备操作（读、写、flush 都算，从 0 开始数，test_ops）返回 IoError，之后照常。
+/// test_fail_wrote 为 true 时，失败的写和 flush 其实做完了（设备做完才报错），否则什么都没做。
+var test_ops: usize = 0;
+var test_fail_at: ?usize = null;
+var test_fail_wrote = false;
+
+/// 这一次设备操作要不要失败。
+fn testFails() bool {
+    defer test_ops += 1;
+    if (test_fail_at != test_ops) return false;
+    test_fail_at = null;
+    return true;
+}
+
+fn testTransfer(block: u64, data: *[block_size]u8, write: bool) bio.IoError!void {
+    if (testFails()) {
+        if (write and test_fail_wrote) testWrite(block, data);
+        return error.IoError;
     }
+    if (write) return testWrite(block, data);
+    // 设备的读能看到还在缓存里的写：从最新的往前找
+    var i = test_cache.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (test_cache.items[i].block == block) {
+            data.* = test_cache.items[i].data;
+            return;
+        }
+    }
+    data.* = test_disk[block];
+}
+
+fn testWrite(block: u64, data: *[block_size]u8) void {
     test_writes += 1;
     if (test_crashed) return;
     if (test_budget) |*left| {
@@ -848,7 +907,15 @@ fn testTransfer(block: u64, data: *[block_size]u8, write: bool) void {
     }
 }
 
-fn testFlush() void {
+fn testFlush() bio.IoError!void {
+    if (testFails()) {
+        if (test_fail_wrote) testFlushNow();
+        return error.IoError;
+    }
+    testFlushNow();
+}
+
+fn testFlushNow() void {
     test_flushes += 1;
     if (test_crashed) return;
     for (test_cache.items) |*w| test_disk[w.block] = w.data;
@@ -878,6 +945,8 @@ fn testSetup(blocks: usize) !void {
     test_crashed = false;
     test_writes = 0;
     test_flushes = 0;
+    test_ops = 0;
+    test_fail_at = null;
     test_cache.clearRetainingCapacity();
     testReboot();
     try Volume.format(blocks);
@@ -898,6 +967,8 @@ fn testFree() void {
     test_cache.deinit(std.testing.allocator);
     test_cache = .empty;
     test_cache_mode = false;
+    test_fail_at = null;
+    test_fail_wrote = false;
 }
 
 /// 测试用的键和数据：编号 id 的键是 (id % 37, id % 3, id)，各种字段都会参与比较；
@@ -1349,4 +1420,96 @@ test "掉电：在每一次写之后掉电（包括只写了一半），重新�
             return err;
         };
     }
+}
+
+/// 在第 fail_at 次设备操作时读写失败，跑 CrashRun 那样的随机事务：失败的事务作废（内存里退回上一次提交），
+/// 接着跑下去；提交到一半失败的，卷不再修改（broken）。最后核对内存里和重新挂载之后的内容。
+/// 返回跑完这些事务用了几次设备操作（之后的核对不再注入失败），卷有没有因此不再修改。
+fn ioErrorAt(fail_at: usize, wrote: bool) !struct { ops: usize, broken: bool } {
+    try testSetup(64);
+    const v = &test_vol;
+    var snapshots: CrashRun = .{}; // 借它记每个事务号对应的内容
+    defer snapshots.deinit();
+    var model: Model = .{};
+    defer model.deinit();
+    try snapshots.snapshot(v.generation, &model);
+    test_fail_at = fail_at;
+    test_fail_wrote = wrote;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rng = prng.random();
+    for (0..CrashRun.txns) |_| {
+        bio.invalidate(); // 不然大部分读都被缓存挡住了，测不到读失败
+        const ok = txn: {
+            for (0..CrashRun.ops) |_| randomOp(v, &model, rng, 40) catch |err| switch (err) {
+                error.NoSpace => {},
+                error.IoError => break :txn false, // 操作自己作废了事务
+                else => return err,
+            };
+            // 提交之前就记下：写超级块失败的话，盘上可能是它、也可能还是上一个
+            if (snapshots.snapshots.items.len < v.transid) try snapshots.snapshot(v.transid, &model);
+            v.commit() catch |err| switch (err) {
+                error.IoError => break :txn false,
+                else => return err,
+            };
+            break :txn true;
+        };
+        if (!ok) {
+            // Fs.run 也是这样：出错就作废（已经作废过的话什么都不做）
+            v.abort() catch |err| if (err != error.IoError) return err;
+            model.deinit();
+            model = try snapshots.snapshots.items[v.generation - 1].clone();
+            // 提交到一半失败的，盘上可能已经是下一个事务号的内容，留着它
+            if (v.broken) break;
+            // 没提交的事务号会被下一个事务重用
+            while (snapshots.snapshots.items.len > v.generation) {
+                var m = snapshots.snapshots.pop().?;
+                m.deinit();
+            }
+        }
+    }
+    const ops_used = test_ops;
+    const broken = v.broken;
+    test_fail_at = null;
+    const gen = v.generation;
+    const committed = &snapshots.snapshots.items[gen - 1];
+    if (v.broken) {
+        // 不再修改，读者照常读已提交的树
+        try std.testing.expectError(error.IoError, v.commit());
+        try std.testing.expectError(error.IoError, randomOp(v, &model, rng, 40));
+        try expectContentsAt(v, v.committed, committed);
+    } else {
+        _ = try v.check();
+        try expectContents(v, committed);
+    }
+    // 重新挂载：盘上的是最后一次提交的；提交到一半失败的话，也可能是那一次（写失败的超级块可能其实写下去了）
+    testReboot();
+    try v.mount();
+    _ = try v.check();
+    try std.testing.expect(v.generation == gen or (v.generation == gen + 1 and v.generation <= snapshots.snapshots.items.len));
+    try expectContents(v, &snapshots.snapshots.items[v.generation - 1]);
+    // 挂载之后还能接着用
+    model.deinit();
+    model = try snapshots.snapshots.items[v.generation - 1].clone();
+    for (0..5) |_| randomOp(v, &model, rng, 40) catch |err| if (err != error.NoSpace) return err;
+    try v.commit();
+    _ = try v.check();
+    try expectContents(v, &model);
+    return .{ .ops = ops_used, .broken = broken };
+}
+
+test "读写失败：在每一次读、写、flush 时失败，事务作废或者卷不再修改，重新挂载后都是某个已提交的状态" {
+    defer testFree();
+    const total = (try ioErrorAt(std.math.maxInt(usize), false)).ops; // 不失败，数一共几次设备操作
+    try std.testing.expect(total > 200);
+    var broken: usize = 0;
+    for (0..total) |n| {
+        for ([_]bool{ false, true }) |wrote| {
+            const r = ioErrorAt(n, wrote) catch |err| {
+                std.debug.print("I/O error at operation {d} of {d} (wrote: {})\n", .{ n, total, wrote });
+                return err;
+            };
+            if (r.broken) broken += 1;
+        }
+    }
+    try std.testing.expect(broken > 0); // 有些落在了提交的中间
 }

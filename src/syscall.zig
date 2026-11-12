@@ -300,7 +300,10 @@ const handlers = struct {
     /// 读原始区域的一块到用户内存。拿着缓冲区的睡眠锁复制，所以先 pin 好目标。
     pub fn readblock(blockno: usize, ptr: usize) !void {
         const dst = try vm.pinDst(space(), ptr, abi.block_size);
-        const b = bio.read(try rawBlock(blockno)) catch unreachable; // rawBlock 检查过了
+        const b = bio.read(try rawBlock(blockno)) catch |err| switch (err) {
+            error.IoError => return error.IoError,
+            error.NoDevice, error.OutOfRange => unreachable, // rawBlock 检查过了
+        };
         defer bio.release(b);
         dst.copyOut(0, b.data);
     }
@@ -313,7 +316,7 @@ const handlers = struct {
         defer bio.release(b);
         src.copyIn(0, b.data);
         b.valid = true;
-        bio.write(b);
+        try bio.write(b);
     }
 
     /// 打开路径 path，返回 fd（见 abi.Syscall.open）。

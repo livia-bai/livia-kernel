@@ -59,10 +59,10 @@ class Failure(Exception):
 class Qemu:
     """启动 QEMU，后台线程持续读取串口输出；按提示符一条一条地发命令。"""
 
-    def __init__(self, kernel, smp, disk):
+    def __init__(self, kernel, smp, disk, drive_file=None):
         # 磁盘：virtio 块设备，现代（version 2）的 virtio-mmio 接口，和 build.zig 的 zig build run 一样，
-        # 只是不加 snapshot=on：退出之后要检查写进磁盘镜像的内容
-        drive = [a.replace("{disk}", disk) for a in QEMU_DISK]
+        # 只是不加 snapshot=on：退出之后要检查写进磁盘镜像的内容。drive_file 替换 -drive 的 file=（比如 blkdebug:...）
+        drive = [a.replace("{disk}", drive_file or disk) for a in QEMU_DISK]
         self.proc = subprocess.Popen(
             QEMU + ["-smp", str(smp), "-kernel", kernel] + drive,
             stdin=subprocess.PIPE,
@@ -759,12 +759,35 @@ def case_disk(q, c, mode):
     c.contains(q.command("disk"), r"1024 blocks of 4 KiB \(4 MiB\)\n", "disk")
     check_counts(c, q.command("run t_disk"), "t_disk")
     q.after_shutdown.append((c, lambda c: check_disk_image(q, c)))
+    q.after_shutdown.append((c, lambda c: check_disk_errors(q, c)))
 
 
-def reboot(q, c, what, steps):
+def check_disk_errors(q, c):
+    """再启动一次，用 QEMU 的 blkdebug 让原始区域第 EIO_BLOCK 块的读写都失败（设备报 VIRTIO_BLK_S_IOERR）：
+    t_disk eio 看到 IoError，内核打印出错的请求，不 panic，两边的块照常能读。"""
+    block = 900
+    sector = (FS_BLOCKS + block) * BLOCK_SIZE // 512
+    conf = os.path.splitext(q.disk)[0] + "-blkdebug.conf"
+    with open(conf, "w", encoding="utf-8") as f:
+        for event in ["read_aio", "write_aio"]:
+            f.write(f'[inject-error]\nevent = "{event}"\nerrno = "5"\nsector = "{sector}"\nonce = "off"\n\n')
+
+    def steps(r):
+        out = r.command(f"run t_disk eio {block}")
+        check_counts(c, out, "t_disk")
+        for kind in [0, 1]:  # 读、写
+            c.contains(out, rf"\[disk\] request type {kind} at sector {sector} failed with status 1\n", "t_disk eio: kernel message")
+        r.send("shutdown\r")
+        c.expect(r.finish(COMMAND_TIMEOUT) == 0, "shutdown after t_disk eio")
+
+    # 读写错误要报给虚拟机（rerror/werror 的默认值遇到某些错误会让虚拟机停下）
+    reboot(q, c, "eio", steps, f"blkdebug:{conf}:{q.disk},rerror=report,werror=report")
+
+
+def reboot(q, c, what, steps, drive_file=None):
     """在同一个磁盘镜像上再启动一次（QEMU 已经退出），等提示符，确认文件系统挂上了，再调用 steps(新的 Qemu)。
     串口输出存到镜像旁边的 <镜像名>-<what>.log。"""
-    r = Qemu(q.kernel, q.smp, q.disk)
+    r = Qemu(q.kernel, q.smp, q.disk, drive_file)
     try:
         text = r.wait_for(lambda t: "Type 'help' for commands.\n> " in t or "KERNEL PANIC" in t, BOOT_TIMEOUT,
                           f"the first prompt ({what})")
