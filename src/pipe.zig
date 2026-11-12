@@ -1,7 +1,7 @@
 //! 管道，照 xv6 的 pipe.c 写：一个环形缓冲区，一端写、一端读，读写两端各是一个打开的文件（见 file.zig）。
 //!
-//! - 读：缓冲区空着时睡在 &nread 上等写端写进来；写端都关了、缓冲区也空了，返回 0（读到结尾）。
-//! - 写：写满了就叫醒读的进程，自己睡在 &nwrite 上等它读走；写完全部字节才返回。
+//! - 读：缓冲区空着时排在 readers 里睡下，等写端写进来；写端都关了、缓冲区也空了，返回 0（读到结尾）。
+//! - 写：写满了就叫醒读的进程，自己排在 writers 里睡下，等它读走；写完全部字节才返回。
 //!   读端都关了，再写就返回 BrokenPipe（Linux 的 EPIPE）。
 //! - nread、nwrite 是读走、写进的总字节数，只增不减（64 位，不会回绕），
 //!   两者之差就是缓冲区里的字节数，下标是它们对缓冲区大小取模。
@@ -22,6 +22,9 @@ pub const Pipe = struct {
     lock: Spinlock = .init("pipe", .cond),
     nread: usize = 0,
     nwrite: usize = 0,
+    /// lock。等数据的读者、等空位的写者
+    readers: proc.WaitQueue = .{},
+    writers: proc.WaitQueue = .{},
     /// 读端、写端是否还开着（对应的 File 的引用数还没减到 0）
     read_open: bool = true,
     write_open: bool = true,
@@ -46,10 +49,10 @@ pub fn close(p: *Pipe, writable: bool) void {
     p.lock.acquire();
     if (writable) {
         p.write_open = false;
-        proc.wakeup(&p.nread);
+        p.readers.wakeAll(&p.lock);
     } else {
         p.read_open = false;
-        proc.wakeup(&p.nwrite);
+        p.writers.wakeAll(&p.lock);
     }
     const unused = !p.read_open and !p.write_open;
     p.lock.release();
@@ -65,14 +68,14 @@ pub fn write(p: *Pipe, src: vm.PinnedSrc) Error!usize {
     defer p.lock.release();
     var done: usize = 0;
     // 写进了东西就叫醒读的进程（在放开锁之前：defer 按相反的顺序执行）
-    defer if (done > 0) proc.wakeup(&p.nread);
+    defer if (done > 0) p.readers.wakeAll(&p.lock);
     while (done < len) {
         if (!p.read_open) return if (done == 0) error.BrokenPipe else done;
         if (proc.isKilled()) return done;
         if (p.nwrite - p.nread == size) {
             // 满了：叫醒读的进程，等它读走一些
-            proc.wakeup(&p.nread);
-            proc.sleep(&p.nwrite, &p.lock);
+            p.readers.wakeAll(&p.lock);
+            p.writers.wait(&p.lock);
             continue;
         }
         // 一次复制一段：不超过缓冲区的空位、不越过缓冲区末尾（环形）
@@ -93,10 +96,10 @@ pub fn read(p: *Pipe, dst: vm.PinnedDst) Error!usize {
     defer p.lock.release();
     while (p.nread == p.nwrite and p.write_open) {
         if (proc.isKilled()) return 0;
-        proc.sleep(&p.nread, &p.lock);
+        p.readers.wait(&p.lock);
     }
     var done: usize = 0;
-    defer if (done > 0) proc.wakeup(&p.nwrite);
+    defer if (done > 0) p.writers.wakeAll(&p.lock);
     while (done < len and p.nread != p.nwrite) {
         const start = p.nread % size;
         const n = @min(len - done, p.nwrite - p.nread, size - start);

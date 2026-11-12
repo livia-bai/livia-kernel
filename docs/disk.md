@@ -97,11 +97,11 @@ pub fn flush() void   // 协商到 FLUSH 才发请求，否则什么都不做
 
 两个都交给 `submit(类型, 扇区号, 数据或 null)`：
 
-1. 拿 `lock`。分配三个描述符，没有就 `proc.sleep(&free, &lock)`，等有请求做完放回描述符。
+1. 拿 `lock`。分配三个描述符，没有就 `free_waiters.wait(&lock)`，等有请求做完放回描述符。
 2. 填请求头、状态字节（先写成 `0xff`）、三个描述符；`info[head].done = false`。
 3. 把链的第一个描述符的下标放进 `avail.ring[avail.idx % num]`，**`fence`**，`avail.idx += 1`，**`fence`**，写 QueueNotify。设备看到新的 `idx` 时，前面写的描述符和 ring 必须已经可见；写 QueueNotify（MMIO）之前，`idx` 也必须已经可见。
-4. `while (!info[head].done) proc.sleep(&info[head], &lock)`：进程睡着等，CPU 给别的进程。
-5. 醒来后看状态字节，不是 0 就 panic（QEMU 上只有内核给错了参数才会出现）；放回描述符，`wakeup(&free)`。
+4. `while (!info[head].done) info[head].waiters.wait(&lock)`：进程睡着等，CPU 给别的进程。
+5. 醒来后看状态字节，不是 0 就 panic（QEMU 上只有内核给错了参数才会出现）；放回描述符，`free_waiters.wakeAll(&lock)`。
 
 **写缓存**：写请求做完只说明设备收到了数据。设备（真实的磁盘，或者 QEMU 背后宿主机的页缓存）可能还把它放在缓存里，掉电会丢，几次写落盘的先后也不保证。写时复制的文件系统恰恰依赖顺序（新节点先落盘、超级块后落盘，[btree.md](btree.md#事务和提交)），所以提交时在超级块前后各 `flush` 一次。
 
@@ -116,7 +116,7 @@ reg(.interrupt_ack).* = reg(.interrupt_status).* & 0x3;
 while (used_idx != used.idx) {
     const id = used.ring[used_idx % num].id;   // 做完的请求链的第一个描述符
     info[id].done = true;
-    proc.wakeup(&info[id]);
+    info[id].waiters.wakeAll(&lock);
     used_idx +%= 1;
 }
 ```
@@ -145,7 +145,7 @@ pub const Sleeplock = struct {
 };
 ```
 
-和 xv6 的一样：`acquire` 拿着 `lk` 检查 `locked`，被别人拿着就 `proc.sleep(l, &lk)` 睡下，`release` 清掉 `locked` 再 `wakeup(l)`。和自旋锁的区别：
+和 xv6 的一样：`acquire` 拿着 `lk` 检查 `locked`，被别人拿着就排进 `waiters` 睡下（`l.waiters.wait(&l.lk)`），`release` 清掉 `locked` 再 `l.waiters.wakeAll(&l.lk)`。和自旋锁的区别：
 
 - **等锁时睡着**，不占 CPU 空转。拿着锁的进程可能正在等磁盘，拿着自旋锁等的话，别的 hart 上要同一把锁的进程都得陪着转。
 - **拿着它可以睡觉**（等磁盘、等别的睡眠锁）。自旋锁不行：`sched` 只允许拿着自己的进程锁。反过来，拿睡眠锁之前不能拿着自旋锁（`acquire` 一开始就检查，原来要等到真的睡下、`sched` 发现时才 panic）。
@@ -195,7 +195,7 @@ pub fn blockCount() u64
 2. 没有就放开桶的锁，**换块**（`evict`），拿着 `evict_lock`：
    1. 再在桶里找一次：放开桶的锁到拿到 `evict_lock` 之间，别的进程可能刚把这一块换进来。换进来都要拿着 `evict_lock`，所以拿着它查一次就够了，之后没人能再换进同一块：**同一块在缓存里不会有两份**。
    2. 依次看每个桶（`takeOldest`），找 `refcnt == 0`、`stamp` 最小的缓冲区。一直拿着目前最好的候选所在的桶的锁，找到更好的才换成新的桶，这样候选的 `refcnt` 不会在找完之前被别人加上去。最后把它从原来的桶里摘下来，改成这一块（`valid = false`、`refcnt = 1`），挂进新的桶。摘下来到挂进去之间它不在任何桶里，别人找不到它。
-   3. 都有人在用（64 个都有人拿着）就 `proc.sleep(&evicting, &evict_lock)`，等有人 `release`。xv6 在这里 panic。
+   3. 都有人在用（64 个都有人拿着）就 `evict_waiters.wait(&evict_lock)`，等有人 `release`。xv6 在这里 panic。
 3. 换来的缓冲区同样再拿睡眠锁。
 
 **两把桶的锁同时拿只发生在换块的时候**，而换块拿着 `evict_lock`，一次只有一个进程在换，所以不会互相等。顺序是 `evict_lock` → 桶的锁；找已经缓存着的块只拿一把桶的锁，拿着它不再拿别的锁。

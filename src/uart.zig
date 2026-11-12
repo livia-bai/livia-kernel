@@ -7,6 +7,7 @@
 const std = @import("std");
 const hart = @import("hart.zig");
 const Spinlock = @import("spinlock.zig").Spinlock;
+const proc = @import("proc.zig");
 
 pub const base: usize = 0x1000_0000;
 pub const mmio_size: usize = 0x100;
@@ -96,8 +97,8 @@ pub const rx_capacity = rx_buf.len - 1;
 /// 所以不会自己等自己；多核时串口中断可能在另一个 hart 上处理。
 pub var rx_lock: Spinlock = .init("uart rx", .cond);
 
-/// 等键盘输入的进程睡在这个通道上，收到字符后陷阱处理程序用它 proc.wakeup。
-pub const rx_chan: *const anyopaque = &rx_buf;
+/// rx_lock。等键盘输入的进程排在这里，收到字符后陷阱处理程序叫醒它们。
+pub var rx_waiters: proc.WaitQueue = .{};
 
 /// Ctrl-C（ASCII 0x03）不进缓冲区，陷阱处理程序据此结束前台进程。
 const ctrl_c = 0x03;

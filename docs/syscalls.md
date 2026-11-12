@@ -199,7 +199,7 @@ pub fn dispatch(frame: *TrapFrame) ?usize {
 
 内核这边，`syscall.errno(err)` 对错误集做 `inline else`，在编译期逐个看名字：和 `abi.Error` 里的同名（`NotFound`、`BadAddress`、`TextBusy`……）就直接用那个错误码；内核里别的名字（`Corrupt`、`InvalidName`、`IsDirLink`……）在 `syscall.aliases` 里说明换成哪个。两边都没有的错误直接编译失败（`no errno for error.X: add it to syscall.aliases`）。所以新加一个错误不会悄悄变成 `-EIO`（这个内核里 `EIO` 的意思是“磁盘上的数据不对”），原来的 `fsys.errno(anyerror)` 有一个 `else => .io` 兜底，就会这样。内核的错误尽量直接用 `abi.Error` 里的名字，`aliases` 里剩下的十来个是文件系统、`exec` 内部更具体的说法。
 
-会等待的调用（`yield`、`sleep`、`read`、管道的 `write`、`wait`）在里面切回调度器，等这个进程再被调度时才返回，然后 `handleTrap` 照常把返回值写进 `a0`、检查 `killed`、回到 U 模式。`sleep` 和 xv6 的 `sys_sleep` 一样，拿着 `timer.lock` 在循环里 `proc.sleep(&timer.ticks, &timer.lock)`，每个 tick 醒来一次，数够了 tick（或者被 kill 了）才返回（[process.md](process.md#sleepwakeup)）。
+会等待的调用（`yield`、`sleep`、`read`、管道的 `write`、`wait`）在里面切回调度器，等这个进程再被调度时才返回，然后 `handleTrap` 照常把返回值写进 `a0`、检查 `killed`、回到 U 模式。`sleep` 和 xv6 的 `sys_sleep` 一样，拿着 `timer.lock` 在循环里 `timer.waiters.wait(&timer.lock)`，每个 tick 醒来一次，数够了 tick（或者被 kill 了）才返回（[process.md](process.md#等待队列waitqueue)）。
 
 ## write
 
@@ -408,6 +408,6 @@ pub fn fprint(fd: Fd, comptime fmt: []const u8, args: anytype) void
 1. `src/abi.zig`：在 `Syscall` 里加一个编号，在 `params` 里写它的参数（需要新错误码就在 `Errno` 里加，沿用 Linux 的编号，再在 `error_names` 里给它起名字）。漏了 `params` 编译不过。
 2. `src/syscall.zig`：在 `handlers` 里加一个同名的 `pub fn`，参数类型按上面的表（`*file.File`、`UserSlice`、整数……），返回什么都行（`!usize`、`!void`……），出错直接 `try`。漏了、参数对不上编译不过。内核里新的错误名要么和 `abi.Error` 里的同名，要么加进 `aliases`，否则编译不过。
 3. 涉及用户指针的，一律通过 `vm.copyFromUser` / `vm.copyToUser` 访问，不要打开 `SUM`。要拿着锁读写用户内存、或者会消耗内核状态（比如取走输入）的，先 pin（[访问用户内存](#访问用户内存)）。
-4. 要阻塞等待的（比如等键盘输入），照 `sleep` 的办法：挑一个代表“在等什么”的地址作通道，拿着保护条件的锁 `while (!条件 and !proc.isKilled()) proc.sleep(chan, &lock);`，在条件可能变化的地方（中断处理程序、别的进程）拿着同一把锁改条件、`proc.wakeup(chan)`（[process.md](process.md#sleepwakeup)）。读串口用的是 `uart.rx_chan` 和 `uart.rx_lock`，管道用的是 `&pipe.nread`/`&pipe.nwrite` 和管道的锁，`wait` 用的是进程自己和 `proc.wait_lock`，`sleep` 用的是 `&timer.ticks` 和 `timer.lock`。`lock` 不能为空。不要在系统调用里开中断 `wfi`（[trap.md](trap.md#中断开关不变量)）。
+4. 要阻塞等待的（比如等键盘输入），照 `sleep` 的办法：在等待条件旁边放一个 `proc.WaitQueue`，拿着保护条件的锁 `while (!条件 and !proc.isKilled()) q.wait(&lock);`，在条件可能变化的地方（中断处理程序、别的进程）拿着同一把锁改条件、`q.wakeAll(&lock)`（[process.md](process.md#等待队列waitqueue)）。读串口用的是 `uart.rx_waiters` 和 `uart.rx_lock`，管道用的是 `Pipe.readers`/`writers` 和管道的锁，`wait` 用的是进程自己的 `child_exit` 和 `proc.wait_lock`，`sleep` 用的是 `timer.waiters` 和 `timer.lock`。`lock` 不能为空。不要在系统调用里开中断 `wfi`（[trap.md](trap.md#中断开关不变量)）。
 5. `user/sys.zig`：加一个封装函数，用 `call(.名字, .{ 参数... })` 和 `check`。参数个数、种类不对编译不过。
 6. 更新本文的调用列表，在 [changes.md](changes.md) 里加一行。

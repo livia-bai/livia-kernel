@@ -103,7 +103,7 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 
 **调度器**（[process.md](process.md#调度)，结构照搬 xv6）：每个 hart 一个，在这个 hart 的启动栈上永远循环：开一下中断（处理挂起的中断）再关上 → 依次扫描进程表，每个槽位拿着进程锁看状态，`runnable` 的进程：切到它的地址空间，`switchContext` 换到它的内核栈，等它调用 `sched()` 切回来 → 一个都没有就 `wfi`。别的 hart 把进程改成 `runnable`、或者杀了在这个 hart 上运行的进程时，发核间中断叫醒或打断它（`ipi.zig`），不用等 10 ms 一次的时钟中断。新进程从 `forkret` → `trapExit` 进入 U 模式，老进程从上次 `sched()` 的地方继续（可能在另一个 hart 上）。
 
-**进程让出 CPU**：时钟中断打断 U 模式（时间片用完）→ `proc.yieldTimeslice`，`yield` 系统调用 → `proc.yield`；要等某件事（`sleep` 系统调用等时钟，`read` 等键盘输入或管道里的数据，`write` 等管道腾出空间，`wait` 等子进程结束）→ `proc.sleep(chan, lock)`，等中断处理程序或别的进程 `proc.wakeup(chan)`。两者都经 `proc.sched` 切回调度器。
+**进程让出 CPU**：时钟中断打断 U 模式（时间片用完）→ `proc.yieldTimeslice`，`yield` 系统调用 → `proc.yield`；要等某件事（`sleep` 系统调用等时钟，`read` 等键盘输入或管道里的数据，`write` 等管道腾出空间，`wait` 等子进程结束）→ 排进条件旁边的等待队列（`q.wait(lock)`，`proc.WaitQueue`），等中断处理程序或别的进程 `q.wakeAll(lock)`。两者都经 `proc.sched` 切回调度器。
 
 **shell**（[shell.md](shell.md)）：普通的用户程序：`read` 一个字节、自己回显 → 回车时执行命令；`run` 用 `fork` + `exec` 启动程序（带命令行参数），前台程序用 `setfg` 登记、`wait` 等它结束；`run a | b` 用 `pipe` + `dup` 把 a 的标准输出接到 b 的标准输入。
 
@@ -125,7 +125,7 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 
 - `sscratch`：在 U 模式运行时存着当前进程的内核栈顶；在内核里是这个 hart 的陷阱栈顶（S 模式的陷阱都在陷阱栈上处理）；正在处理 S 模式的陷阱时为 0（[trap.md](trap.md#sscratch-约定)）。
 - 内核代码全程关着中断（`sstatus.SIE = 0`）：初始化、陷阱处理、系统调用、调度器扫描进程表。中断只会打断 U 模式，或者调度器每一轮开头开中断的那一下，不会嵌套（[trap.md](trap.md)）。
-- 拿自旋锁时中断关着；切换进程（`sched`）时只拿着这个进程自己的锁，回到 U 模式时不拿着任何锁；要拿着锁等待的用 `proc.sleep(chan, lock)`；同时拿几把锁时按固定的顺序（[process.md](process.md#锁)）。
+- 拿自旋锁时中断关着；切换进程（`sched`）时只拿着这个进程自己的锁，回到 U 模式时不拿着任何锁；要拿着锁等待的用 `proc.WaitQueue`；同时拿几把锁时按固定的顺序（[process.md](process.md#锁)）。
 - 进程切换只在关中断、拿着这个进程的锁时发生，并且总是经过调度器：`scheduler` ↔ 进程，进程只通过 `proc.sched` 切回，进程之间不直接切换（[process.md](process.md#切换上下文)）。一个进程同一时刻只在一个 hart 上运行。
 - 内核里 `tp` 是当前 hart 的编号；用户程序的 `tp` 在进出 U 模式时换掉（[trap.md](trap.md#tp-约定)）。
 - 被 kill 的进程不会再回到 U 模式：陷阱返回前、新进程第一次进入 U 模式前都检查 `killed`（[process.md](process.md#结束进程)）。

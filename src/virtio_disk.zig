@@ -130,13 +130,16 @@ var queue: Queue align(4096) = undefined;
 
 /// 每个请求链（按第一个描述符的下标）的状态。由 lock 保护。
 const Info = struct {
-    /// 设备做完了没有。发出请求的进程拿着 lock 睡在这一项上，等它变成 true
+    /// 设备做完了没有。发出请求的进程拿着 lock 排在 waiters 里睡下，等它变成 true
     done: bool = false,
+    waiters: proc.WaitQueue = .{},
 };
 
 /// 保护队列、描述符的分配、info 和 used_idx。加锁顺序：lock → 进程锁（睡下、叫醒）。
 var lock: Spinlock = .init("virtio disk", .cond);
 var free: [num]bool = @splat(true);
+/// 等空闲描述符的进程
+var free_waiters: proc.WaitQueue = .{};
 var info: [num]Info = @splat(.{});
 /// 驱动看到哪儿了：used 环里 [used_idx, used.idx) 是还没处理的
 var used_idx: u16 = 0;
@@ -261,7 +264,7 @@ fn submit(kind: u32, sector: u64, data: ?*[block_size]u8) void {
     defer lock.release();
     const idx = while (true) {
         if (allocDescs(3)) |idx| break idx;
-        proc.sleep(&free, &lock);
+        free_waiters.wait(&lock);
     };
     const head = idx[0];
     const q: *volatile Queue = &queue;
@@ -287,12 +290,12 @@ fn submit(kind: u32, sector: u64, data: ?*[block_size]u8) void {
     fence();
     reg(.queue_notify).* = 0; // 告诉设备队列 0 有新请求
 
-    while (!info[head].done) proc.sleep(&info[head], &lock);
+    while (!info[head].done) info[head].waiters.wait(&lock);
 
     const status = q.status[head];
     if (status != 0) std.debug.panic("virtio disk: request type {d} at sector {d} failed with status {d}", .{ kind, sector, status });
     for (idx) |i| free[i] = true;
-    proc.wakeup(&free);
+    free_waiters.wakeAll(&lock);
 }
 
 /// 中断处理：确认中断，把 used 环里新做完的请求标成 done，叫醒等它们的进程。
@@ -307,7 +310,7 @@ pub fn onInterrupt() void {
         fence();
         const id = q.used.ring[used_idx % num].id;
         info[id].done = true;
-        proc.wakeup(&info[id]);
+        info[id].waiters.wakeAll(&lock);
         used_idx +%= 1;
     }
 }

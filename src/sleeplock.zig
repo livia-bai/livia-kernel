@@ -1,4 +1,4 @@
-//! 睡眠锁，照 xv6 的 sleeplock.c 写。和自旋锁的区别：等锁的进程睡下（proc.sleep），不占着 CPU 空转；
+//! 睡眠锁，照 xv6 的 sleeplock.c 写。和自旋锁的区别：等锁的进程排进 waiters 睡下（proc.WaitQueue），不占着 CPU 空转；
 //! 拿着它可以睡觉、切换进程。用来保护要等磁盘 I/O 的东西（缓冲区缓存里的每一块，见 bio.zig）：
 //! 拿着锁的进程可能正在等磁盘，拿着自旋锁等的话，别的 hart 上想要同一把锁的进程都得陪着空转。
 //!
@@ -52,6 +52,8 @@ pub const Sleeplock = struct {
     rank: Rank,
     /// 保护 locked 和 holder；等锁的进程拿着它睡在这把睡眠锁上
     lk: Spinlock,
+    /// lk。等这把锁的进程
+    waiters: proc.WaitQueue = .{},
     locked: bool = false,
     /// 拿着它的进程（单元测试在主机上运行，没有当前进程，是 null）
     holder: ?*proc.Process = null,
@@ -71,7 +73,7 @@ pub const Sleeplock = struct {
         defer l.lk.release();
         // 自己已经拿着的话，睡下去就永远醒不来了（和自旋锁一样，直接 panic）
         if (l.locked and l.holder == proc.current()) std.debug.panic("acquire: sleeplock {s} is already held by this process", .{l.name});
-        while (l.locked) proc.sleep(l, &l.lk);
+        while (l.locked) l.waiters.wait(&l.lk);
         l.locked = true;
         l.holder = proc.current();
         if (proc.heldSleeplocks()) |h| h.counts[@backingInt(l.rank)] += 1;
@@ -84,7 +86,7 @@ pub const Sleeplock = struct {
         l.locked = false;
         l.holder = null;
         if (proc.heldSleeplocks()) |h| h.counts[@backingInt(l.rank)] -= 1;
-        proc.wakeup(l);
+        l.waiters.wakeAll(&l.lk);
     }
 
     /// 当前进程是否拿着它。

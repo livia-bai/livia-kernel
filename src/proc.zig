@@ -5,8 +5,8 @@
 //!   进程不绑定 hart：这次在哪个 hart 上让出 CPU，下次可能在另一个 hart 上接着运行。
 //! - 进程要让出 CPU 时，先拿上自己的锁、改自己的状态，再调用 sched() 切回调度器：yield（时间片用完）、
 //!   sleep（等某件事）、exit 都是这样。
-//! - 等待用 sleep(chan, lock) / wakeup(chan)：chan 是任意一个地址，代表“在等什么”。sleep 系统调用睡在
-//!   &timer.ticks 上，read 等键盘睡在 uart.rx_chan 上，wait 等子进程睡在自己的 Process 上。
+//! - 等待用 WaitQueue：每个等待条件旁边放一个队列（管道的 readers/writers、timer.waiters、uart.rx_waiters、
+//!   进程自己的 child_exit……），q.wait(lock) 睡下，q.wakeAll(lock) 叫醒排在里面的进程。
 //! - 进程之间有父子关系：fork 复制当前进程，exec 换掉地址空间，exit 之后变成 zombie，等父进程 wait 回收。
 //!   第一个进程 init（pid 1）由 kmain 创建，父进程先结束的孤儿交给它回收。
 //! - kill 只做标记、叫醒在睡的进程；被杀的进程回到 U 模式之前自己结束（checkKilled）。
@@ -25,7 +25,7 @@
 //! 页在第一次被访问时才分配，段里的页那时才从程序文件读进来。
 //!
 //! 锁（照 xv6 的 proc.c，详见 docs/process.md 的“锁”一节）：
-//! - 每个进程的 lock 保护它的 state、hart、chan、killed、xstatus、pid、ticks、name。调度器拿着它切到进程，
+//! - 每个进程的 lock 保护它的 state、hart、killed、xstatus、pid、ticks、name。调度器拿着它切到进程，
 //!   进程拿着它切回调度器，所以“改状态 + 切换”在别的 hart 看来是一步完成的。
 //! - wait_lock 保护所有进程的 parent，wait 拿着它睡在自己身上。加锁顺序：wait_lock 在前，进程锁在后；
 //!   别的锁（管道、串口、ticks）也都在进程锁前面拿，进程锁之后只会再拿页分配器、文件表这种不再往下拿锁的。
@@ -95,8 +95,12 @@ pub const Process = struct {
     parent: ?*Process = null,
     /// 不在运行时，它的内核上下文保存在这里（见 switchContext）
     context: Context = undefined,
-    /// lock。sleeping 时等的“通道”，wakeup 用同一个地址叫醒它
-    chan: ?*const anyopaque = null,
+    /// 在某个 WaitQueue 里排着时的下一个进程，和 queued 一起由那个队列的锁（保护等待条件的锁）保护
+    wait_next: ?*Process = null,
+    /// 在不在某个 WaitQueue 里：wakeAll 把它摘下来时清掉；被 kill 叫醒的还排着，自己摘（见 WaitQueue.wait）
+    queued: bool = false,
+    /// wait_lock。在 wait 里等子进程结束的父进程排在这里，子进程的 finish、reparent 叫醒它
+    child_exit: WaitQueue = .{},
     /// lock。被 kill 了的话是原因。进程回到 U 模式之前看到它就自己结束（见 checkKilled）
     killed: ?[]const u8 = null,
     /// lock。zombie 的结束状态，父进程 wait 时取走：正常退出时是退出码，被杀时是 abi.killed_status
@@ -498,66 +502,81 @@ pub fn yieldTimeslice() void {
     p.lock.release();
 }
 
-/// 按通道地址散列的睡眠者计数：睡在散列到第 i 格的通道上的进程有几个。wakeup 看到 0 就直接返回，
-/// 不用扫整张进程表、拿 max_procs 把锁（放开睡眠锁、管道读写、磁盘中断、每个时钟 tick 都要 wakeup，
-/// 绝大多数时候没人在等）。不同的通道散列到同一格只是多扫一次，不会漏。
+/// 等某件事的进程排成的队列（xv6 的 sleep/wakeup，“通道”从任意一个地址换成一个有类型的对象）。
+/// 放在等待条件旁边：管道的 readers/writers、timer.waiters、uart.rx_waiters、睡眠锁的 waiters、进程的 child_exit……
+/// 原来通道是 *const anyopaque，谁在等什么要靠搜同一个地址表达式来配对，写错一边就永远不醒；wakeup 每次都要扫
+/// 整张进程表、拿 max_procs 把锁。现在 wakeAll 只看排在这个队列里的进程，没人在等时什么锁都不拿。
 ///
-/// 为什么不会丢唤醒：sleep 拿着条件锁 lock 时加 1，之后才放开 lock；改条件的一方要先拿 lock 才能改，
-/// 改完（或者放开 lock 之后）才 wakeup。所以它读计数时，lock 的放开和拿上已经把这次加 1 排在了前面。
-/// 计数只靠这个先后关系，不用来保护别的数据，monotonic 就够了。
-var sleepers: [32]std.atomic.Value(u32) = @splat(.init(0));
+/// 队列由保护等待条件的那把锁（lock，等级 cond 或 wait）保护：wait 和 wakeAll 都要拿着它调用，两边都检查。
+/// 不会丢唤醒：等的一方拿着 lock 检查条件、排进队列，拿上自己的进程锁之后才放开 lock；改条件的一方要拿 lock
+/// 才能改、才能 wakeAll，所以它看到的队列里一定有这个进程，而它要拿进程锁才能改状态，等到拿上时进程已经切走了。
+/// 醒来不代表条件已经满足（几个进程等同一个条件，先醒的拿走了；或者是被 kill 叫醒的），所以都在循环里等：
+/// `while (!条件) q.wait(lock);`
+pub const WaitQueue = struct {
+    /// 排着的进程，用 Process.wait_next 串起来（后来的在前面：wakeAll 一次叫醒全部，顺序无所谓）
+    first: ?*Process = null,
 
-fn sleepersOf(chan: *const anyopaque) *std.atomic.Value(u32) {
-    // 通道多是结构体里的字段，低几位常常一样，先右移
-    return &sleepers[(@intFromPtr(chan) >> 3) % sleepers.len];
-}
-
-/// 当前进程睡在 chan 上，直到别人调用 wakeup(chan)。
-///
-/// 醒来不代表等的条件已经满足（同一个 chan 上可能有好几个进程在等不同的东西，也可能被 kill 叫醒），
-/// 所以调用方要在循环里检查条件：`while (!条件) sleep(chan, lock);`。
-///
-/// lock 是保护这个条件的锁，调用方拿着它检查条件、拿着它调用 sleep；sleep 先拿上自己的进程锁，
-/// 再放开 lock，睡下、切走之后调度器才放开进程锁；醒来先放开进程锁，再重新拿上 lock（xv6 的写法）。
-/// 改条件的一方要先拿 lock，wakeup 要拿进程锁，所以从“检查完条件”到“切走”之间它插不进来，
-/// 不会丢掉 wakeup（lost wakeup），也不会在这个进程还没切走时就被另一个 hart 的调度器运行。
-pub fn sleep(chan: *const anyopaque, lock: *Spinlock) void {
-    const p = current().?;
-    const count = sleepersOf(chan);
-    _ = count.fetchAdd(1, .monotonic); // 在放开 lock 之前，见 sleepers
-    p.lock.acquire();
-    lock.release();
-    p.chan = chan;
-    p.state = .sleeping;
-    sched();
-    p.chan = null;
-    p.lock.release();
-    _ = count.fetchSub(1, .monotonic);
-    lock.acquire();
-}
-
-/// 叫醒所有睡在 chan 上的进程。只改状态，不切换，中断处理程序里也能调用。
-/// 没人睡在（散列到同一格的）通道上就直接返回（见 sleepers）。
-/// 跳过当前进程：它在运行，不会在睡；调用方可能还拿着它的锁。
-/// 叫醒的每个都经过 makeRunnable：叫醒了几个，就给最多几个空闲的 hart 发核间中断，让它们马上来运行。
-/// 调用方要拿过保护条件的锁（sleep 的 lock）：拿着它调用，或者放开它之后调用。
-pub fn wakeup(chan: *const anyopaque) void {
-    kstat.inc(.wakeup_calls);
-    if (sleepersOf(chan).load(.monotonic) == 0) return;
-    kstat.inc(.wakeup_scans);
-    const me = current();
-    var woken: usize = 0;
-    for (&table) |*p| {
-        if (p == me) continue;
+    /// 当前进程排进队列、睡下，直到被 wakeAll（或者 kill）叫醒。调用方拿着 lock 调用，返回时又拿着它。
+    /// 先拿上自己的进程锁，再放开 lock，切走之后调度器才放开进程锁；醒来先放开进程锁，再拿上 lock（xv6 的写法）。
+    pub fn wait(q: *WaitQueue, lock: *Spinlock) void {
+        // 单元测试在主机上运行，不会走到这里（sched 会 panic）
+        if (!lock.holding()) std.debug.panic("WaitQueue.wait: not holding {s}", .{lock.name});
+        const p = current().?;
+        std.debug.assert(!p.queued);
+        p.wait_next = q.first;
+        q.first = p;
+        p.queued = true;
         p.lock.acquire();
-        defer p.lock.release();
-        if (p.state == .sleeping and p.chan == chan) {
-            makeRunnable(p);
-            woken += 1;
-        }
+        lock.release();
+        p.state = .sleeping;
+        sched();
+        p.lock.release();
+        lock.acquire();
+        // wakeAll 叫醒的已经被摘下来了；被 kill 叫醒（markKilled）的还排着，自己摘掉
+        if (p.queued) q.remove(p);
     }
-    kstat.add(.processes_woken, woken);
-}
+
+    /// 叫醒排在队列里的所有进程，队列清空。只改状态，不切换，中断处理程序里也能调用。调用方拿着 lock。
+    /// 叫醒的每个都经过 makeRunnable：叫醒了几个，就给最多几个空闲的 hart 发核间中断，让它们马上来运行。
+    /// 摘下来的进程可能已经不在睡了（被 kill 叫醒、还没拿上 lock 把自己摘掉），跳过。
+    pub fn wakeAll(q: *WaitQueue, lock: *Spinlock) void {
+        if (!lock.holding()) std.debug.panic("WaitQueue.wakeAll: not holding {s}", .{lock.name});
+        kstat.inc(.wakeup_calls);
+        var woken: usize = 0;
+        while (q.first) |p| {
+            // 当前进程在运行，不会排在任何队列里（被 kill 叫醒的，从 wait 返回之前就摘掉了自己）
+            std.debug.assert(p != current());
+            q.first = p.wait_next;
+            p.wait_next = null;
+            p.queued = false;
+            p.lock.acquire();
+            defer p.lock.release();
+            if (p.state == .sleeping) {
+                makeRunnable(p);
+                woken += 1;
+            }
+        }
+        kstat.add(.processes_woken, woken);
+    }
+
+    /// 有没有进程排着。调用方拿着 lock。
+    pub fn isEmpty(q: *const WaitQueue) bool {
+        return q.first == null;
+    }
+
+    fn remove(q: *WaitQueue, p: *Process) void {
+        var link = &q.first;
+        while (link.*) |x| : (link = &x.wait_next) {
+            if (x == p) {
+                link.* = p.wait_next;
+                p.wait_next = null;
+                p.queued = false;
+                return;
+            }
+        }
+        unreachable; // queued 为 true 就一定排在这个队列里
+    }
+};
 
 /// 把一个不在运行的进程（睡着的、刚建好的）改成 runnable，叫一个登记为空闲的 hart 马上来运行它（ipi.wakeIdle）。
 /// 让别的进程变成 runnable 都经过这里（wakeup、markKilled、fork、userinit）：原来是一条约定，“改成 runnable 的地方
@@ -618,7 +637,7 @@ fn finish(p: *Process, status: u32) noreturn {
     wait_lock.acquire();
     reparent(p, init);
     // 父进程可能在 wait 里睡着。它要拿 wait_lock 才能检查子进程，所以先叫醒、后改状态也不会漏掉
-    wakeup(p.parent.?);
+    p.parent.?.child_exit.wakeAll(&wait_lock);
     p.lock.acquire();
     p.xstatus = status;
     p.state = .zombie;
@@ -635,7 +654,7 @@ fn reparent(p: *Process, init: *Process) void {
         // 空槽位的 parent 是 null（回收时清掉的），不会等于 p
         if (c.parent == p) {
             c.parent = init;
-            wakeup(init);
+            init.child_exit.wakeAll(&wait_lock);
         }
     }
 }
@@ -645,7 +664,7 @@ pub const WaitError = error{NoChildren};
 /// 等一个子进程结束并回收它（对应 xv6 的 wait），返回它的 pid。pid 为 abi.wait_any 时等任意一个子进程，
 /// 否则只等这一个。status 不为 null 时把结束状态写进去（用户内存，调用方 pin 好的：写不进去的地址在 pin 时就是
 /// EFAULT，那时还没回收，子进程还在，可以再 wait 一次）。
-/// 有子进程但都还没结束时，拿着 wait_lock 睡在自己身上，等子进程的 finish 叫醒；nohang 时不等，返回 null。
+/// 有子进程但都还没结束时，拿着 wait_lock 排在自己的 child_exit 里睡下，等子进程的 finish 叫醒；nohang 时不等，返回 null。
 /// 被 kill 了也返回 null，回到陷阱处理程序后结束。
 pub fn wait(pid: usize, nohang: bool, status: ?vm.PinnedDst) WaitError!?usize {
     const p = current().?;
@@ -661,7 +680,7 @@ pub fn wait(pid: usize, nohang: bool, status: ?vm.PinnedDst) WaitError!?usize {
             return child_pid;
         }
         if (nohang or isKilled()) return null;
-        sleep(p, &wait_lock);
+        p.child_exit.wait(&wait_lock);
     }
 }
 
@@ -854,45 +873,59 @@ fn contextAsm(comptime op: []const u8, comptime base: []const u8) []const u8 {
     return s;
 }
 
-/// 测试用：表里直接摆好的 sleeping 进程没走 sleep，替它们记上睡眠者计数。
-fn testSleepers(procs: []const Process) void {
-    for (procs) |*p| if (p.state == .sleeping) {
-        _ = sleepersOf(p.chan.?).fetchAdd(1, .monotonic);
-    };
+/// 测试用：表里直接摆好的 sleeping 进程没走 WaitQueue.wait，替它排进队列。
+fn testEnqueue(q: *WaitQueue, p: *Process) void {
+    std.debug.assert(p.state == .sleeping and !p.queued);
+    p.wait_next = q.first;
+    q.first = p;
+    p.queued = true;
 }
 
 /// 测试用：清空进程表和全局状态。
 fn testReset() void {
-    sleepers = @splat(.init(0));
     table = @splat(.{});
     cpus = @splat(.{});
     init_proc = null;
     foreground.store(0, .monotonic);
 }
 
-test "wakeup 只叫醒睡在同一个通道上的进程；kill 只做标记，叫醒在睡的进程，不能杀 init" {
+test "wakeAll 只叫醒排在这个队列里的进程，清空队列；kill 只做标记，叫醒在睡的进程，不能杀 init" {
     const expectEqual = std.testing.expectEqual;
     testReset();
     defer testReset();
-    var a: u64 = 0;
-    var b: u64 = 0;
-    table[0] = .{ .state = .sleeping, .pid = 1, .chan = &a };
-    table[1] = .{ .state = .sleeping, .pid = 2, .chan = &a };
-    table[2] = .{ .state = .sleeping, .pid = 3, .chan = &b };
+    var lock: Spinlock = .init("test cond", .cond);
+    var a: WaitQueue = .{};
+    var b: WaitQueue = .{};
+    table[0] = .{ .state = .sleeping, .pid = 1 };
+    table[1] = .{ .state = .sleeping, .pid = 2 };
+    table[2] = .{ .state = .sleeping, .pid = 3 };
     table[3] = .{ .state = .runnable, .pid = 4 };
     table[4] = .{ .state = .zombie, .pid = 5 };
     init_proc = &table[0];
-    testSleepers(&table);
+    testEnqueue(&a, &table[0]);
+    testEnqueue(&a, &table[1]);
+    testEnqueue(&b, &table[2]);
 
-    wakeup(&a);
+    lock.acquire();
+    a.wakeAll(&lock);
+    a.wakeAll(&lock); // 空队列：什么都不做
+    lock.release();
     try expectEqual(.runnable, table[0].state);
     try expectEqual(.runnable, table[1].state);
     try expectEqual(.sleeping, table[2].state);
+    try std.testing.expect(a.isEmpty() and !b.isEmpty());
+    try std.testing.expect(!table[0].queued and !table[1].queued and table[2].queued);
 
     // kill 叫醒在睡的进程，只记第一次的原因；runnable 的进程状态不变，等它自己结束
     try kill(3, "first");
     try kill(3, "second");
     try expectEqual(.runnable, table[2].state);
+    // 被 kill 叫醒的还排在 b 里（醒来的进程自己摘掉，见 WaitQueue.wait）；这时 wakeAll 把它摘下来，状态不变
+    try std.testing.expect(table[2].queued);
+    lock.acquire();
+    b.remove(&table[2]);
+    lock.release();
+    try std.testing.expect(b.isEmpty() and !table[2].queued and table[2].wait_next == null);
     try std.testing.expectEqualStrings("first", table[2].killed.?);
     try kill(4, "x");
     try expectEqual(.runnable, table[3].state);
@@ -940,8 +973,7 @@ test "wait 只找自己的子进程，按 pid 挑；子进程结束时交给 ini
     const init = &table[0];
     const sh = &table[1];
     init.* = .{ .state = .sleeping, .pid = 1 };
-    init.chan = init; // 在 wait 里睡着
-    testSleepers(&table);
+    testEnqueue(&init.child_exit, init); // 在 wait 里睡着
     sh.* = .{ .state = .running, .pid = 2, .parent = init };
     table[2] = .{ .state = .runnable, .pid = 3, .parent = sh };
     table[3] = .{ .state = .zombie, .pid = 4, .parent = sh };
@@ -968,6 +1000,7 @@ test "wait 只找自己的子进程，按 pid 挑；子进程结束时交给 ini
     try expectEqual(init, table[2].parent.?);
     try expectEqual(init, table[3].parent.?);
     try expectEqual(.runnable, init.state);
+    try std.testing.expect(init.child_exit.isEmpty());
     try std.testing.expectError(error.NoChildren, findZombieChild(sh, abi.wait_any));
     const z5 = (try findZombieChild(init, abi.wait_any)).?;
     try expectEqual(&table[3], z5);

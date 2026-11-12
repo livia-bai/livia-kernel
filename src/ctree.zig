@@ -149,6 +149,8 @@ pub const Volume = struct {
     /// 读着最新的已提交的树（generation）的读者个数，和读着更早的树的读者个数
     readers: usize = 0,
     old_readers: usize = 0,
+    /// snap_lock。等旧树的读者读完的修改的一方（waitReaders）排在这里，最后一个旧树的读者 endRead 时叫醒
+    readers_done: proc.WaitQueue = .{},
     /// 叶子里的条目指向的树外的块（文件系统的数据块）。挂载、检查走树时对每个条目调用它，
     /// 返回的块也算用着的（同一块被引用两次是 Corrupt）。由文件系统在挂载之前设好，没有就是 null
     data_refs: ?*const fn (key: Key, data: []const u8) ?DataRef = null,
@@ -269,7 +271,7 @@ pub const Volume = struct {
             v.readers -= 1;
         } else {
             v.old_readers -= 1;
-            if (v.old_readers == 0) proc.wakeup(&v.old_readers);
+            if (v.old_readers == 0) v.readers_done.wakeAll(&v.snap_lock);
         }
     }
 
@@ -291,7 +293,7 @@ pub const Volume = struct {
     /// 不会等修改的一方，所以等得到。只有进程能调用；单元测试里没有并发的读者，不会走到 sleep。
     fn waitReaders(v: *Volume) void {
         v.snap_lock.acquire();
-        while (v.old_readers > 0) proc.sleep(&v.old_readers, &v.snap_lock);
+        while (v.old_readers > 0) v.readers_done.wait(&v.snap_lock);
         v.snap_lock.release();
         v.reclaim();
     }

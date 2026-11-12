@@ -83,7 +83,7 @@ fn consoleRead(space: *vm.PageTable, ptr: usize, len: usize) Error!usize
 ```
 
 - **写**：先 `uart.lockOutput()` 拿上串口的输出锁，用户内存按块（128 字节、不跨页）复制到栈上、逐块输出，全部写完才放开锁，所以一次 `write` 的内容不会和别的 hart 的输出交错（[devices.md](devices.md#输出)）。部分写的语义见 [syscalls.md](syscalls.md#write)。
-- **读**：拿着 `uart.rx_lock` 检查输入缓冲区（[devices.md](devices.md#输入环形缓冲区)），空着就 `proc.sleep(uart.rx_chan, &uart.rx_lock)`，串口中断叫醒它；被 kill 了就返回。有字符就有多少读多少（最多 `len`），每次最多 64 个放进栈上的缓冲区，再 `copyToUser`。调用方（`read` 系统调用）已经检查过目标范围可写，`copyToUser` 不会失败。
+- **读**：拿着 `uart.rx_lock` 检查输入缓冲区（[devices.md](devices.md#输入环形缓冲区)），空着就 `uart.rx_waiters.wait(&uart.rx_lock)`，串口中断叫醒它；被 kill 了就返回。有字符就有多少读多少（最多 `len`），每次最多 64 个放进栈上的缓冲区，再 `PinnedDst.copyOut`。调用方（`read` 系统调用）已经 pin 好了目标范围，`copyOut` 不会失败。
 - **Ctrl-D（`0x04`）表示输入结束**，和 Unix 终端一样：读到它就停下。它前面有字符的话先返回这些字符，Ctrl-D 留在缓冲区里；下一次 `read` 读掉它、返回 0。所以单独按一次 Ctrl-D，`read` 返回 0。`cat`、`wc` 直接从键盘读时靠它结束；shell 读到 0 就忽略。
 - 不回显、不做行编辑（shell 自己做），Ctrl-C 在串口中断里就被截下了（[process.md](process.md#ctrl-c)），读不到。
 
@@ -132,13 +132,13 @@ pub fn read(p: *Pipe, space: *vm.PageTable, ptr: usize, len: usize) Error!usize
 p.lock.acquire();
 defer p.lock.release();
 var done: usize = 0;
-defer if (done > 0) proc.wakeup(&p.nread);
+defer if (done > 0) p.readers.wakeAll(&p.lock);
 while (done < len) {
     if (!p.read_open) return if (done == 0) error.BrokenPipe else done;
     if (proc.isKilled()) return done;
     if (p.nwrite - p.nread == size) {        // 满了
-        proc.wakeup(&p.nread);
-        proc.sleep(&p.nwrite, &p.lock);
+        p.readers.wakeAll(&p.lock);
+        p.writers.wait(&p.lock);
         continue;
     }
     // 复制一段：不超过空位、不越过缓冲区末尾、不跨用户页
@@ -158,7 +158,7 @@ p.lock.acquire();
 defer p.lock.release();
 while (p.nread == p.nwrite and p.write_open) {
     if (proc.isKilled()) return 0;
-    proc.sleep(&p.nread, &p.lock);
+    p.readers.wait(&p.lock);
 }
 // 有多少读多少，最多 len；读走了东西就叫醒写的进程
 ```
@@ -172,8 +172,8 @@ while (p.nread == p.nwrite and p.write_open) {
 ```zig
 pub fn close(p: *Pipe, writable: bool) void {
     p.lock.acquire();
-    if (writable) { p.write_open = false; proc.wakeup(&p.nread); }
-    else { p.read_open = false; proc.wakeup(&p.nwrite); }
+    if (writable) { p.write_open = false; p.readers.wakeAll(&p.lock); }
+    else { p.read_open = false; p.writers.wakeAll(&p.lock); }
     const unused = !p.read_open and !p.write_open;
     p.lock.release();
     if (unused) page.free(...);

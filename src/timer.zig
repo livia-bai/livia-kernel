@@ -22,10 +22,12 @@ var deadline: [hart.max]u64 = undefined;
 /// 由哪个 hart 的时钟中断给 ticks 加 1。
 var timekeeper: usize = undefined;
 
-/// 保护 ticks（xv6 的 tickslock）。sleep 系统调用拿着它检查时间、睡在 &ticks 上。
+/// 保护 ticks（xv6 的 tickslock）。sleep 系统调用拿着它检查时间、排在 waiters 里睡下。
 pub var lock: Spinlock = .init("ticks", .cond);
 /// 开机以来的 tick 数。读写都要拿着 lock。
 pub var ticks: u64 = 0;
+/// lock。sleep 系统调用里的进程排在这里，每个 tick 叫醒一次（自己数时间到了没有）
+pub var waiters: proc.WaitQueue = .{};
 
 /// 启动 hart 调用一次，在 initHart 之前。
 pub fn init(hz: u64) void {
@@ -59,7 +61,7 @@ pub fn onInterrupt() void {
     lock.acquire();
     defer lock.release();
     ticks += 1;
-    proc.wakeup(&ticks);
+    waiters.wakeAll(&lock);
 }
 
 /// 开机以来的毫秒数（从打开时钟中断算起），精度是一个 tick。

@@ -985,8 +985,7 @@ def case_kstat(q, c, mode):
     for name in ["syscalls", "context_switches", "timer_interrupts", "wakeup_calls", "faults_zero", "faults_file",
                  "tlb_full_flushes", "tlb_user_flushes", "bio_misses", "disk_reads"]:
         c.expect(counters.get(name, 0) > 0, f"kstat: {name} should be > 0:\n{indent(out)}")
-    # 绝大多数 wakeup 没人在等，不扫进程表（proc.sleepers）
-    c.expect(counters.get("wakeup_scans", 0) < counters.get("wakeup_calls", 0), f"kstat: wakeup_scans >= wakeup_calls:\n{indent(out)}")
+    c.expect(counters.get("processes_woken", 0) > 0, f"kstat: processes_woken should be > 0:\n{indent(out)}")
     for kind in ["process", "boot", "trap"]:
         c.contains(out, rf"(?m)^stack_{kind} +\d+ of \d+ bytes$", "kstat")
     exited(c, out, "kstat", 0)

@@ -5,7 +5,7 @@
 //! - 拿着锁时中断必须是关着的。否则中断处理程序在同一个 hart 上去拿同一把锁，就会永远自旋下去。
 //!   内核代码本来就关着中断运行（见 docs/trap.md），所以 acquire 只检查，不负责关中断（xv6 的 push_off）。
 //! - 不能拿着锁回到 U 模式。切换进程（sched）时只能拿着这个进程自己的锁（proc.zig），别的锁都要先放开；
-//!   要拿着锁等待的，用 proc.sleep(chan, lock)：它在睡下之后放开锁，醒来再重新拿上。
+//!   要拿着锁等待的，用 proc.WaitQueue 的 wait(lock)：它在睡下之后放开锁，醒来再重新拿上。
 //! - 同一个 hart 重复拿同一把锁是死锁，直接 panic。
 //! - **加锁顺序由等级（Rank）检查**：每把锁在创建时给一个等级，拿一把锁时，这个 hart 已经拿着的锁的等级都必须更低
 //!   （只有 bucket 这一级允许同时拿几把，见 Rank）。违反了就 panic，说出是哪两把锁。所以一次正常的运行就能发现
@@ -23,8 +23,8 @@ const no_hart = std.math.maxInt(usize);
 pub const Rank = enum(u8) {
     /// proc.wait_lock：父子关系。它在最前面：拿着它要看、要改各个进程（进程锁），还要叫醒父进程
     wait,
-    /// 保护某个等待条件、拿着它 proc.sleep / proc.wakeup 的锁：管道、timer.lock、uart.rx_lock、virtio_disk.lock、
-    /// bio.evict_lock、Volume.snap_lock、睡眠锁里的自旋锁。sleep 拿着它再拿进程锁，wakeup 拿着它扫进程锁，
+    /// 保护某个等待条件和对应的 proc.WaitQueue、拿着它 wait / wakeAll 的锁：管道、timer.lock、uart.rx_lock、virtio_disk.lock、
+    /// bio.evict_lock、Volume.snap_lock、睡眠锁里的自旋锁。wait 拿着它再拿自己的进程锁，wakeAll 拿着它拿排着的进程的锁，
     /// 所以都比进程锁低；它们之间不嵌套
     cond,
     /// bio 的桶。换块的一方拿着 evict_lock（cond）找最久没用的缓冲区时，会同时拿着两个桶的锁：

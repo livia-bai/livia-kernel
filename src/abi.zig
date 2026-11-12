@@ -379,7 +379,7 @@ pub const ProcState = enum(u8) {
     runnable,
     /// 正在 CPU 上运行
     running,
-    /// 在 sleep(chan) 里等某件事：sleep 系统调用、read 等键盘、wait 等子进程
+    /// 排在某个 WaitQueue 里等某件事：sleep 系统调用、read 等键盘、wait 等子进程、等锁、等磁盘
     sleeping,
     /// 已经结束，等父进程 wait 回收
     zombie,
@@ -434,9 +434,8 @@ pub const Counters = extern struct {
     timer_interrupts: u64 = 0,
     /// 发出的核间中断
     ipis_sent: u64 = 0,
-    /// wakeup 被调用的次数；其中真的扫了进程表的次数（有进程睡在散列到同一格的通道上）；叫醒的进程数
+    /// WaitQueue.wakeAll 被调用的次数（大多数时候队列是空的，什么锁都不拿）；叫醒的进程数
     wakeup_calls: u64 = 0,
-    wakeup_scans: u64 = 0,
     processes_woken: u64 = 0,
     /// 拿自旋锁时锁已经被别的 hart 拿着、要等的次数
     lock_contended: u64 = 0,

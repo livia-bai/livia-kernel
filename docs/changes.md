@@ -2,6 +2,12 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-12 等待用 WaitQueue，不再用任意地址作通道
+
+- 改动：`proc.sleep(chan, lock)` / `proc.wakeup(chan)` 换成 `proc.WaitQueue`：每个等待条件旁边放一个队列（`Pipe.readers`/`writers`、`timer.waiters`、`uart.rx_waiters`、`Sleeplock.waiters`、`virtio_disk` 的 `free_waiters` 和每个请求的 `waiters`、`bio.evict_waiters`、`Volume.readers_done`、`Process.child_exit`），`q.wait(lock)` 排进去睡下，`q.wakeAll(lock)` 只叫醒排着的进程，队列空着时什么锁都不拿。原来的 `wakeup` 要扫整张进程表；按通道地址散列的睡眠者计数（`sleepers`）也去掉了。
+- 改动：队列由保护等待条件的锁保护，`wait`、`wakeAll` 都检查调用方拿着它。串口中断原来放开 `rx_lock` 之后才 `wakeup`，现在拿着 `rx_lock` 叫醒。被 kill 叫醒的进程醒来后自己出队。`Process.chan` 换成 `wait_next`、`queued`。
+- 改动：计数器 `wakeup_scans` 去掉了。
+
 ## 2026-11-12 切换地址空间时不再作废整个 TLB
 
 - 改动：`vm.activate` 写 `satp` 之后只执行一次 `sfence.vma zero, t0`（新增 `riscv.sfenceVmaAsid`、`vm.flushUserTlb`），只作废 ASID 0 的非全局项，带 G 位的内核映射留在 TLB 里；写 `satp` 之前的那次 `sfence.vma` 去掉了。`fork`、`sbrk` 缩小改完页表也只作废用户映射。整个 TLB 只在启动时（`vm.enable`）作废。调度器一来一回从 4 次全量刷新变成 2 次只作废用户映射的刷新。

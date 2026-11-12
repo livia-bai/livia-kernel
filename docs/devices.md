@@ -81,7 +81,7 @@ var rx_head: u8 = 0;  // 中断处理程序写入的位置
 var rx_tail: u8 = 0;  // read 系统调用读出的位置
 pub var rx_lock: Spinlock = .init("uart rx", .cond);   // 保护上面三个
 
-pub const rx_chan: *const anyopaque = &rx_buf;  // 等输入的进程睡在这个通道上
+pub var rx_waiters: proc.WaitQueue = .{};  // rx_lock。等输入的进程排在这里
 
 pub fn hasInput() bool   // 调用方要拿着 rx_lock，下同
 pub fn peek() ?u8        // 看一眼下一个字符，不取出来
@@ -91,7 +91,7 @@ pub fn read() ?u8        // 取出一个字符
 - 索引是 `u8`，`+%` 回绕正好对应 256 字节的缓冲区，不需要取模。
 - `head == tail` 表示空；`head + 1 == tail` 表示满（留一个空位区分空和满，实际容量 255）。满了之后新来的字符被丢弃。
 - **单生产者单消费者**：只有中断处理程序（`onInterrupt`）改 `head`，只有 `read` 系统调用（`file.consoleRead` 里的 `uart.hasInput`、`peek`、`read`）改 `tail`。两边都拿着 `rx_lock`（`hasInput` 等断言了这一点）：串口中断在一个 hart 上处理的同时，另一个 hart 上的进程可能正在 `read`。中断处理程序也拿这把锁不会死锁：拿着它的代码都关着中断，同一个 hart 上不会被串口中断打断。
-- 缓冲区为空时 `read` 系统调用拿着 `rx_lock` 调用 `proc.sleep(rx_chan, &rx_lock)`；`trap.handleExternal` 在 `onInterrupt` 之后 `proc.wakeup(rx_chan)` 叫醒它（[files.md](files.md#串口)）。驱动本身不知道进程的存在。
+- 缓冲区为空时 `read` 系统调用拿着 `rx_lock` 调用 `rx_waiters.wait(&rx_lock)`；`trap.handleExternal` 在 `onInterrupt` 之后拿上 `rx_lock`、`rx_waiters.wakeAll(&rx_lock)` 叫醒它（[files.md](files.md#串口)）。驱动只放着这个队列，不叫醒、不睡。
 
 ```zig
 pub fn onInterrupt() bool {
@@ -183,9 +183,9 @@ pub var ticks: u64 = 0;
 - **每个 hart 有自己的定时器**：SBI 的 `set_timer` 只设置调用它的那个 hart 的下一次时钟中断，所以每个 hart 各自预约、各自的 `deadline[hart.id()]`，各自每 10 ms 被打断一次。每个 hart 上的进程都靠自己 hart 的时钟中断被抢占。
 - **预约**：`arm()` 把当前 hart 的 `deadline` 加上一个周期 `timebase_hz / tick_hz`（10 MHz 下是 100000 个计数），通过 `sbi.setTimer(deadline)` 让 OpenSBI 在那时产生 S 模式时钟中断。下一次的预约时刻以**上一次的预约时刻**为基准，而不是以“现在”为基准，原因见下面的“为什么”。
 - **初始化**：`init(hz)` 由启动 hart 调用一次，记下频率，并把自己定为 `timekeeper`；`initHart()` 每个 hart 调用一次，把自己的 `deadline` 设成当前的 `time`，预约第一次（一个周期之后），再打开自己的 `sie.STIE`。
-- **中断处理**：`onInterrupt()` 先预约这个 hart 的下一次（`setTimer` 同时清除了当前挂起的时钟中断，不预约的话处理程序返回后会立刻再次进来）。只有 `timekeeper`（启动 hart）接着拿 `lock`、让 `ticks` 加 1、`proc.wakeup(&ticks)` 叫醒 `sleep` 系统调用里的进程（xv6 的 `clockintr` 也只在 cpu 0 上做）。每个 hart 都加的话，4 个 hart 时 `ticks` 就会快 4 倍。
+- **中断处理**：`onInterrupt()` 先预约这个 hart 的下一次（`setTimer` 同时清除了当前挂起的时钟中断，不预约的话处理程序返回后会立刻再次进来）。只有 `timekeeper`（启动 hart）接着拿 `lock`、让 `ticks` 加 1、`waiters.wakeAll(&lock)` 叫醒 `sleep` 系统调用里的进程（xv6 的 `clockintr` 也只在 cpu 0 上做）。每个 hart 都加的话，4 个 hart 时 `ticks` 就会快 4 倍。
 - **计时**：`ticks` 从打开时钟中断开始计数，`uptimeMs()` 拿着 `lock` 读它，返回 `ticks * 1000 / tick_hz` 毫秒，是 `uptime` 系统调用的返回值，shell 的 `uptime` 命令显示它。误差在一个 tick（10 ms）以内，不随时间累积。
-- **`lock`**：`sleep` 系统调用拿着它检查睡够了没有、睡在 `&ticks` 上（[process.md](process.md#sleepwakeup)），时钟中断拿着它加 `ticks`、叫醒，所以不会丢 `wakeup`。
+- **`lock`**：`sleep` 系统调用拿着它检查睡够了没有、排在 `waiters` 里睡下（[process.md](process.md#等待队列waitqueue)），时钟中断拿着它加 `ticks`、叫醒，所以不会丢唤醒。
 - **为什么以上一次的预约时刻为基准**：中断从到期到被处理总有一段延迟。以前 `arm()` 按“处理中断时读到的 `time` + 一个周期”预约，每个 tick 都把这段延迟丢掉，误差越积越多。实测 `uptime` 比 `time` 慢 2%～3%，shell 空闲 20 秒就慢了 543 ms。现在每个周期的边界是固定的，延迟不累积，同样空闲 20 秒只差 4 ms。
 - **处理晚了超过一个周期时**：新的预约时刻已经过去。按 SBI 规范，这时中断会立刻挂起，连续来几次之后 `ticks` 就追上了。这种情况没有实测过。
 

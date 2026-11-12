@@ -326,7 +326,9 @@ fn handleExternal() void {
         plic.uart0_irq => {
             // 和 xv6 的 consoleintr 一样在中断里直接处理：Ctrl-C 杀掉前台进程，叫醒等输入的进程
             if (uart.onInterrupt()) proc.interruptForeground();
-            proc.wakeup(uart.rx_chan);
+            uart.rx_lock.acquire();
+            uart.rx_waiters.wakeAll(&uart.rx_lock);
+            uart.rx_lock.release();
         },
         else => if (irq == virtio_disk.irq) {
             // 磁盘做完了请求：叫醒等它的进程

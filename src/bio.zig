@@ -81,6 +81,8 @@ var datas: [nbuf][block_size]u8 align(4096) = undefined;
 var clock: std.atomic.Value(u64) = .init(0);
 /// 正在换块的进程个数（拿着 evict_lock 时加减）。release 看到它不为 0 才去拿 evict_lock 叫醒等着的进程
 var evicting: std.atomic.Value(usize) = .init(0);
+/// evict_lock。找不到能换掉的缓冲区的进程排在这里，release 放出一个没人用的缓冲区时叫醒
+var evict_waiters: proc.WaitQueue = .{};
 var device: ?Device = null;
 
 pub const Error = error{ NoDevice, OutOfRange };
@@ -155,7 +157,7 @@ fn evict(bk: *Bucket, blockno: u64) *Buf {
             bk.lock.release();
             return b;
         }
-        proc.sleep(&evicting, &evict_lock);
+        evict_waiters.wait(&evict_lock);
     }
 }
 
@@ -252,7 +254,7 @@ pub fn release(b: *Buf) void {
     bk.lock.release();
     if (idle and evicting.load(.seq_cst) > 0) {
         evict_lock.acquire();
-        proc.wakeup(&evicting);
+        evict_waiters.wakeAll(&evict_lock);
         evict_lock.release();
     }
 }

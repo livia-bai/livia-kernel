@@ -8,7 +8,7 @@
 - **每个 hart 有自己的调度器 `proc.scheduler()`，只管调度**。每个 hart 初始化完之后调用它，它在这个 hart 的启动栈上永远循环：依次扫描（所有 hart 共用的）进程表，遇到 `runnable` 的进程就切过去，等它切回来再接着往下扫。进程不绑定 hart，这次在哪个 hart 上让出 CPU，下次可能在另一个 hart 上接着运行。
 - **进程自己让出 CPU**：先拿上自己的锁、改自己的状态，再调用 `sched()` 切回调度器。时间片用完（`yield`）、等某件事（`sleep`）、结束（`exit`）都是这样。进程之间从不直接切换。
 - **每个进程有一把锁**，保护它的状态等字段；**`wait_lock`** 保护父子关系。调度器拿着进程锁切到进程，进程拿着它切回来，所以一个进程同一时刻只会在一个 hart 上运行（[锁](#锁)）。
-- **等待用 `sleep(chan, lock)` / `wakeup(chan)`**：`chan` 是任意一个地址，代表“在等什么”；`lock` 是保护等待条件的锁。
+- **等待用等待队列 `WaitQueue`**：每个等待条件旁边放一个队列，`q.wait(lock)` 排进去睡下，`q.wakeAll(lock)` 叫醒排着的进程；`lock` 是保护等待条件（也保护这个队列）的锁。
 - **每个进程有自己的 fd 表**，指向全局文件表里的串口或管道（[files.md](files.md)）。`fork` 复制，`exec` 保留，结束时全部关掉。
 - **结束的进程变成 zombie，由父进程 `wait` 回收**。父进程先结束的，子进程交给 init。
 - **`kill` 只做标记**，被杀的进程回到 U 模式之前自己结束。
@@ -47,7 +47,9 @@ pub const Process = struct {
     space: vm.Space = undefined,       // 地址空间：根页表、各个段、堆（按需分页要用，见 paging.md）
     parent: ?*Process = null,          // wait_lock。父进程；init 没有
     context: Context = undefined,      // 不在运行时保存的内核上下文
-    chan: ?*const anyopaque = null,    // lock。sleeping 时等的通道
+    wait_next: ?*Process = null,       // 排在某个 WaitQueue 里时的下一个进程
+    queued: bool = false,              // 在不在某个 WaitQueue 里。这两个由那个队列的锁保护
+    child_exit: WaitQueue = .{},       // wait_lock。在 wait 里等子进程结束时排在这里
     killed: ?[]const u8 = null,        // lock。被 kill 了的话是原因
     xstatus: u32 = 0,                  // lock。zombie 的结束状态，父进程 wait 时取走
     ticks: u64 = 0,                    // lock。在 U 模式运行期间来过的时钟中断数
@@ -344,8 +346,8 @@ pub fn scheduler() noreturn            // 每个 hart 初始化完之后调用�
 fn sched() void                        // 当前进程切回调度器
 pub fn yield() void                    // yield 系统调用
 pub fn yieldTimeslice() void           // 时钟中断打断了 U 模式
-pub fn sleep(chan: *const anyopaque, lock: *Spinlock) void
-pub fn wakeup(chan: *const anyopaque) void
+pub fn WaitQueue.wait(q: *WaitQueue, lock: *Spinlock) void
+pub fn WaitQueue.wakeAll(q: *WaitQueue, lock: *Spinlock) void
 ```
 
 ### 调度器
@@ -463,66 +465,75 @@ pub fn yield() void {
 
 **时间片**：每个 hart 的时钟中断是每 10 ms 一次（[devices.md](devices.md#定时器timerzig)），不是按进程计时的，所以一个进程刚被调度就碰上时钟中断时，它的时间片会不足 10 ms。`ticks` 只在时钟中断打断这个进程时加 1，是它用掉的 CPU 时间的近似值（单位 10 ms），`ps` 显示它。两个死循环的进程一起跑时，`ticks` 的增速几乎相同；多核时它们在不同的 hart 上同时跑，各自每秒接近 100。
 
-### sleep、wakeup
+### 等待队列（WaitQueue）
 
 ```zig
-pub fn sleep(chan: *const anyopaque, lock: *Spinlock) void {
-    const p = current().?;
-    const count = sleepersOf(chan);
-    _ = count.fetchAdd(1, .monotonic);
-    p.lock.acquire();
-    lock.release();
-    p.chan = chan;
-    p.state = .sleeping;
-    sched();
-    p.chan = null;
-    p.lock.release();
-    _ = count.fetchSub(1, .monotonic);
-    lock.acquire();
-}
+pub const WaitQueue = struct {
+    first: ?*Process = null, // 排着的进程，用 Process.wait_next 串起来；由保护等待条件的锁保护
 
-pub fn wakeup(chan: *const anyopaque) void {
-    if (sleepersOf(chan).load(.monotonic) == 0) return;
-    const me = current();
-    for (&table) |*p| {
-        if (p == me) continue;
+    pub fn wait(q: *WaitQueue, lock: *Spinlock) void {
+        const p = current().?;
+        p.wait_next = q.first; // 拿着 lock 排进队列
+        q.first = p;
+        p.queued = true;
         p.lock.acquire();
-        defer p.lock.release();
-        if (p.state == .sleeping and p.chan == chan) p.state = .runnable;
+        lock.release();
+        p.state = .sleeping;
+        sched();
+        p.lock.release();
+        lock.acquire();
+        if (p.queued) q.remove(p); // 被 kill 叫醒的还排着，自己摘掉
     }
-}
+
+    pub fn wakeAll(q: *WaitQueue, lock: *Spinlock) void {
+        while (q.first) |p| {
+            q.first = p.wait_next; // 摘下来
+            p.wait_next = null;
+            p.queued = false;
+            p.lock.acquire();
+            defer p.lock.release();
+            if (p.state == .sleeping) makeRunnable(p);
+        }
+    }
+};
 ```
 
-`chan` 只是一个地址，用来配对 `sleep` 和 `wakeup`，内核不会去读它指向的内容。现在用到的通道：
+（省略了检查和计数。）每个等待条件旁边放一个队列，和条件由同一把锁保护：
 
-| 谁在等 | 等什么 | 通道 | 拿着的锁 | 谁叫醒 |
+| 谁在等 | 等什么 | 队列 | 锁 | 谁叫醒 |
 | --- | --- | --- | --- | --- |
-| `sleep` 系统调用 | 时钟走够 | `&timer.ticks` | `timer.lock` | 启动 hart 的每个时钟中断（`timer.onInterrupt`） |
-| `read` 系统调用（串口） | 键盘输入 | `uart.rx_chan`（`&rx_buf`） | `uart.rx_lock` | 串口中断（`trap.handleExternal`） |
-| `read` 系统调用（管道） | 管道里有数据，或者写端都关了 | `&pipe.nread` | `Pipe.lock` | 往管道里写了东西（`pipe.write`），写端关了（`pipe.close`） |
-| `write` 系统调用（管道） | 管道腾出空间，或者读端都关了 | `&pipe.nwrite` | `Pipe.lock` | 从管道里读走了东西（`pipe.read`），读端关了（`pipe.close`） |
-| `wait` 系统调用 | 子进程结束 | 自己的 `*Process` | `wait_lock` | 子进程结束时（`finish` 叫醒父进程）；孤儿交给 init 时（`reparent` 叫醒 init） |
+| `sleep` 系统调用 | 时钟走够 | `timer.waiters` | `timer.lock` | 启动 hart 的每个时钟中断（`timer.onInterrupt`） |
+| `read` 系统调用（串口） | 键盘输入 | `uart.rx_waiters` | `uart.rx_lock` | 串口中断（`trap.handleExternal`） |
+| `read` 系统调用（管道） | 管道里有数据，或者写端都关了 | `Pipe.readers` | `Pipe.lock` | 往管道里写了东西（`pipe.write`），写端关了（`pipe.close`） |
+| `write` 系统调用（管道） | 管道腾出空间，或者读端都关了 | `Pipe.writers` | `Pipe.lock` | 从管道里读走了东西（`pipe.read`），读端关了（`pipe.close`） |
+| `wait` 系统调用 | 子进程结束 | 自己的 `child_exit` | `wait_lock` | 子进程结束时（`finish` 叫醒父进程）；孤儿交给 init 时（`reparent` 叫醒 init） |
+| 拿睡眠锁 | 锁被放开 | `Sleeplock.waiters` | `Sleeplock.lk` | `Sleeplock.release` |
+| 读写磁盘 | 请求做完；有空闲的描述符 | `info[head].waiters`；`free_waiters` | `virtio_disk.lock` | 磁盘中断（`virtio_disk.onInterrupt`）；做完的请求放回描述符 |
+| 换缓冲区 | 有缓冲区没人用了 | `bio.evict_waiters` | `bio.evict_lock` | `bio.release` |
+| 修改的一方等 `limbo` | 旧树的读者读完 | `Volume.readers_done` | `Volume.snap_lock` | 最后一个旧树的读者 `endRead` |
 
-规矩是**醒来之后自己检查条件，不满足就再睡**：`while (!条件) sleep(chan, lock);`。醒来不代表条件满足：时钟通道每个 tick 都叫醒所有在等的进程，各自数够了没有；两个进程同时 `read`，一个字符只能给其中一个；被 `kill` 也会醒。`wakeup` 只改状态、不切换，所以中断处理程序里也能调用。
+规矩是**醒来之后自己检查条件，不满足就再等**：`while (!条件) q.wait(lock);`。醒来不代表条件满足：时钟的队列每个 tick 都叫醒所有在等的进程，各自数够了没有；两个进程同时 `read`，一个字符只能给其中一个；被 `kill` 也会醒。`wakeAll` 只改状态、不切换，所以中断处理程序里也能调用。
 
-**`lock` 是保护等待条件的锁**，照 xv6 的 `sleep(chan, lk)`：调用方拿着它检查条件、拿着它调用 `sleep`；醒来后重新拿上再返回，所以调用方的循环里一直拿着锁。改条件的一方（往管道里写、串口中断往缓冲区里放字符、时钟中断加 `ticks`）也要先拿这把锁。例子是管道的读：
+**`lock` 是保护等待条件的锁**，照 xv6 的 `sleep(chan, lk)`：调用方拿着它检查条件、拿着它调用 `wait`；醒来后重新拿上再返回，所以调用方的循环里一直拿着锁。改条件的一方（往管道里写、串口中断往缓冲区里放字符、时钟中断加 `ticks`）也要先拿这把锁，**拿着它调用 `wakeAll`**：队列本身也归这把锁管。`wait` 和 `wakeAll` 都检查调用方拿着 `lock`，没拿就 panic。例子是管道的读：
 
 ```zig
 p.lock.acquire();
 defer p.lock.release();
 while (p.nread == p.nwrite and p.write_open) {
     if (proc.isKilled()) return 0;
-    proc.sleep(&p.nread, &p.lock);
+    p.readers.wait(&p.lock);
 }
 ```
 
-**为什么不会丢 `wakeup`**（lost wakeup：`wakeup` 发生在睡下之前，等的人永远睡下去）：`sleep` 先拿上自己的进程锁，再放开 `lock`，然后才改状态、切走；调度器切回来之后才放开进程锁。所以从“调用方检查完条件”到“真正切走”，这个进程一直拿着 `lock` 或者自己的进程锁（交接时两把都拿着）。改条件的一方要先拿 `lock` 才能改，改完调用 `wakeup` 又要拿进程锁才能看状态，于是它看到的要么是还没检查条件之前（那调用方会看到新的条件，不睡），要么是已经完全睡下、切走之后（`sleeping`，叫醒它）。进程锁还保证了另一件事：`wakeup` 不会在这个进程还没切走时就把它改成 `runnable`，让另一个 hart 的调度器在它还在原来的栈上运行时恢复它。
+**为什么不会丢唤醒**（lost wakeup：叫醒发生在睡下之前，等的人永远睡下去）：`wait` 拿着 `lock` 排进队列，先拿上自己的进程锁，再放开 `lock`，然后才改状态、切走；调度器切回来之后才放开进程锁。改条件的一方要先拿 `lock` 才能改、才能 `wakeAll`，于是它看到的要么是还没检查条件之前（那调用方会看到新的条件，不睡），要么是已经排进队列之后；它要拿进程锁才能改状态，等拿上时这个进程已经完全睡下、切走了（`sleeping`，叫醒它）。进程锁还保证了另一件事：`wakeAll` 不会在这个进程还没切走时就把它改成 `runnable`，让另一个 hart 的调度器在它还在原来的栈上运行时恢复它。
 
-**没人在等就不扫进程表**（`sleepers`）：`wakeup` 调得很频繁（每次放开睡眠锁、每次管道读写、每个磁盘中断、每个时钟 tick），而绝大多数时候没有进程在等：B 树查找每经过一层节点放一次缓冲区的睡眠锁，原来每次都要扫 64 个槽位、拿 64 次进程锁。现在按通道地址散列成 32 格，每格一个原子计数，`sleep` 拿着 `lock` 时加 1、醒来减 1，`wakeup` 看到这一格是 0 就直接返回。不同的通道散列到同一格只是多扫一遍，不会漏。它也不会丢 `wakeup`：`sleep` 加 1 在放开 `lock` 之前，改条件的一方在拿上 `lock` 之后才改条件、才 `wakeup`（拿着 `lock` 调用，或者像串口中断那样放开之后调用），`lock` 的放开和拿上把加 1 排在了读计数之前。计数不保护别的数据，所以用 `monotonic`。这是 xv6 没有的优化；彻底的做法是每个条件一个等待队列，只走真正在等的进程。
+**被 `kill` 叫醒的进程还排在队列里**：`kill` 只拿进程锁，直接把 `sleeping` 改成 `runnable`（`markKilled`），不知道它排在哪个队列里，也没拿那个队列的锁。所以 `wait` 醒来、重新拿上 `lock` 之后看 `queued`：还是 `true` 就自己从队列里摘掉（单链表，要从头找，但只有被 kill 时才走这一步）。在它拿上 `lock` 之前，`wakeAll` 可能已经把它摘下来了，那时它已经不是 `sleeping`，`wakeAll` 只摘不改状态。`wait_next`、`queued` 都由队列的锁保护，所以两边不会同时改。一个进程同一时刻最多排在一个队列里：它在从 `wait` 返回之前一定已经出队了。
 
-**`wakeup` 跳过当前进程**：它正在运行，不会是 `sleeping`；而调用方可能正拿着它的锁，再拿就是同一个 hart 重复加锁（xv6 也跳过 `myproc()`）。
+**为什么从“通道”换成队列**：原来照 xv6 写的是 `sleep(chan, lock)` / `wakeup(chan)`，`chan` 是任意一个地址（`&p.nread`、`&timer.ticks`、`&info[head]`……），内核不读它指向的内容，只用来配对。这有两个问题。一是谁在等什么要靠搜同一个地址表达式来配对，把 `&p.nread` 写成 `&p.nwrite` 就是永远不醒，类型系统帮不上忙；现在队列是结构体里有名字的字段，写错了多半编译不过，或者一眼就能看出来。二是 `wakeup` 要扫整张进程表、拿 64 次进程锁，而它调得很频繁（每次放开睡眠锁、每次管道读写、每个磁盘中断、每个时钟 tick），绝大多数时候没人在等：B 树查找每经过一层节点放一次缓冲区的睡眠锁。中间有一版按通道地址散列成 32 个原子计数器，没人在等时直接返回；现在 `wakeAll` 看到队列是空的就直接返回，有人在等时也只拿排着的进程的锁。代价是每个进程多两个字段，每个等待条件多一个指针。
 
-`lock` 不能为空。单核时内核全程关中断，不传锁也不会丢 `wakeup`；多核时另一个 hart 上的写者随时可能插进来，等待的条件必须有锁保护。
+**当前进程不会排在队列里**：它在运行。所以 `wakeAll` 不用像 xv6 的 `wakeup` 那样跳过 `myproc()`（调用方可能拿着自己的锁，再拿就是重复加锁），只断言一下。
+
+`lock` 不能为空。单核时内核全程关中断，不传锁也不会丢唤醒；多核时另一个 hart 上的写者随时可能插进来，等待的条件必须有锁保护。
 
 `sleep` 系统调用（`syscall.zig`）就是 xv6 的 `sys_sleep`：
 
@@ -531,10 +542,10 @@ const n = (ms *| timer.tick_hz +| 999) / 1000;
 timer.lock.acquire();
 defer timer.lock.release();
 const start = timer.ticks;
-while (timer.ticks - start < n and !proc.isKilled()) proc.sleep(&timer.ticks, &timer.lock);
+while (timer.ticks - start < n and !proc.isKilled()) timer.waiters.wait(&timer.lock);
 ```
 
-要睡的 tick 数 `⌈ms × 100 / 1000⌉`，乘法和加法都是饱和运算，`ms` 再大也不会溢出（最多睡到永远，只能被 `kill`）。`ticks` 由 `timer.lock` 保护（xv6 的 `tickslock`），只有启动 hart 的时钟中断给它加 1，加完在锁里 `wakeup(&ticks)`（[devices.md](devices.md#定时器timerzig)）。用户程序看到的 `uptime()` 也是按 tick 算的，所以醒来后 `uptime()` 至少增加了 `ms`；按真实时间算，可能比 `ms` 少不到一个 tick（睡下去时当前 tick 已经过了一部分）。`ms = 0` 时不睡，直接返回。被 kill 了就提前返回，回到陷阱处理程序后结束。
+要睡的 tick 数 `⌈ms × 100 / 1000⌉`，乘法和加法都是饱和运算，`ms` 再大也不会溢出（最多睡到永远，只能被 `kill`）。`ticks` 由 `timer.lock` 保护（xv6 的 `tickslock`），只有启动 hart 的时钟中断给它加 1，加完在锁里 `waiters.wakeAll(&lock)`（[devices.md](devices.md#定时器timerzig)）。用户程序看到的 `uptime()` 也是按 tick 算的，所以醒来后 `uptime()` 至少增加了 `ms`；按真实时间算，可能比 `ms` 少不到一个 tick（睡下去时当前 tick 已经过了一部分）。`ms = 0` 时不睡，直接返回。被 kill 了就提前返回，回到陷阱处理程序后结束。
 
 ## 切换上下文
 
@@ -631,7 +642,7 @@ fn finish(p: *Process, status: u32) noreturn {
     vm.releaseBacking(&p.space);   // 不会再缺页了：放开程序文件
     wait_lock.acquire();
     reparent(p, init);
-    wakeup(p.parent.?);
+    p.parent.?.child_exit.wakeAll(&wait_lock);
     p.lock.acquire();
     p.xstatus = status;
     p.state = .zombie;
@@ -668,14 +679,14 @@ pub fn wait(pid: usize, nohang: bool, status_ptr: usize) WaitError!?usize {
             return child_pid;
         }
         if (nohang or isKilled()) return null;
-        sleep(p, &wait_lock);
+        p.child_exit.wait(&wait_lock);
     }
 }
 ```
 
 - **整个过程拿着 `wait_lock`**：`parent` 字段只在拿着它时改（`fork`、`reparent`、`reap`），所以扫描期间父子关系不会变。
 - `findZombieChild` 扫一遍进程表，看 `parent == p` 的进程（`pid` 不是 `abi.wait_any` 时只看这一个 pid），每个都拿它的锁看状态：有 zombie 就**拿着它的锁**返回；有符合条件的子进程但都没结束返回 `null`；一个都没有是 `NoChildren`（`-ECHILD`）。它只看进程表，单元测试直接测它。
-- 都没结束就**睡在自己身上**（`sleep(p, &wait_lock)`），子进程的 `finish` 用 `wakeup(p.parent)` 叫醒它。醒来再扫一遍。`nohang` 时不睡，返回 `null`（系统调用返回 0）；被 kill 了也不睡，回到陷阱处理程序后结束。
+- 都没结束就**排在自己的 `child_exit` 里睡下**（`p.child_exit.wait(&wait_lock)`），子进程的 `finish` 用 `p.parent.?.child_exit.wakeAll(&wait_lock)` 叫醒它。醒来再扫一遍。`nohang` 时不睡，返回 `null`（系统调用返回 0）；被 kill 了也不睡，回到陷阱处理程序后结束。
 - 找到 zombie 后，先把 `xstatus` 写进用户给的地址（`status_ptr` 为 0 时不写；写不进去就返回 `BadAddress`，系统调用返回 `-EFAULT`，**不回收**，子进程还在，可以再 `wait`），然后 `reap`：释放地址空间，`fill(c, .{})` 把槽位清回 `unused`（锁留着）。xv6 也是先 `copyout` 再 `freeproc`，也是拿着 `wait_lock` 和子进程的锁做这些。`copyToUser` 只查页表、复制，不会等待，拿着锁调用没问题。
 
 ### kill：只做标记
@@ -738,7 +749,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 | `page.Pool.lock`（每个 hart 一把） | 这个 hart 的空闲页链表和页数；每一页的引用数是原子变量，不用锁 | [page-allocator.md](page-allocator.md#并发) |
 | `File.lock`（每个打开的文件一把） | 这个 `File` 的引用数（文件表没有整张表的锁） | [files.md](files.md#文件表) |
 | `Pipe.lock` | 一个管道的缓冲区和两端的状态；读写的进程拿着它睡在管道上 | [files.md](files.md#管道) |
-| `uart.rx_lock` | 串口的输入缓冲区；`read` 拿着它睡在 `uart.rx_chan` 上，串口中断也要拿它 | [devices.md](devices.md#输入环形缓冲区) |
+| `uart.rx_lock` | 串口的输入缓冲区；`read` 拿着它排在 `uart.rx_waiters` 里睡下，串口中断也要拿它（拿着它叫醒） | [devices.md](devices.md#输入环形缓冲区) |
 | `virtio_disk.lock` | 磁盘的请求队列；发出请求的进程拿着它睡着等，磁盘中断拿着它叫醒 | [disk.md](disk.md#锁) |
 | `bio` 的桶的锁（13 把） | 桶里的缓冲区链表，和这些缓冲区的 `refcnt`、`blockno`、`stamp` | [disk.md](disk.md#锁-1) |
 | `bio.evict_lock` | 换块一个一个来；等空闲缓冲区时拿着它睡下 | [disk.md](disk.md#找缓冲区get) |

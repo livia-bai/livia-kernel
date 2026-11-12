@@ -308,7 +308,7 @@ pub fn seek(f: *File, offset: i64, whence: usize) Error!u64 {
 /// Ctrl-D：在串口上表示“输入结束”，和 Unix 终端一样。
 const ctrl_d = 0x04;
 
-/// 从键盘缓冲区读最多 len 个字节。缓冲区为空时睡在 uart.rx_chan 上，串口中断叫醒它。
+/// 从键盘缓冲区读最多 len 个字节。缓冲区为空时排在 uart.rx_waiters 里睡下，串口中断叫醒它。
 /// 读到 Ctrl-D 就停下：它前面有字符的话先返回这些字符，Ctrl-D 留到下一次 read，
 /// 那一次读掉它、返回 0。所以单独按一次 Ctrl-D，read 返回 0。
 fn consoleRead(dst: vm.PinnedDst) Error!usize {
@@ -318,7 +318,7 @@ fn consoleRead(dst: vm.PinnedDst) Error!usize {
     defer uart.rx_lock.release();
     while (!uart.hasInput()) {
         if (proc.isKilled()) return 0; // 回到陷阱处理程序后结束，返回值没人看
-        proc.sleep(uart.rx_chan, &uart.rx_lock);
+        uart.rx_waiters.wait(&uart.rx_lock);
     }
     if (uart.peek() == ctrl_d) {
         _ = uart.read();
