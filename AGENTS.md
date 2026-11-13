@@ -69,7 +69,7 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 - 内核代码（陷阱处理、系统调用、调度器扫描进程表）全程关中断执行；只有调度器每一轮开头开一下中断（[docs/trap.md](docs/trap.md#中断开关不变量)）。
 - 调度器先关中断再扫描进程表、再 `wfi`，下一轮开头才开中断；扫描之前先 `ipi.setIdle(true)` 登记成空闲，挑中进程时清掉（[docs/process.md](docs/process.md#调度器)）。让别的进程变成 `runnable` 只能经过 `proc.makeRunnable`（它调用 `ipi.wakeIdle`，否则空闲的 hart 要等 10 ms 才来运行它）（[docs/process.md](docs/process.md#核间中断)）。
 - 进程切换只在关中断、拿着这个进程的锁时进行，并且总是调度器 ↔ 进程：`proc.scheduler` 拿着进程锁切到进程，进程拿上自己的锁、改掉自己的状态后只通过 `proc.sched`（`yield`/`yieldTimeslice`/`sleep`/`finish`）切回，切回来之后由调用方放开锁；新进程在 `forkretC` 里放开（[docs/process.md](docs/process.md#调度器)）。调度器先换回内核页表再放开进程锁。`startFrame` 构造的 `TrapFrame`（init、`exec`）的 `sstatus` 必须清掉 `SIE`。
-- 进程的 `state`、`hart`、`pid`、`name`、`chan`、`killed`、`xstatus`、`ticks` 只在拿着它的锁时读写，`parent` 只在拿着 `wait_lock` 时读写；新进程拿着锁一次填好再放开（`fill` 不覆盖锁）（[docs/process.md](docs/process.md#锁)）。
+- 进程的 `state`、`hart`、`pid`、`name`、`killed`、`xstatus`、`ticks` 只在拿着它的锁时读写，`parent`、`child_exit` 只在拿着 `wait_lock` 时读写，`wait_next`、`queued` 归它排着的那个等待队列的锁；新进程拿着锁一次填好再放开（`fill` 不覆盖锁）（[docs/process.md](docs/process.md#锁)）。
 - 进程的 `TrapFrame` 总在它内核栈的最顶端（`proc.frameOf`）：`trapEntry`、`trapExit` 设 `sscratch`、`fork` 复制父进程的 `TrapFrame` 都依赖这一点。
 - 结束的进程只由父进程 `wait` 回收（`proc.reap`），父进程先结束的交给 init；init（pid 1）不能结束，结束内核就 panic（[docs/process.md](docs/process.md#结束进程)）。
 - 等待用 `proc.WaitQueue`：每个等待条件旁边放一个队列，`q.wait(lock)` 睡下、`q.wakeAll(lock)` 叫醒，`lock` 是保护等待条件和这个队列的锁（两边都要拿着它调用，会检查），醒来后在循环里重新检查条件（[docs/process.md](docs/process.md#等待队列waitqueue)）；`proc.kill` 只做标记，被杀的进程在回到 U 模式之前（`handleTrap` 末尾、`forkret`）由 `checkKilled` 结束（[docs/process.md](docs/process.md#结束进程)）。

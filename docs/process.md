@@ -743,7 +743,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 
 | 锁 | 保护什么 | 在哪 |
 | --- | --- | --- |
-| `Process.lock`（每个进程一把） | 这个进程的 `state`、`hart`、`pid`、`name`、`chan`、`killed`、`xstatus`、`ticks`；调度器拿着它切到进程，进程拿着它切回调度器 | 本文 |
+| `Process.lock`（每个进程一把） | 这个进程的 `state`、`hart`、`pid`、`name`、`killed`、`xstatus`、`ticks`；调度器拿着它切到进程，进程拿着它切回调度器 | 本文 |
 | `proc.wait_lock` | 所有进程的 `parent`；`wait` 拿着它睡在自己身上 | 本文 |
 | `timer.lock` | `timer.ticks`；`sleep` 系统调用拿着它睡在 `&ticks` 上 | [devices.md](devices.md#定时器timerzig) |
 | `page.Pool.lock`（每个 hart 一把） | 这个 hart 的空闲页链表和页数；每一页的引用数是原子变量，不用锁 | [page-allocator.md](page-allocator.md#并发) |
@@ -771,7 +771,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 规矩（`spinlock.zig` 的开头也写了）：
 
 - **拿着锁时中断必须关着**，`acquire` 检查这一点。不然中断处理程序在同一个 hart 上去拿同一把锁（比如串口中断拿 `rx_lock`），就会永远自旋。内核本来就全程关着中断，所以 `acquire` 只检查、不负责关中断（xv6 用 `push_off`/`pop_off` 计数）。
-- **切换进程时只能拿着这个进程自己的锁**（`sched` 检查 `heldCount() == 1` 且拿着的就是它），**回到 U 模式时什么锁都不能拿着**（`handleTrap` 末尾和 `forkretC` 检查 `heldCount() == 0`）。要拿着锁等待的，用 `sleep(chan, lock)`。
+- **切换进程时只能拿着这个进程自己的锁**（`sched` 检查 `heldCount() == 1` 且拿着的就是它），**回到 U 模式时什么锁都不能拿着**（`handleTrap` 末尾和 `forkretC` 检查 `heldCount() == 0`）。要拿着锁等待的，用等待队列（`WaitQueue.wait(lock)`）。
 - **加锁顺序由等级检查**：每把锁创建时给一个等级（`spinlock.Rank`），只能从低往高拿：拿一把锁时，这个 hart 已经拿着的锁的等级都必须更低，否则 `acquire` 直接 panic，说出是哪两把锁（`lock order: acquiring proc (proc) while holding wait (leaf)`，这是把 `wait_lock` 故意标成 `leaf` 实测的）。等级从低到高：
 
   | 等级 | 锁 | 为什么在这一级 |
