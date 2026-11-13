@@ -796,3 +796,5 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 进程锁在调度器和进程之间交接（调度器拿、进程放，或者反过来），但交接的两边总在同一个 hart 上：调度器切到的进程就在这个 hart 上接着运行，进程切回的也是这个 hart 的调度器。所以每个 hart 记着的“拿着哪些锁”都对得上。
 
 **页表和 TLB**：每个进程同一时刻只在一个 hart 上运行（没有线程），用户页表只在这个 hart 的 TLB 里。进程换到另一个 hart 时，调度器 `vm.activate` 会作废这个 hart 的 TLB 里的用户映射；离开时调度器切回内核页表也作废一次（内核映射带 G 位，留着，[paging.md](paging.md#切换地址空间)）。`sbrk` 缩小、`exec` 换地址空间时只刷当前 hart 的 TLB 就够了，不用跨 hart 刷（TLB shootdown）。内核页表启动后不再改，所有 hart 共用。
+
+**随机空转（`-Dlock-jitter`）**：测试时可以让 `acquire` 之前、`release` 之后随机空转一会儿，拉大竞争窗口（`spinlock.jitterSpin`，用法和效果见 [testing.md](testing.md#qemu-测试toolsqemu_testpy)）。默认关着，是编译期常量，关着时不生成代码。根文件 `main.zig` 的 `lock_jitter` 来自构建选项；单元测试、`mkfs` 的根文件没有它，`spinlock.zig` 用 `@hasDecl(@import("root"), "lock_jitter")` 判断。
