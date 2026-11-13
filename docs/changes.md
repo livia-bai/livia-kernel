@@ -2,6 +2,10 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-13 拿锁、放锁时随机空转（-Dlock-jitter）
+
+- 新增：构建选项 `-Dlock-jitter=true`：`Spinlock.acquire` 之前、`release` 之后随机空转一会儿，拉大竞争窗口，启动时打印一行说明。默认关着，关着时不生成任何代码。`qemu_test.py` 加了 `--jitter`、`--repeat N`。
+
 ## 2026-11-12 磁盘读写失败交回文件系统，不再 panic
 
 - 改动：virtio 磁盘的请求失败（状态字节不为 0）时打印出错的请求、返回 `IoError`，原来直接 panic。`bio.Device.transfer`、`flush`，`bio.load`、`read`、`write`、`flush` 都可能返回 `IoError`；写失败时缓冲区标成无效。

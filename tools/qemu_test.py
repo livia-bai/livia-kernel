@@ -37,6 +37,7 @@ TIMEBASE_HZ = 10_000_000  # QEMU virt 的 time CSR 频率
 
 # 下面这些在 Zig 里已经定义了，从 zig build 生成的 config.json 读（build.zig 的 Config），见 load_config
 QEMU = None  # QEMU 的命令行（不含 -smp、-kernel、磁盘）
+JITTER = False  # --jitter：内核用 -Dlock-jitter=true 构建（拿锁、放锁时随机空转，拉大竞争窗口）
 QEMU_DISK = None  # 接磁盘的参数，镜像的路径填进 {disk}
 GUARD_PAGE = None  # 用户地址空间里栈下面那一页保护页（src/vm.zig 的 heap_limit..stack_limit）
 USER_SPACE = None
@@ -712,7 +713,7 @@ def case_ipi(q, c, mode):
     # 单核时 wakeup 必然要等父进程的时间片用完，只检查能跑完
     out = q.command("run t_ipi")
     m = c.contains(out, r"ipi latency \(median of \d+\): kill (\d+) us, wakeup (\d+) us\n", "run t_ipi")
-    if m and q.smp >= 2:
+    if m and q.smp >= 2 and not JITTER:  # 随机空转会把延迟拉长，不检查
         kill, wakeup = int(m.group(1)), int(m.group(2))
         c.expect(kill < IPI_KILL_MAX_US, f"run t_ipi: killing a process on another hart took {kill} us")
         c.expect(wakeup < IPI_WAKEUP_MAX_US, f"run t_ipi: an idle hart took {wakeup} us to run a woken process")
@@ -1083,6 +1084,8 @@ def cases_for(files):
 
 def build(mode, prefix):
     cmd = ["zig", "build", f"-Doptimize={mode}", "-p", prefix, "-Dtest-programs=true"]
+    if JITTER:
+        cmd.append("-Dlock-jitter=true")
     r = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     # 链接器的警告会以 "error: warning(link)" 打印出来，但 zig build 仍然返回 0，所以输出必须为空
     if r.returncode != 0 or r.stdout.strip():
@@ -1199,7 +1202,7 @@ def symbolize(kernel, text):
 
 def run_mode(mode, names, smps):
     """构建一次，每个 hart 数各启动一次 QEMU。返回 [(hart 数, 名字, Checks, 构建错误, 串口日志)]。"""
-    prefix = os.path.join(ROOT, "zig-out", "qemu-test", mode)
+    prefix = os.path.join(ROOT, "zig-out", "qemu-test", mode + ("-jitter" if JITTER else ""))
     try:
         build(mode, prefix)
     except Failure as e:
@@ -1223,8 +1226,14 @@ def main():
     parser.add_argument("--all-modes", action="store_true", help="test all four optimize modes")
     parser.add_argument("--smp", action="append", type=int,
                         help=f"number of harts given to QEMU (repeatable; default: {' and '.join(map(str, DEFAULT_SMP))})")
+    parser.add_argument("--jitter", action="store_true",
+                        help="build the kernel with -Dlock-jitter=true: random spins around spinlocks widen race windows")
+    parser.add_argument("--repeat", type=int, default=1, metavar="N",
+                        help="run every mode and hart count N times (races do not show up on every run)")
     parser.add_argument("--list", action="store_true", help="list the cases and the files they cover")
     args = parser.parse_args()
+    global JITTER
+    JITTER = args.jitter
 
     if args.list:
         print(f"{'(all)':<11} {' '.join(CORE)}")
@@ -1249,23 +1258,35 @@ def main():
 
     failed = False
     for mode in modes:
-        started = time.monotonic()
-        results = run_mode(mode, names, smps)
-        for smp, name, c, error, log in results:
-            if error:
-                c.failures.append(error)
-            status = "PASS" if not c.failures else "FAIL"
-            harts = f"smp{smp}" if smp else ""
-            print(f"{status}  {mode:<5}  {harts:<5}  {name:<10}  {c.count} checks")
-            for f in c.failures:
-                print(f"    - {f}")
-            if c.failures:
-                failed = True
-                if log:
-                    print(f"    serial log: {os.path.relpath(log, ROOT)}")
-        print(f"      {mode:<5}  {time.monotonic() - started:.1f}s")
+        for round in range(args.repeat):
+            failed |= run_and_report(mode, names, smps, round)
     return 1 if failed else 0
 
+
+def run_and_report(mode, names, smps, round):
+    """跑一遍 run_mode，打印结果。返回有没有失败的。重复跑时（--repeat）失败的那一轮的串口日志另存一份，
+    不然下一轮会把它覆盖掉。"""
+    failed = False
+    started = time.monotonic()
+    results = run_mode(mode, names, smps)
+    saved = {}
+    for smp, name, c, error, log in results:
+        if error:
+            c.failures.append(error)
+        status = "PASS" if not c.failures else "FAIL"
+        harts = f"smp{smp}" if smp else ""
+        print(f"{status}  {mode:<5}  {harts:<5}  {name:<10}  {c.count} checks")
+        for f in c.failures:
+            print(f"    - {f}")
+        if c.failures:
+            failed = True
+            if log:
+                if round > 0 and log not in saved:
+                    saved[log] = f"{os.path.splitext(log)[0]}-round{round}.log"
+                    shutil.copyfile(log, saved[log])
+                print(f"    serial log: {os.path.relpath(saved.get(log, log), ROOT)}")
+    print(f"      {mode:<5}  {time.monotonic() - started:.1f}s" + (f"  (round {round + 1})" if round > 0 else ""))
+    return failed
 
 if __name__ == "__main__":
     sys.exit(main())

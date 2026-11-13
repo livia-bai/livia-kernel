@@ -47,6 +47,7 @@ python3 tools/qemu_test.py                # 全部用例，safe 模式，单核�
 python3 tools/qemu_test.py shell fork     # 只跑指定的用例
 python3 tools/qemu_test.py --all-modes    # debug、safe、fast、small 四种模式都跑
 python3 tools/qemu_test.py --smp 8        # 只用 8 个 hart 跑（可以给几个：--smp 2 --smp 8）
+python3 tools/qemu_test.py --jitter --repeat 5 --smp 4 --smp 8   # 拿锁、放锁时随机空转，每种组合跑 5 遍
 python3 tools/qemu_test.py --list         # 列出用例和它们覆盖的文件
 ```
 
@@ -89,7 +90,12 @@ FAIL  safe   smp4   sched       61 checks
     serial log: zig-out/qemu-test/safe/serial-smp4.log
 ```
 
-多核下的竞争不一定每次都出现。改了加锁、调度、进程生命周期的代码之后，最好多跑几遍、多试几种 hart 数，比如 `for i in 1 2 3 4 5; do python3 tools/qemu_test.py --mode debug --mode fast --smp 2 --smp 4 --smp 8; done`。
+多核下的竞争不一定每次都出现。改了加锁、调度、进程生命周期的代码之后，最好多跑几遍、多试几种 hart 数，再加上随机空转：`python3 tools/qemu_test.py --jitter --repeat 5 --mode debug --mode fast --smp 2 --smp 4 --smp 8`。
+
+- `--repeat N`：每种模式、每个 hart 数都跑 N 遍。失败的那一遍的串口日志另存成 `serial-smpK-roundR.log`，不会被下一遍覆盖。
+- `--jitter`：内核用 `zig build -Dlock-jitter=true` 构建（产物在 `zig-out/qemu-test/<模式>-jitter/`），启动时多打印一行 `[ok] lock jitter: ...`。`Spinlock.acquire` 拿锁之前、`release` 放锁之后，大约四次里有一次空转 0..1023 圈（伪随机数每个 hart 一份，种子来自 `time`，每次运行都不一样）。竞争类的错误常常要两个 hart 在几条指令的窗口里恰好交叉才出现，在每个加锁的地方随机停一停，交叉的方式就多得多。这时 `t_ipi` 的延迟上限不检查（空转会把延迟拉长）。
+- 效果只验证过一次，算弱证据：在 `WaitQueue.wait` 里故意先放开条件的锁、再拿进程锁（会丢唤醒），`pipe smp disk` 三个用例 4 核跑 4 遍，不加 `--jitter` 4 遍里抓到 3 遍，加了 4 遍都抓到（都是 `disk` 用例卡住）。
+- 它仍然只是让竞争更容易撞上，不能证明没有竞争；做不到可重放。
 
 内核 panic 之后停机的行为（停机后不能忙等）没有自动测试：触发内核 panic 的 shell 命令随着 shell 搬到用户态一起去掉了。内核栈溢出也没法从用户程序触发，启动日志里的 `[ok] stack overflow check: ...`（`trap.probeGuard`，[trap.md](trap.md#内核栈溢出)）每次启动都模拟一次，`check_boot` 检查它和 `80 stack guard pages unmapped`。
 

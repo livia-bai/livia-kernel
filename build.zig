@@ -60,6 +60,10 @@ pub fn build(b: *std.Build) void {
             .omit_frame_pointer = false,
         }),
     });
+    // -Dlock-jitter=true：拿锁、放锁时随机空转一会儿，拉大竞争窗口（spinlock.zig 的 jitter，qemu_test.py --jitter 用）
+    const options = b.addOptions();
+    options.addOption(bool, "lock_jitter", b.option(bool, "lock-jitter", "Spin for a random while around spinlock acquire/release to widen race windows") orelse false);
+    kernel.root_module.addOptions("build_options", options);
     kernel.setLinkerScript(b.path("linker.ld"));
     b.installArtifact(kernel);
 

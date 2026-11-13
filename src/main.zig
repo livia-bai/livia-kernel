@@ -23,6 +23,9 @@ const kstack = @import("kstack.zig");
 /// Debug 模式下的安全检查失败（整数溢出、数组越界等）都会走到这里。
 pub const panic = std.debug.FullPanic(kernelPanic);
 
+/// zig build -Dlock-jitter=true 时为 true（spinlock.zig 用 @import("root") 看它；单元测试、mkfs 的根文件没有它）。
+pub const lock_jitter = @import("build_options").lock_jitter;
+
 fn kernelPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     riscv.disableInterrupts();
     // 别的 hart 下一次输出、等锁或者调度时会看到，自己停下
@@ -189,6 +192,7 @@ fn startHarts(self: usize, ids: []const u32, timebase_hz: u64) void {
     }
     const n = started + 1;
     uart.print("[ok] {d} hart{s} running, booted on hart {d}\n", .{ n, if (n == 1) "" else "s", self });
+    if (lock_jitter) uart.print("[ok] lock jitter: random spins around spinlock acquire and release\n", .{});
 }
 
 /// 其他 hart 的初始化（kmain 的每个 hart 一份的部分），然后进入调度器。全局的东西启动 hart 都已经做好了。

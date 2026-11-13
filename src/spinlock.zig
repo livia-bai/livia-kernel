@@ -67,6 +67,7 @@ pub const Spinlock = struct {
 
     pub fn acquire(l: *Spinlock) void {
         assertInterruptsOff();
+        jitterSpin();
         if (l.holding()) std.debug.panic("acquire: lock {s} is already held by this hart", .{l.name});
         if (orderViolation(l)) |other| std.debug.panic("lock order: acquiring {s} ({s}) while holding {s} ({s})", .{
             l.name, @tagName(l.rank), other.name, @tagName(other.rank),
@@ -94,6 +95,7 @@ pub const Spinlock = struct {
         forget(l);
         // release 语义保证临界区里的访存都在放开锁之前完成
         l.locked.store(false, .release);
+        jitterSpin(); // 放开之后停一会儿，别的 hart 更可能在这时插进来
     }
 
     /// 当前 hart 是否拿着这把锁。别的 hart 拿着时，hart 字段不会等于当前 hart 的编号，
@@ -102,6 +104,29 @@ pub const Spinlock = struct {
         return l.locked.load(.monotonic) and l.hart == hart.id();
     }
 };
+
+/// 拉大竞争窗口（zig build -Dlock-jitter=true，qemu_test.py --jitter）：拿锁之前、放锁之后，大约四次里有一次
+/// 空转 0..1023 圈。竞争类的错误常常要两个 hart 在几条指令的窗口里恰好交叉才出现，多跑几遍也不一定撞上；
+/// 在每个加锁的地方随机停一停，交叉的方式就多得多。伪随机数每个 hart 一份（xorshift64），种子来自 time，
+/// 所以每次运行都不一样。只在内核里有：单元测试、mkfs 的根文件没有 lock_jitter。
+const jitter = blk: {
+    const root = @import("root");
+    break :blk @hasDecl(root, "lock_jitter") and root.lock_jitter;
+};
+var jitter_state: [hart.max]u64 = @splat(0);
+
+fn jitterSpin() void {
+    if (comptime !jitter) return;
+    const s = &jitter_state[hart.id()];
+    if (s.* == 0) s.* = (riscv.read(.time) ^ (@as(u64, hart.id()) << 32)) | 1;
+    var x = s.*;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    s.* = x;
+    if (x & 3 != 0) return;
+    for (0..(x >> 16) % 1024) |_| std.atomic.spinLoopHint();
+}
 
 /// 拿 l 会违反加锁顺序的话，返回当前 hart 拿着的、挡住它的那把锁（等级不比 l 低）。
 fn orderViolation(l: *const Spinlock) ?*Spinlock {
