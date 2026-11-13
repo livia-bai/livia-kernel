@@ -1051,8 +1051,8 @@ fn runBuiltin(b: Builtin, args: []const []const u8) u8 {
         },
         .mem => {
             const m = sys.meminfo();
-            sys.print("{d} of {d} pages free ({d} KiB), {d} KiB each\n", .{
-                m.free_pages, m.total_pages, m.free_pages * m.page_size / 1024, m.page_size / 1024,
+            sys.print("{d} of {d} pages free ({d} KiB), {d} KiB each; {d} pages of programs cached\n", .{
+                m.free_pages, m.total_pages, m.free_pages * m.page_size / 1024, m.page_size / 1024, m.cached_pages,
             });
         },
         .disk => {

@@ -939,6 +939,31 @@ def case_snap(q, c, mode):
     q.command("rm /tsnap/a /tsnap/b /tsnap")
 
 
+def kstat_counters(q):
+    out = q.command("kstat")
+    return {k: int(v) for k, v in re.findall(r"^(\w+) +(\d+)$", out, re.M)}
+
+
+def case_pagecache(q, c, mode):
+    # 程序文件的页缓存：同一个程序第二次运行，它的页都在缓存里，不读盘
+    q.command("run hello")
+    kstat_counters(q)  # kstat 自己的页也先读进缓存
+    before = kstat_counters(q)
+    exited(c, q.command("run hello"), "hello", 0)
+    after = kstat_counters(q)
+    c.expect(after.get("faults_file", 0) == before.get("faults_file", 0),
+             f"the second run of hello read {after.get('faults_file', 0) - before.get('faults_file', 0)} pages from the file")
+    c.expect(after.get("faults_cached", 0) > before.get("faults_cached", 0), "the second run of hello hit no cached page")
+    c.contains(q.command("mem"), r"; [1-9]\d* pages of programs cached\n", "mem: cached pages")
+    # 程序文件被改了（覆盖成另一个程序）：缓存作废，运行的是新的内容
+    q.command("mkdir /tpc")
+    q.command("cp /bin/hello /tpc/p")
+    c.contains(q.command("/tpc/p"), r"Hello from U-mode!", "run a copy of hello")
+    exited(c, q.command("cp /bin/echo /tpc/p"), "cp", 0)
+    c.contains(q.command("/tpc/p cached pages are gone"), r"\ncached pages are gone\n", "run the program after overwriting it")
+    q.command("rm /tpc/p /tpc")
+
+
 def case_fs(q, c, mode):
     # shell 里的文件操作：ls、重定向、cat、mkdir、cd、rm
     out = q.command("run ls /")
@@ -1076,7 +1101,7 @@ def case_kstat(q, c, mode):
     """kstat 打印的计数器：放在最后跑，前面的用例做过的事都数进去了。"""
     out = q.command("kstat")
     counters = {k: int(v) for k, v in re.findall(r"^(\w+) +(\d+)$", out, re.M)}
-    for name in ["syscalls", "context_switches", "timer_interrupts", "wakeup_calls", "faults_zero", "faults_file",
+    for name in ["syscalls", "context_switches", "timer_interrupts", "wakeup_calls", "faults_zero", "faults_file", "faults_cached",
                  "tlb_full_flushes", "tlb_user_flushes", "bio_misses", "disk_reads"]:
         c.expect(counters.get(name, 0) > 0, f"kstat: {name} should be > 0:\n{indent(out)}")
     c.expect(counters.get("processes_woken", 0) > 0, f"kstat: processes_woken should be > 0:\n{indent(out)}")
@@ -1110,6 +1135,7 @@ CASES = {
     "cow": (case_cow, ["user/tests/t_cow.zig"]),
     "demand": (case_demand, ["src/fsys.zig", "user/spin.zig", "user/tests/t_demand.zig"]),
     "snap": (case_snap, ["src/ctree.zig", "src/fs.zig", "src/fsys.zig", "src/file.zig", "user/snap.zig", "user/scrub.zig"]),
+    "pagecache": (case_pagecache, ["src/pagecache.zig", "src/fsys.zig", "user/hello.zig", "user/kstat.zig"]),
     "unlink": (case_unlink, ["src/fs.zig", "src/fsys.zig", "src/file.zig", "user/tests/t_unlink.zig"]),
     "tools": (case_tools, ["src/fsys.zig", "user/test.zig", "user/expr.zig", "user/seq.zig", "user/sleep.zig", "user/head.zig",
                            "user/tail.zig", "user/grep.zig", "user/cp.zig", "user/touch.zig", "user/tee.zig", "user/xargs.zig",

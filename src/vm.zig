@@ -34,6 +34,7 @@ const proc = @import("proc.zig");
 const fsys = @import("fsys.zig");
 const abi = @import("abi.zig");
 const kstat = @import("kstat.zig");
+const pagecache = @import("pagecache.zig");
 
 pub const user_base = abi.user_base;
 pub const user_end = abi.user_end;
@@ -568,17 +569,49 @@ pub fn fault(s: *Space, va: usize, access: Access) FaultError!void {
     }
     const r = s.regionOf(base) orelse return error.BadAddress;
     if (!allows(r.perm, access)) return error.BadAddress;
-    if (r.file_len > 0) kstat.inc(.faults_file) else kstat.inc(.faults_zero);
-    const p = try page.alloc(); // 清零的：段里文件之外的部分（.bss）、堆、栈都是 0
+    // 程序文件里的页走页缓存（pagecache.zig）：几个进程、前后几次 exec 共用一份
+    const cached = r.file_len > 0 and s.backing == .file;
+    const p = if (cached) try programPage(s.backing.file, r) else blk: {
+        if (r.file_len > 0) kstat.inc(.faults_file) else kstat.inc(.faults_zero);
+        const p = try allocPage(); // 清零的：段里文件之外的部分（.bss）、堆、栈都是 0
+        errdefer page.free(p);
+        if (r.file_len > 0) try s.backing.read(r.file_off, p[0..r.file_len]);
+        break :blk p;
+    };
     errdefer page.free(p);
-    if (r.file_len > 0) try s.backing.read(r.file_off, p[0..r.file_len]);
     var perm = r.perm;
     perm.u = true;
+    // 缓存里的页是共用的：可写的段按写时复制映射，第一次写时 breakCow 复制一份
+    const cow = cached and perm.w;
+    if (cow) perm.w = false;
     map(s.root, base, @intFromPtr(p), page.size, perm) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory, // 要新的页表，没有内存了
         error.AlreadyMapped => unreachable, // 上面看过了没有；读盘时睡着也没人会改这个地址空间
     };
+    if (cow) leafOf(s.root, base).?.cow = true;
     flushTlb(base);
+    if (cow and access == .write) return fault(s, va, access); // 这次就是写：接着复制
+}
+
+/// 程序文件 ino 里区域 r 说的那一页：在页缓存里就用缓存里的，不然分配、读进来、放进缓存。返回调用方的一个引用。
+fn programPage(ino: u64, r: Page) FaultError!*align(page.size) page.Page {
+    if (pagecache.lookup(ino, r.file_off, r.file_len)) |p| {
+        kstat.inc(.faults_cached);
+        return p;
+    }
+    kstat.inc(.faults_file);
+    const p = try allocPage(); // 清零的：文件之外的部分（.bss）是 0
+    errdefer page.free(p);
+    try fsys.readText(ino, r.file_off, p[0..r.file_len]);
+    return pagecache.insert(ino, r.file_off, r.file_len, p);
+}
+
+/// 缺页时分配一页（清零的）。没有内存了先丢掉页缓存里只有缓存还拿着的页，再试一次。
+fn allocPage() error{OutOfMemory}!*align(page.size) page.Page {
+    return page.alloc() catch {
+        if (pagecache.shrink() == 0) return error.OutOfMemory;
+        return page.alloc();
+    };
 }
 
 fn allows(perm: Perm, access: Access) bool {

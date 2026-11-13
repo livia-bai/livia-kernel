@@ -212,7 +212,7 @@ pub fn readText(ino: u64, off: u64, dst: []u8) error{IoError}!void
 | 带 `O_TRUNC` 的 `open` | 截断的是正在运行的程序文件（`syscall.openPath`） |
 | `exec` | 程序文件正在被改（上面某个操作做到一半） |
 
-改内容的地方拿着 `write_lock`，改之前 `beginModify(ino)`：有地址空间用着它就是 `TextBusy`；没有就记下 `modifying = ino`，事务提交或者作废之后 `endModify`。这期间 `hold(ino, .text)` 是 `TextBusy`。删掉、改名、加硬链接都不动内容，照常可以：删掉正在运行的程序只删名字，它变成孤儿，进程照常从它读页，结束之后才删掉。
+改内容的地方拿着 `write_lock`，改之前 `beginModify(ino)`：有地址空间用着它就是 `TextBusy`；没有就记下 `modifying = ino`、作废页缓存里它的页（[paging.md](paging.md#程序页缓存)），事务提交或者作废之后 `endModify`。这期间 `hold(ino, .text)` 是 `TextBusy`。删掉、改名、加硬链接都不动内容，照常可以：删掉正在运行的程序只删名字，它变成孤儿，进程照常从它读页，结束之后才删掉。
 
 `t_unlink`（打开着删掉、`fork` 之后共用、删掉正在运行的程序之后它才第一次读只读数据）、`t_demand`（不能改正在运行的程序）和 QEMU 测试用例 `unlink`（打开着一个删掉了的文件时掉电，下次挂载删掉孤儿）、`tools`（`cp` 覆盖是 `TextBusy`，`rm` 一个正在运行的 `spin` 的副本可以、它接着运行）检查了这些（[testing.md](testing.md#回归测试程序)）。
 

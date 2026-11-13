@@ -120,7 +120,7 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 11 | `getppid` | 无 | 父进程的 pid；init 是 0 | |
 | 12 | `setfg` | `a0` = pid，0 表示没有 | 0；`-ESRCH` | 设置前台进程：按 Ctrl-C 时内核杀掉它（[process.md](process.md#ctrl-c)） |
 | 13 | `procinfo` | `a0` = `ProcInfo` 数组的地址，`a1` = 数组长度 n | 进程总数（可能大于 n）；`-EFAULT` | 按槽位顺序写最多 n 个进程的信息。n = 0 时只返回总数。名字超过 16 字节时截断。每个槽位单独拿锁读一次（`proc.info`），不是同一瞬间的快照：别的 hart 上的进程可能正在 `fork`、结束 |
-| 14 | `meminfo` | `a0` = `MemInfo` 的地址 | 0；`-EFAULT` | 空闲页数、总页数、页大小 |
+| 14 | `meminfo` | `a0` = `MemInfo` 的地址 | 0；`-EFAULT` | 空闲页数（包括页缓存里随时可以丢掉的页，[paging.md](paging.md#程序页缓存)）、总页数、页大小、页缓存里的页数 |
 | 15 | （去掉了） | | `-ENOSYS` | 原来是 `listprog`（列出嵌在内核里的程序）。程序搬进 `/bin` 之后用 `readdir` 列目录 |
 | 16 | `shutdown` | 无 | 不返回 | 通过 SBI 关机 |
 | 17 | `close` | `a0` = fd | 0；`-EBADF` | 关掉 fd。是这个文件的最后一个引用的话，真正关掉它（[files.md](files.md)） |

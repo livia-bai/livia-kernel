@@ -14,6 +14,7 @@ const uart = @import("uart.zig");
 const timer = @import("timer.zig");
 const vm = @import("vm.zig");
 const page = @import("page.zig");
+const pagecache = @import("pagecache.zig");
 const sbi = @import("sbi.zig");
 const proc = @import("proc.zig");
 const file = @import("file.zig");
@@ -656,7 +657,8 @@ const handlers = struct {
     }
 
     pub fn meminfo(ptr: usize) !void {
-        try copyOut(ptr, &abi.MemInfo{ .free_pages = page.freePages(), .total_pages = page.total_pages, .page_size = page.size });
+        const c = pagecache.counts();
+        try copyOut(ptr, &abi.MemInfo{ .free_pages = page.freePages() + c.reclaimable, .total_pages = page.total_pages, .page_size = page.size, .cached_pages = c.cached });
     }
 
     /// 内核的计数器和栈的高水位（kstat.zig、kstack.deepest）。

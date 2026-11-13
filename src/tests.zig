@@ -21,4 +21,5 @@ test {
     _ = @import("kstack.zig");
     _ = @import("kstat.zig");
     _ = @import("loader.zig");
+    _ = @import("pagecache.zig");
 }

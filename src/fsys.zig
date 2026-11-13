@@ -22,6 +22,7 @@ const fs = @import("fs.zig");
 const ctree = @import("ctree.zig");
 const bio = @import("bio.zig");
 const uart = @import("uart.zig");
+const pagecache = @import("pagecache.zig");
 const Sleeplock = @import("sleeplock.zig").Sleeplock;
 const Spinlock = @import("spinlock.zig").Spinlock;
 
@@ -280,6 +281,7 @@ pub fn release(ino: u64, use: Use) void {
     if (!reap) return;
     const w = writer() catch return;
     defer unlock();
+    pagecache.invalidate(ino);
     w.run(Fs.reapOrphan, .{ino}) catch |err| uart.print("[warn] fs: could not remove orphan inode {d}: {s}\n", .{ ino, @errorName(err) });
 }
 
@@ -288,23 +290,31 @@ pub fn release(ino: u64, use: Use) void {
 /// 事务后来作废了也没关系：orphan 记早了，到时候 reapOrphan 发现没有孤儿条目，什么都不做。
 fn keepInUse(ino: u64) bool {
     std.debug.assert(write_lock.holding());
-    use_lock.acquire();
-    defer use_lock.release();
-    if (userOf(ino)) |u| {
-        u.orphan = true;
-        return true;
+    {
+        use_lock.acquire();
+        defer use_lock.release();
+        if (userOf(ino)) |u| {
+            u.orphan = true;
+            return true;
+        }
+        removing = ino;
     }
-    removing = ino;
+    pagecache.invalidate(ino); // 放开 use_lock 之后：两把都是叶子锁
     return false;
 }
 
 /// 要改 inode ino 的内容之前调用（拿着 write_lock）。有进程在运行它就是 TextBusy。成功之后改完要 endModify。
 pub fn beginModify(ino: u64) error{TextBusy}!void {
     std.debug.assert(write_lock.holding());
-    use_lock.acquire();
-    defer use_lock.release();
-    if (userOf(ino)) |u| if (u.texts > 0) return error.TextBusy;
-    modifying = ino;
+    {
+        use_lock.acquire();
+        defer use_lock.release();
+        if (userOf(ino)) |u| if (u.texts > 0) return error.TextBusy;
+        modifying = ino;
+    }
+    // 缓存的程序页要过时了。没有地址空间用着它（上面查过了），modifying 挡着新的 exec，所以没人映射着这些页。
+    // 放开 use_lock 之后再作废：两把都是叶子锁
+    pagecache.invalidate(ino);
 }
 
 /// 改内容、删除的事务做完了（提交了或者作废了）：清掉 modifying、removing。unlink、rename 之后也要调用。

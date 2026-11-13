@@ -413,9 +413,12 @@ pub const ProcInfo = extern struct {
 
 /// meminfo 返回的物理内存使用情况。
 pub const MemInfo = extern struct {
+    /// 空闲的页，加上页缓存里随时可以丢掉的页（只有缓存还拿着的）
     free_pages: u64,
     total_pages: u64,
     page_size: u64,
+    /// 程序文件的页缓存里的页（包括正在被映射着的）
+    cached_pages: u64,
 };
 
 /// scrub 返回的统计。
@@ -458,6 +461,8 @@ pub const Counters = extern struct {
     /// 缺页（U 模式的和内核替用户访问的）：分配清零的页、从程序文件读进来的页、写时复制
     faults_zero: u64 = 0,
     faults_file: u64 = 0,
+    /// 程序文件的页在页缓存里，不用读盘（vm.fault、pagecache.zig）
+    faults_cached: u64 = 0,
     faults_cow: u64 = 0,
     /// 整个 TLB 的刷新（sfence.vma zero, zero，只在启动时每个 hart 一次）
     tlb_full_flushes: u64 = 0,

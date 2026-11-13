@@ -315,7 +315,7 @@ fn replaceFd(target: sys.Fd, path: []const u8, flags: sys.OpenFlags, saved: ?*[2
 | `cd [DIR]` | 换 shell 的当前目录（`chdir`），之后启动的程序继承它；不给 `DIR` 时回到 `/`；`cd -` 回到上一个目录并打印它。出错时打印 `cd: DIR: NotFound`（或 `NotDir`、`SymlinkLoop`） | |
 | `pwd` | 当前目录的绝对路径（`getcwd`）。经过符号链接 `cd` 进来的，是真实的路径（没有 bash 的“逻辑路径”） | `/bin` |
 | `uptime` | 开机时长（`uptime` 系统调用） | `up 3.26s` |
-| `mem` | 物理页的使用情况（`meminfo`，[page-allocator.md](page-allocator.md)） | `31600 of 31676 pages free (126400 KiB), 4 KiB each` |
+| `mem` | 物理页的使用情况（`meminfo`，[page-allocator.md](page-allocator.md)） | `31492 of 31528 pages free (125968 KiB), 4 KiB each; 13 pages of programs cached`（空闲的页包括页缓存里没人映射着、随时可以丢掉的页） |
 | `disk` | 磁盘的原始区域（文件系统之后的块）有多大（`blockcount`，[disk.md](disk.md#系统调用)）；没有磁盘时打印 `no disk` | `1024 blocks of 4 KiB (4 MiB)` |
 | `ps` | 列出进程（`procinfo`）：pid、父进程、状态、用掉的 CPU 时间（毫秒）、名字 | 见下文 |
 | `jobs` | 这个 shell 的还没结束的子进程（后台进程），从 `procinfo` 里按父进程挑出来 | `[19] running  spin` |
