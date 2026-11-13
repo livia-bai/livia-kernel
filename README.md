@@ -34,7 +34,7 @@ SBI: OpenSBI, spec v1.0 | hart 0 | device tree at 0x87e00000
 [ok] file system: 6422 of 7168 blocks free, generation 59
 Type 'help' for commands.
 > run
-programs: cat cp echo expr fault grep head hello init kstat ln ls mkdir mv rm scrub seq sh sleep spin tail tee test ticker touch wc xargs
+programs: cat cp echo expr fault grep head hello init kstat ln ls mkdir mv rm scrub seq sh sleep snap spin tail tee test ticker touch wc xargs
 > run hello
 Hello from U-mode! I am pid 3, the kernel has been up for 130 ms.
 write() refused a kernel pointer: BadAddress
@@ -122,7 +122,7 @@ shell 是用户程序（`user/sh.zig`），由 init 启动。
 | `disk` | 磁盘的原始区域（文件系统之后的块）有多大 |
 | `cd [DIR]`、`cd -` | 换当前目录，不给时回到 `/`，`-` 回到上一个目录 |
 | `pwd` | 当前目录的绝对路径 |
-| `NAME [ARGS...]` 或 `run NAME [ARGS...]` | 用 `fork` + `exec` 运行用户程序 `NAME`（`hello`、`fault`、`spin`、`ticker`、`echo`、`cat`、`wc`、`ls`、`mkdir`、`rm`、`mv`、`ln`、`scrub`、`kstat`（内核的计数器）、`sh`，写脚本用的见下表），带上参数，等它结束，Ctrl-C 结束它；只写 `run` 时列出所有程序 |
+| `NAME [ARGS...]` 或 `run NAME [ARGS...]` | 用 `fork` + `exec` 运行用户程序 `NAME`（`hello`、`fault`、`spin`、`ticker`、`echo`、`cat`、`wc`、`ls`、`mkdir`、`rm`、`mv`、`ln`、`scrub`、`kstat`（内核的计数器）、`snap`（文件系统的快照：`snap`、`snap ls`、`snap rm ID`，快照在 `/.snap/ID/` 下只读）、`sh`，写脚本用的见下表），带上参数，等它结束，Ctrl-C 结束它；只写 `run` 时列出所有程序 |
 | `A \| B \| ...` | 管道：A 的输出接到 B 的输入，最多 8 个程序；Ctrl-C 结束整条管道 |
 | `... > F`、`... >> F`、`... < F` | 标准输出写进文件 `F`（没有就建，有就清空）、追加到 `F` 末尾、标准输入从 `F` 读 |
 | `... &` | 在后台运行，马上回到提示符（`$!` 是它的 pid） |

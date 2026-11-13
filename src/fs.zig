@@ -494,6 +494,16 @@ pub const Fs = struct {
         }
     }
 
+    /// 把已提交的文件系统保存成一个快照（ctree.Volume.createSnap），返回它的编号（事务号）。事务里第一个操作。
+    pub fn snapshot(fs: *Fs) Error!u64 {
+        return fs.vol.createSnap();
+    }
+
+    /// 删掉编号为 generation 的快照（提交之后它独占的块空出来）。
+    pub fn deleteSnapshot(fs: *Fs, generation: u64) Error!void {
+        return fs.vol.deleteSnap(generation);
+    }
+
     /// 删掉孤儿 ino（用它的人都放开了）。没有它的孤儿条目（删名字的事务作废了、已经删过了）就什么都不做。
     pub fn reapOrphan(fs: *Fs, ino: u64) Error!void {
         const key = Key.init(0, type_orphan, ino);

@@ -316,6 +316,24 @@ scrub: tree of 30 nodes, 1068 items, height 2; 6149 of 7168 blocks free, generat
 [proc] pid 494 (scrub) exited with code 0
 ```
 
+### snap
+
+`snap`（`user/snap.zig`）管理文件系统的快照（[fs.md](fs.md#保存的快照)）：不带参数时存一个，打印编号；`snap ls` 一行一个列出编号；`snap rm ID...` 删掉，有文件打开着它时打印 `snap: ID: Busy`，以 1 结束。快照里的文件在 `/.snap/编号/` 下，只读：
+
+```
+> echo before > /tsnap/a
+> run snap
+snapshot 116: /.snap/116/
+> echo after > /tsnap/a
+> cat /.snap/116/tsnap/a
+before
+> echo x > /.snap/116/tsnap/a
+sh: /.snap/116/tsnap/a: ReadOnly
+> run snap rm 116
+```
+
+（`[proc] ... exited` 的行略去了。）
+
 ### kstat
 
 `kstat`（`user/kstat.zig`）调用 `kstat` 系统调用，打印内核的计数器和栈的高水位。计数器的名字就是 `abi.Counters` 的字段名，程序对字段做 `inline for` 逐个打印，内核加了计数器这里不用改。下面是跑完全部 QEMU 测试（safe、4 核）时的输出：

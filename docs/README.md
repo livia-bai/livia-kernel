@@ -53,7 +53,7 @@ livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 
 | [user-programs.md](user-programs.md) | 用户程序：运行时（`start.zig`、`sys.zig`）、示例程序、写脚本用的程序（`test`、`expr`、`xargs`……）、怎么写新程序 |
 | [process.md](process.md) | 进程：进程表、ELF 加载器、按需分页、`userinit`/`fork`/`exec`、命令行参数、`sbrk`、xv6 式调度（每个 hart 的 `scheduler`、`sched`、等待队列 `WaitQueue`）、核间中断、切换上下文、`exit`/`wait`/`kill`、Ctrl-C、锁和加锁顺序 |
 | [disk.md](disk.md) | 磁盘：virtio 块设备驱动、睡眠锁、缓冲区缓存、读写块的系统调用 |
-| [btree.md](btree.md) | 写时复制 B 树（文件系统的基础，类似 btrfs）：节点格式、写时复制、事务和提交、空闲空间、掉电测试 |
+| [btree.md](btree.md) | 写时复制 B 树（文件系统的基础，类似 btrfs）：节点格式、写时复制、事务和提交、空闲空间、保存的快照、掉电测试 |
 | [fs.md](fs.md) | 文件系统：inode、目录、文件内容（内联、数据块、洞、校验和），每个操作一个事务，接进内核（挂载、锁、系统调用、当前目录），`mkfs`，掉电测试 |
 | [files.md](files.md) | 文件：fd 表、文件表、串口、管道和文件系统里的文件的读写 |
 | [syscalls.md](syscalls.md) | 系统调用：调用约定、调用列表、访问用户内存、怎么加新调用 |
@@ -106,6 +106,7 @@ livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 
 | `user/echo.zig`、`user/cat.zig`、`user/wc.zig` | [user-programs.md](user-programs.md#echocatwc) | [shell.md](shell.md#管道) |
 | `user/ls.zig`、`user/mkdir.zig`、`user/rm.zig`、`user/mv.zig`、`user/ln.zig` | [user-programs.md](user-programs.md#lsmkdirrmmvln) | [fs.md](fs.md) |
 | `user/kstat.zig` | [user-programs.md](user-programs.md#kstat) | [syscalls.md](syscalls.md#调用列表) |
+| `user/snap.zig` | [user-programs.md](user-programs.md#snap) | [fs.md](fs.md#保存的快照) |
 | `user/scrub.zig` | [user-programs.md](user-programs.md#scrub) | [fs.md](fs.md#检查整个文件系统checkscrub) |
 | `user/test.zig`、`user/expr.zig`、`user/seq.zig`、`user/sleep.zig`、`user/head.zig`、`user/tail.zig`、`user/grep.zig`、`user/cp.zig`、`user/touch.zig`、`user/tee.zig`、`user/xargs.zig` | [user-programs.md](user-programs.md#写脚本用的程序) | [shell.md](shell.md) |
 | `user/tests/*.zig`、`user/tests/noperm.ld` | [testing.md](testing.md#回归测试程序) | [build.md](build.md#用户程序) |

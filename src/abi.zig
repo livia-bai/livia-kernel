@@ -106,6 +106,13 @@ pub const Syscall = enum(usize) {
     lstat = 38,
     /// kstat(ptr) 把内核的计数器和栈的高水位（KStat）写进用户内存，返回 0
     kstat = 39,
+    /// snapshot() 把文件系统现在（最后一次提交）的样子保存成一个快照，返回它的编号（那次提交的事务号）。
+    /// 之后在 /.snap/编号/路径 下只读地看得到它的内容。最多 4 个（ENOSPC）
+    snapshot = 40,
+    /// snaplist(ptr, n) 把保存的快照的编号写进用户内存的 u64 数组（最多 n 个），返回一共有几个
+    snaplist = 41,
+    /// snapdel(id) 删掉编号为 id 的快照，它独占的块空出来。有打开着的文件在读它时是 EBUSY
+    snapdel = 42,
     _,
 };
 
@@ -174,6 +181,9 @@ pub const params = .{
     .getcwd = .{.bytes},
     .lstat = .{ .bytes, .ptr },
     .kstat = .{.ptr},
+    .snapshot = .{},
+    .snaplist = .{.array},
+    .snapdel = .{.int},
 };
 
 /// 系统调用 name 的参数，按 Param。
@@ -324,6 +334,10 @@ pub const Errno = enum(usize) {
     spipe = 29,
     /// 文件正在被运行，不能改、不能删（write、截断、unlink、rename 换掉它）；或者正在被改，不能运行（exec）
     txtbsy = 26,
+    /// 还有人在用（snapdel 一个有文件打开着的快照）
+    busy = 16,
+    /// 只读的文件系统（写保存的快照里的文件）
+    rofs = 30,
     /// 没有这个系统调用
     nosys = 38,
     _,
@@ -498,6 +512,8 @@ const error_names = .{
     .nfile = error.TooManyFiles,
     .mfile = error.TooManyOpenFiles,
     .txtbsy = error.TextBusy,
+    .busy = error.Busy,
+    .rofs = error.ReadOnly,
     .fbig = error.FileTooBig,
     .nospc = error.NoSpace,
     .spipe = error.NotSeekable,

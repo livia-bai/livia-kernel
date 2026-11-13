@@ -63,13 +63,14 @@ pub fn init() void {
     uart.print("[ok] file system: {d} of {d} blocks free, generation {d}\n", .{ vol.free_count, vol.blocks, vol.generation });
 }
 
-/// 读者：一个快照上的只读 Fs。用完调用 end。
+/// 读者：一个快照上的只读 Fs。用完调用 end。在保存的快照（snap）上读的 snap 是 null：它的块在删掉它之前都不会释放，
+/// 不用登记成读者。
 pub const Reader = struct {
     fs: Fs,
-    snap: ctree.Snapshot,
+    snap: ?ctree.Snapshot,
 
     pub fn end(r: *Reader) void {
-        vol.endRead(r.snap);
+        if (r.snap) |s| vol.endRead(s);
     }
 };
 
@@ -89,6 +90,98 @@ pub fn writer() error{NoDevice}!*Fs {
 
 pub fn unlock() void {
     write_lock.release();
+}
+
+// ---- 保存的快照（snap）----
+//
+// 快照的块在删掉它之前都不会释放、不会改写（ctree.Volume.createSnap），所以在它上面读不用登记成读者，
+// 只要读的期间没人删掉它：打开快照里的文件时 openSnap 占住这个快照，最后一个 fd 关掉时 releaseSnap；
+// 有人占着时 deleteSnap 是 Busy。快照的列表只有修改的一方改（拿着 write_lock），所以 openSnap 也拿 write_lock 查。
+
+/// 打开着的、快照里的文件记着它是哪个快照、根在哪（file.Inode.snap）
+pub const SnapRef = struct { generation: u64, root: ctree.Root };
+
+/// 保护 snap_users。叶子锁
+var snap_lock: Spinlock = .init("fs snaps", .leaf);
+/// 每个保存的快照被几个打开的文件占着
+var snap_users: [ctree.max_snaps]struct { generation: u64 = 0, users: u32 = 0 } = @splat(.{});
+
+/// 保存一个快照，返回它的编号。
+pub fn createSnap() (fs.Error || error{NoDevice})!u64 {
+    const w = try writer();
+    defer unlock();
+    return w.run(Fs.snapshot, .{});
+}
+
+/// 删掉快照 generation：有打开着的文件在读它是 Busy。
+pub fn deleteSnap(generation: u64) (fs.Error || error{ NoDevice, Busy })!void {
+    const w = try writer();
+    defer unlock();
+    {
+        snap_lock.acquire();
+        defer snap_lock.release();
+        for (snap_users) |u| if (u.users > 0 and u.generation == generation) return error.Busy;
+    }
+    try w.run(Fs.deleteSnapshot, .{generation});
+}
+
+/// 保存的快照的编号写进 out，返回一共有几个。
+pub fn listSnaps(out: []u64) error{NoDevice}!usize {
+    _ = try writer();
+    defer unlock();
+    var n: usize = 0;
+    for (vol.snaps) |x| if (x) |sn| {
+        if (n < out.len) out[n] = sn.generation;
+        n += 1;
+    };
+    return n;
+}
+
+/// 占住快照 generation（打开它里面的文件），返回它的根。没有这个快照是 NotFound。
+pub fn openSnap(generation: u64) error{ NoDevice, NotFound }!SnapRef {
+    _ = try writer();
+    defer unlock();
+    const snap_root = vol.snapRoot(generation) orelse return error.NotFound;
+    snap_lock.acquire();
+    defer snap_lock.release();
+    const u = for (&snap_users) |*u| {
+        if (u.users > 0 and u.generation == generation) break u;
+    } else for (&snap_users) |*u| {
+        if (u.users == 0) break u;
+    } else unreachable; // 快照最多 max_snaps 个，每个最多占一项
+    u.generation = generation;
+    u.users += 1;
+    return .{ .generation = generation, .root = snap_root };
+}
+
+pub fn releaseSnap(generation: u64) void {
+    snap_lock.acquire();
+    defer snap_lock.release();
+    for (&snap_users) |*u| if (u.users > 0 and u.generation == generation) {
+        u.users -= 1;
+        return;
+    };
+    std.debug.panic("fsys: snapshot {d} is not in use", .{generation});
+}
+
+/// 在保存的快照上读（调用方占着它）。
+pub fn snapReader(s: SnapRef) Reader {
+    return .{ .fs = .{ .vol = &vol, .next_ino = 0, .view = s.root }, .snap = null };
+}
+
+/// 读打开的文件用的读者：快照里的文件在那个快照上读，别的拿一个最新的快照。
+pub fn readerFor(s: ?SnapRef) error{NoDevice}!Reader {
+    return if (s) |x| snapReader(x) else reader();
+}
+
+/// 路径是 /.snap/编号 或者 /.snap/编号/... 的话，返回编号和剩下的部分（以 / 开头，或者是空的）。
+pub fn snapPath(path: []const u8) ?struct { generation: u64, rest: []const u8 } {
+    const prefix = "/.snap/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const tail = path[prefix.len..];
+    const end = std.mem.indexOfScalar(u8, tail, '/') orelse tail.len;
+    const g = std.fmt.parseInt(u64, tail[0..end], 10) catch return null;
+    return .{ .generation = g, .rest = tail[end..] };
 }
 
 /// fs.read 的 out：写进内核内存。

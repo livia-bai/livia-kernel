@@ -149,6 +149,8 @@ const aliases = .{
     .NotWritable = .badf,
     // exec
     .NoSuchProgram = .noent,
+    // 保存的快照满了
+    .TooManySnapshots = .nospc,
 };
 
 /// fd 对应的打开的文件，fd 超出范围或者没有打开时返回 null。
@@ -214,6 +216,27 @@ fn openPath(root: *Fs, cwd: u64, path: []const u8, flags: usize, writable: bool)
     }
     return st;
 }
+
+/// 只读地按路径找东西（lstat、readlink）：/.snap/编号/... 在那个快照上从根目录找（占住它），别的在最新的快照上从当前目录找。
+const PathReader = struct {
+    r: fsys.Reader,
+    cwd: u64,
+    path: []const u8,
+    snap: ?u64,
+
+    fn init(path: []const u8) !PathReader {
+        if (fsys.snapPath(path)) |sp| {
+            const s = try fsys.openSnap(sp.generation);
+            return .{ .r = fsys.snapReader(s), .cwd = fs.root_ino, .path = if (sp.rest.len == 0) "/" else sp.rest, .snap = sp.generation };
+        }
+        return .{ .r = try fsys.reader(), .cwd = proc.current().?.cwd, .path = path, .snap = null };
+    }
+
+    fn end(p: *PathReader) void {
+        p.r.end();
+        if (p.snap) |g| fsys.releaseSnap(g);
+    }
+};
 
 // ---- 每个系统调用 ----
 
@@ -322,6 +345,7 @@ const handlers = struct {
         const writable = access != abi.open_read;
         var buf: [abi.max_path]u8 = undefined;
         const path = try userPath(path_arg, &buf);
+        if (fsys.snapPath(path)) |sp| return openInSnap(sp.generation, sp.rest, flags, writable);
         const cwd = proc.current().?.cwd;
         // 可能要建文件、截断的才拿写锁，只是打开已有的文件在快照上找
         const modifies = flags & abi.open_create != 0 or (flags & abi.open_trunc != 0 and writable);
@@ -352,11 +376,43 @@ const handlers = struct {
         const f = (if (st.kind == .device)
             file.openDevice(st.ino, @fromBackingInt(st.major), readable, writable)
         else
-            file.openInode(st.ino, readable, writable, flags & abi.open_append != 0)) catch |err| {
+            file.openInode(st.ino, readable, writable, flags & abi.open_append != 0, null)) catch |err| {
             fsys.release(st.ino, .open);
             return err;
         };
         return installFd(f);
+    }
+
+    /// 打开保存的快照 generation 里的 rest（/.snap/编号/...）：只读。占住这个快照，File 接过这份占用。
+    fn openInSnap(generation: u64, rest: []const u8, flags: usize, writable: bool) !usize {
+        if (writable or flags & (abi.open_create | abi.open_trunc | abi.open_append) != 0) return error.ReadOnly;
+        const s = try fsys.openSnap(generation);
+        const f = blk: {
+            errdefer fsys.releaseSnap(generation);
+            var r = fsys.snapReader(s);
+            const ino = try r.fs.resolve(fs.root_ino, if (rest.len == 0) "/" else rest);
+            if ((try r.fs.stat(ino)).kind == .device) return error.ReadOnly; // 设备文件只在当前的文件系统里打开
+            break :blk try file.openInode(ino, true, false, false, s);
+        };
+        return installFd(f);
+    }
+
+    /// 把文件系统现在（最后一次提交）的样子保存成快照，返回编号。
+    pub fn snapshot() !u64 {
+        return fsys.createSnap();
+    }
+
+    /// 保存的快照的编号写进用户的 u64 数组，返回一共有几个。
+    pub fn snaplist(out: UserSlice) !usize {
+        var ids: [@import("ctree.zig").max_snaps]u64 = undefined;
+        const n = try fsys.listSnaps(&ids);
+        const m = @min(n, out.len, ids.len);
+        try vm.copyToUser(space(), out.ptr, std.mem.sliceAsBytes(ids[0..m]));
+        return n;
+    }
+
+    pub fn snapdel(generation: u64) !void {
+        try fsys.deleteSnap(generation);
     }
 
     pub fn mkdir(path_arg: UserSlice) !void {
@@ -439,9 +495,10 @@ const handlers = struct {
     pub fn readlink(path_arg: UserSlice, out: UserSlice) !usize {
         var buf: [abi.max_path]u8 = undefined;
         const path = try userPath(path_arg, &buf);
-        var r = try fsys.reader();
-        defer r.end();
-        const ino = try r.fs.resolveNoFollow(proc.current().?.cwd, path);
+        var at = try PathReader.init(path);
+        defer at.end();
+        const ino = try at.r.fs.resolveNoFollow(at.cwd, at.path);
+        const r = &at.r;
         var target: [fs.max_symlink]u8 = undefined;
         const t = try r.fs.readlink(ino, &target);
         const n = @min(t.len, out.len);
@@ -467,10 +524,10 @@ const handlers = struct {
     pub fn lstat(path_arg: UserSlice, ptr: usize) !void {
         var buf: [abi.max_path]u8 = undefined;
         const path = try userPath(path_arg, &buf);
-        var r = try fsys.reader();
-        defer r.end();
-        const ino = try r.fs.resolveNoFollow(proc.current().?.cwd, path);
-        try copyOut(ptr, &abiStat(try r.fs.stat(ino)));
+        var at = try PathReader.init(path);
+        defer at.end();
+        const ino = try at.r.fs.resolveNoFollow(at.cwd, at.path);
+        try copyOut(ptr, &abiStat(try at.r.fs.stat(ino)));
     }
 
     pub fn lseek(f: *file.File, offset: i64, whence: usize) !u64 {
@@ -480,7 +537,10 @@ const handlers = struct {
     pub fn fstat(f: *file.File, ptr: usize) !void {
         var st: abi.Stat = .{ .ino = 0, .size = 0, .kind = if (f.open.target == .pipe) .pipe else .console };
         if (file.inodeOf(f)) |ino| {
-            var r = try fsys.reader();
+            var r = try fsys.readerFor(switch (f.open.target) {
+                .inode => |i| i.snap,
+                else => null,
+            });
             defer r.end();
             st = abiStat(try r.fs.stat(ino));
         }
@@ -497,7 +557,7 @@ const handlers = struct {
         const dst = try vm.pinDst(space(), ptr, @sizeOf(abi.Dirent));
         f.pos_lock.acquire();
         defer f.pos_lock.release();
-        var r = try fsys.reader();
+        var r = try fsys.readerFor(dir.snap);
         defer r.end();
         var ent: abi.Dirent = undefined;
         const d = try r.fs.readdir(dir.ino, dir.off, &ent.name) orelse return false;

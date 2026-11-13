@@ -185,7 +185,7 @@ def case_shell(q, c, mode):
     c.contains(q.command("uptime"), r"up \d+\.\d\ds\n", "uptime")
     c.contains(q.command("nope"), r"unknown command: nope", "unknown command")
     # /bin 里的程序按名字排序（测试程序 t_* 也在里面）
-    c.contains(q.command("run"), r"programs: cat cp echo expr fault grep head hello init kstat ln ls mkdir mv rm scrub seq sh sleep spin"
+    c.contains(q.command("run"), r"programs: cat cp echo expr fault grep head hello init kstat ln ls mkdir mv rm scrub seq sh sleep snap spin"
                r"( t_\w+)+ tail tee test ticker touch wc xargs\n", "run without a name")
     c.contains(q.command("run nope"), r"no such program: nope\nprograms: ", "run nope")
     # 不写 run，直接写程序名；管道、重定向照样能用。不是内置命令也不是程序的才是 unknown command
@@ -893,6 +893,52 @@ def check_orphan_reboot(q, c):
     reboot(q, c, "orphan2", after)
 
 
+def free_blocks(q, c, what):
+    """run scrub，检查通过，返回空闲块数。"""
+    out = q.command("run scrub")
+    scrub_ok(c, out, what)
+    m = c.contains(out, r"; (\d+) of \d+ blocks free", what)
+    return int(m.group(1)) if m else None
+
+
+def case_snap(q, c, mode):
+    # 保存的快照：保存之后改、删文件，快照里还是原来的样子；只读；有文件打开着时不能删；删掉之后块都空出来
+    q.command("mkdir /tsnap")
+    q.command("echo before > /tsnap/a")
+    q.command("cp /bin/hello /tsnap/big")
+    out = q.command("run snap")
+    m = c.contains(out, r"snapshot (\d+): /\.snap/(\d+)/\n", "run snap")
+    if not m:
+        return
+    g = m.group(1)
+    c.contains(q.command("run snap ls"), rf"\n{g}\n", "snap ls")
+    q.command("echo after > /tsnap/a")
+    q.command("echo new > /tsnap/b")
+    exited(c, q.command("rm /tsnap/big"), "rm", 0)
+    c.contains(q.command("cat /tsnap/a"), r"\nafter\n", "cat the current file")
+    c.contains(q.command(f"cat /.snap/{g}/tsnap/a"), r"\nbefore\n", "cat the file in the snapshot")
+    out = q.command(f"ls /.snap/{g}/tsnap")
+    c.expect(re.search(r" 7 a\n", out) and re.search(r" big\n", out) and not re.search(r" b\n", out),
+             f"ls the snapshot: expected a and big, not b:\n{indent(out)}")
+    wc_snap = no_proc_lines(q.command(f"wc < /.snap/{g}/tsnap/big")).split("\n")[1:]
+    wc_bin = no_proc_lines(q.command("wc < /bin/hello")).split("\n")[1:]
+    c.expect(wc_snap == wc_bin and len(wc_snap) > 1, f"a removed file in the snapshot: wc {wc_snap} vs {wc_bin}")
+    c.contains(q.command(f"echo x > /.snap/{g}/tsnap/a"), r"ReadOnly", "writing to the snapshot")
+    c.contains(q.command("cat /.snap/99999/tsnap/a"), r"NotFound", "a snapshot that does not exist")
+    with_snap = free_blocks(q, c, "scrub with a snapshot")
+    # 有文件打开着（后台的 sleep 的标准输入）时不能删
+    q.command(f"run sleep 1 < /.snap/{g}/tsnap/a &")
+    c.contains(q.command(f"run snap rm {g}"), rf"snap: {g}: Busy\n", "snap rm while a file is open")
+    time.sleep(1.5)
+    exited(c, q.command(f"run snap rm {g}"), "snap", 0)
+    c.expect(q.command("run snap ls").count("\n") <= 3, "snap ls after rm")
+    without = free_blocks(q, c, "scrub after snap rm")
+    if with_snap is not None and without is not None:
+        c.expect(without > with_snap, f"snap rm freed nothing: {with_snap} free blocks before, {without} after")
+    c.contains(q.command(f"cat /.snap/{g}/tsnap/a"), r"NotFound", "cat a removed snapshot")
+    q.command("rm /tsnap/a /tsnap/b /tsnap")
+
+
 def case_fs(q, c, mode):
     # shell 里的文件操作：ls、重定向、cat、mkdir、cd、rm
     out = q.command("run ls /")
@@ -1063,6 +1109,7 @@ CASES = {
     "sbrk": (case_sbrk, ["user/tests/t_sbrk.zig"]),
     "cow": (case_cow, ["user/tests/t_cow.zig"]),
     "demand": (case_demand, ["src/fsys.zig", "user/spin.zig", "user/tests/t_demand.zig"]),
+    "snap": (case_snap, ["src/ctree.zig", "src/fs.zig", "src/fsys.zig", "src/file.zig", "user/snap.zig", "user/scrub.zig"]),
     "unlink": (case_unlink, ["src/fs.zig", "src/fsys.zig", "src/file.zig", "user/tests/t_unlink.zig"]),
     "tools": (case_tools, ["src/fsys.zig", "user/test.zig", "user/expr.zig", "user/seq.zig", "user/sleep.zig", "user/head.zig",
                            "user/tail.zig", "user/grep.zig", "user/cp.zig", "user/touch.zig", "user/tee.zig", "user/xargs.zig",

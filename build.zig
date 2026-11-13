@@ -88,6 +88,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "sleep" }, .{ .name = "head" },  .{ .name = "tail" },
         .{ .name = "grep" },  .{ .name = "cp" },    .{ .name = "touch" },
         .{ .name = "tee" },   .{ .name = "xargs" }, .{ .name = "kstat" },
+        .{ .name = "snap" },
     };
     const test_programs = [_]UserProgram{
         .{ .name = "t_sys", .dir = "user/tests" },

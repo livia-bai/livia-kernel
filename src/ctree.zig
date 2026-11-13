@@ -39,7 +39,7 @@ const Ptr = btree.Ptr;
 pub const block_size = btree.block_size;
 /// 磁盘格式的版本：B 树（btree.zig、这里）或者文件系统（fs.zig 的条目）的格式改了就换一个。
 /// 0002：fs.Inode 多了链接数和设备号（硬链接、设备文件）；0003：inode 多了一种 symlink（符号链接）
-pub const magic = "LBFS0004".*;
+pub const magic = "LBFS0005".*;
 /// 最多管多大的磁盘：位图是静态的，65536 块（256 MiB）的位图是 8 KiB
 pub const max_blocks = 65536;
 /// 树最多几层。4 KiB 的节点一层最多 101 个指针，8 层远远用不完；单元测试里扇出只有 5，会长到 5、6 层
@@ -60,6 +60,8 @@ pub const Error = error{
     NotFormatted,
     /// 磁盘比 max_blocks 大
     DiskTooLarge,
+    /// 保存的快照已经有 max_snaps 个了
+    TooManySnapshots,
     NoDevice,
     OutOfRange,
     /// 磁盘读写失败（bio.IoError）。提交到一半失败之后，这个卷不再接受修改，也是它（见 broken）
@@ -77,6 +79,27 @@ pub const Super = extern struct {
     root_generation: u64,
     root_level: u8,
     _pad2: [7]u8 = @splat(0),
+    /// 保存下来的快照（Volume.snaps），generation 为 0 的槽位空着
+    snaps: [max_snaps]SnapSlot = @splat(.{}),
+};
+
+/// 最多保存几个快照
+pub const max_snaps = 4;
+
+/// 超级块里的一个快照槽位：快照是哪个事务号的已提交的树，它的根。
+pub const SnapSlot = extern struct {
+    generation: u64 = 0,
+    root: u64 = 0,
+    root_generation: u64 = 0,
+    root_level: u8 = 0,
+    _pad: [7]u8 = @splat(0),
+};
+
+/// 保存下来的一个快照（snap）：某个事务提交之后的整棵树，删掉之前它的块都不释放、不改写，随时能在它上面读。
+/// 和读者拿的 Snapshot 不一样：那个只在一次读的期间有效，不写进超级块。
+pub const Snap = struct {
+    generation: u64,
+    root: Root,
 };
 
 pub const Root = struct {
@@ -136,6 +159,12 @@ pub const Volume = struct {
     /// 当前事务开始以来改过东西没有（没改的话 commit 不写超级块，abort 不用重走树）。
     /// 分配、释放块（alloc、free）和换根的地方都要设它：改根之前总要先分配一个块，或者像 collapseRoot 那样自己设
     dirty: bool = false,
+    /// 保存下来的快照（空槽位是 null）。当前事务里的样子；committed_snaps 是已提交的（作废事务时退回它）。
+    /// 修改的一方读写；读者要在快照上读时，由调用方（fsys）拿着写锁取出根
+    snaps: [max_snaps]?Snap = @splat(null),
+    committed_snaps: [max_snaps]?Snap = @splat(null),
+    /// 这个事务删了快照：提交之后重走一遍树，只有那个快照用着的块才空出来
+    rescan_after_commit: bool = false,
     /// 提交到一半时读写失败了（写超级块、或者它之后的 flush）：不知道盘上的超级块指向旧树还是新树，
     /// 两棵树的块都不能再分配、改写，所以之后的修改（reserve、alloc、commit）都返回 IoError，直到重新挂载。
     /// 读者照常在已提交的树上读。作废事务时重走树失败了也这样（位图算到一半）
@@ -204,14 +233,24 @@ pub const Volume = struct {
         v.committed = .{ .blockno = s.root, .generation = s.root_generation, .level = s.root_level };
         v.transid = s.generation + 1;
         v.root = v.committed;
+        for (&v.snaps, s.snaps) |*x, slot| {
+            x.* = if (slot.generation == 0) null else .{
+                .generation = slot.generation,
+                .root = .{ .blockno = slot.root, .generation = slot.root_generation, .level = slot.root_level },
+            };
+            if (slot.generation > s.generation or slot.root_level >= max_levels) return error.Corrupt;
+        }
+        v.committed_snaps = v.snaps;
+        v.rescan_after_commit = false;
         try v.rescan();
     }
 
-    /// 根据当前的根重新算用着的块（挂载、作废事务时）。limbo 里的块可能还有读者在读，也算用着的。
+    /// 根据当前的根和保存的快照重新算用着的块（挂载、作废事务、删掉快照之后）。limbo 里的块可能还有读者在读，也算用着的。
     fn rescan(v: *Volume) Error!void {
         v.pending.clear();
         v.seen.clear();
-        try v.walk(v.root, null, null, null);
+        try v.walk(v.root, null, null, null, false);
+        try v.walkSnaps();
         for (&v.used.masks, &v.seen.masks, &v.limbo.masks) |*u, *x, *l| u.* = x.* | l.*;
         for (0..super_blocks) |i| v.used.set(i);
         v.free_count = v.blocks - v.used.count();
@@ -238,6 +277,10 @@ pub const Volume = struct {
             return err;
         };
         errdefer v.broken = true;
+        var slots: [max_snaps]SnapSlot = @splat(.{});
+        for (&slots, v.snaps) |*slot, x| if (x) |sn| {
+            slot.* = .{ .generation = sn.generation, .root = sn.root.blockno, .root_generation = sn.root.generation, .root_level = sn.root.level };
+        };
         try writeSuper(.{
             .csum = 0,
             .magic = magic,
@@ -246,6 +289,7 @@ pub const Volume = struct {
             .root = v.root.blockno,
             .root_generation = v.root.generation,
             .root_level = v.root.level,
+            .snaps = slots,
         });
         try bio.flush();
         v.snap_lock.acquire();
@@ -267,7 +311,13 @@ pub const Volume = struct {
         v.pending.clear();
         v.transid += 1;
         v.dirty = false;
+        v.committed_snaps = v.snaps;
         v.reclaim();
+        if (v.rescan_after_commit) {
+            v.rescan_after_commit = false;
+            // 删掉的快照独占的块：只有重走一遍才知道是哪些。读盘失败的话位图不变，这些块留到下次挂载
+            v.rescan() catch {};
+        }
     }
 
     // ---- 快照：读者 ----
@@ -324,6 +374,8 @@ pub const Volume = struct {
         if (!v.dirty) return kstat.inc(.fs_clean_aborts);
         kstat.inc(.fs_aborts);
         v.root = v.committed;
+        v.snaps = v.committed_snaps;
+        v.rescan_after_commit = false;
         errdefer v.broken = true;
         try v.rescan();
     }
@@ -356,9 +408,53 @@ pub const Volume = struct {
             // 这个事务里才分配的，已提交的树没用它
             v.used.unset(blockno);
             v.free_count += 1;
+        } else if (generation <= v.newestSnap()) {
+            // 保存快照的时候它就在已提交的树里（它一直在当前的树里，现在才被释放），快照还指着它：不释放。
+            // 删掉快照时重走一遍树（rescan），没有别的快照用着的话才空出来
         } else {
             v.pending.set(blockno);
         }
+    }
+
+    /// 最新的快照的事务号，没有快照是 0。
+    fn newestSnap(v: *const Volume) u64 {
+        var g: u64 = 0;
+        for (v.snaps) |x| if (x) |sn| {
+            g = @max(g, sn.generation);
+        };
+        return g;
+    }
+
+    /// 把已提交的树保存成一个快照（这个事务里改之前的样子），返回它的事务号。最多 max_snaps 个（TooManySnapshots）；
+    /// 已提交的树已经保存过了是 Exists。要在事务开头、改任何东西之前调用（之后释放块时才知道哪些要留给它）。
+    pub fn createSnap(v: *Volume) Error!u64 {
+        if (v.broken) return error.IoError;
+        std.debug.assert(!v.dirty);
+        for (v.snaps) |x| if (x) |sn| if (sn.generation == v.generation) return error.Exists;
+        for (&v.snaps) |*x| if (x.* == null) {
+            x.* = .{ .generation = v.generation, .root = v.committed };
+            v.dirty = true;
+            return v.generation;
+        };
+        return error.TooManySnapshots;
+    }
+
+    /// 删掉事务号为 generation 的快照（没有是 NotFound）。提交之后重走一遍树，它独占的块才空出来。
+    pub fn deleteSnap(v: *Volume, generation: u64) Error!void {
+        if (v.broken) return error.IoError;
+        for (&v.snaps) |*x| if (x.*) |sn| if (sn.generation == generation) {
+            x.* = null;
+            v.dirty = true;
+            v.rescan_after_commit = true;
+            return;
+        };
+        return error.NotFound;
+    }
+
+    /// 事务号为 generation 的快照的根（读快照用，调用方保证这期间没人删它）。
+    pub fn snapRoot(v: *const Volume, generation: u64) ?Root {
+        for (v.snaps) |x| if (x) |sn| if (sn.generation == generation) return sn.root;
+        return null;
     }
 
     /// 保证接下来的操作分配 n 个块不会失败。算上 limbo 才够的话，等旧树的读者读完。
@@ -753,8 +849,10 @@ pub const Volume = struct {
 
     /// 从 r 往下走一遍：每个节点读一次（验校验和、块号、事务号、层数），记进 seen（同一块被引用两次是 Corrupt），
     /// 检查键的顺序和上下界（每个节点的键都在 [lo, hi) 里）。stats 不为 null 时顺便数节点和条目。
-    fn walk(v: *Volume, r: Root, lo: ?Key, hi: ?Key, stats: ?*Stats) Error!void {
-        if (r.blockno >= v.blocks or v.seen.isSet(r.blockno)) return error.Corrupt;
+    /// shared 为 true 时走的是保存的快照：遇到已经走过的块（和当前的树、别的快照共用的）就不再往下走。
+    fn walk(v: *Volume, r: Root, lo: ?Key, hi: ?Key, stats: ?*Stats, shared: bool) Error!void {
+        if (r.blockno >= v.blocks) return error.Corrupt;
+        if (v.seen.isSet(r.blockno)) return if (shared) {} else error.Corrupt;
         v.seen.set(r.blockno);
         const b = try v.readNode(r.blockno, r.generation, r.level);
         defer bio.release(b);
@@ -769,9 +867,10 @@ pub const Volume = struct {
                 if (it.offset + it.size != end or it.size > btree.max_data) return error.Corrupt;
                 if (v.data_refs) |refs| {
                     if (refs(it.key, n.itemData(i))) |d| {
-                        if (d.blockno < super_blocks or d.blockno >= v.blocks or v.seen.isSet(d.blockno) or
-                            d.generation > v.transid) return error.Corrupt;
-                        v.seen.set(d.blockno);
+                        if (d.blockno < super_blocks or d.blockno >= v.blocks or d.generation > v.transid) return error.Corrupt;
+                        if (v.seen.isSet(d.blockno)) {
+                            if (!shared) return error.Corrupt;
+                        } else v.seen.set(d.blockno);
                     }
                 }
                 end = it.offset;
@@ -792,18 +891,26 @@ pub const Volume = struct {
             }
             const child_lo = if (i == 0) lo else ptr.key;
             const child_hi = if (i + 1 < ps.len) ps[i + 1].key else hi;
-            try v.walk(.{ .blockno = ptr.blockno, .generation = ptr.generation, .level = r.level - 1 }, child_lo, child_hi, stats);
+            try v.walk(.{ .blockno = ptr.blockno, .generation = ptr.generation, .level = r.level - 1 }, child_lo, child_hi, stats, shared);
         }
+    }
+
+    /// 把保存的快照的块也记进 seen（和当前的树共用的块不重复走）。
+    fn walkSnaps(v: *Volume) Error!void {
+        for (v.snaps) |x| if (x) |sn| try v.walk(sn.root, null, null, null, true);
     }
 
     /// 检查当前的树：结构、校验和，以及位图：用着的块正好是树的块、超级块、等着释放的块（pending、limbo）。
     pub fn check(v: *Volume) Error!Stats {
         var stats: Stats = .{ .height = v.height() };
         v.seen.clear();
-        try v.walk(v.root, null, null, &stats);
+        try v.walk(v.root, null, null, &stats, false);
         for (0..super_blocks) |i| v.seen.set(i);
         // 当前的树不能用着等释放的块：那些块属于已提交的树，提交之前不能分配出去
         for (&v.seen.masks, &v.pending.masks, &v.limbo.masks) |*x, *p, *l| if (x.* & (p.* | l.*) != 0 or p.* & l.* != 0) return error.Corrupt;
+        // 快照的块也不能在 pending、limbo 里：快照之前就有的块不会被释放，快照之后释放的块快照没用
+        try v.walkSnaps();
+        for (&v.seen.masks, &v.pending.masks, &v.limbo.masks) |*x, *p, *l| if (x.* & (p.* | l.*) != 0) return error.Corrupt;
         for (&v.seen.masks, &v.pending.masks, &v.limbo.masks) |*x, *p, *l| x.* |= p.* | l.*;
         if (!std.mem.eql(u64, &v.seen.masks, &v.used.masks) or v.free_count != v.blocks - v.used.count() or
             v.limbo_count != v.limbo.count()) return error.Corrupt;
@@ -1342,7 +1449,13 @@ const CrashRun = struct {
         test_torn = torn;
         var prng = std.Random.DefaultPrng.init(5);
         const rng = prng.random();
-        for (0..txns) |_| {
+        for (0..txns) |t| {
+            // 时不时在事务开头保存一个快照、删掉最早的快照
+            if (t % 6 == 2) _ = v.createSnap() catch |err| switch (err) {
+                error.TooManySnapshots, error.Exists => {},
+                else => return err,
+            };
+            if (t % 6 == 5) if (oldestSnap(v)) |g| try v.deleteSnap(g);
             for (0..ops) |_| {
                 randomOp(v, &model, rng, 40) catch |err| {
                     if (test_crashed) return; // 掉电之后读到的东西是乱的，出什么错都不奇怪
@@ -1363,6 +1476,19 @@ const CrashRun = struct {
     }
 };
 
+fn oldestSnap(v: *const Volume) ?u64 {
+    var g: ?u64 = null;
+    for (v.snaps) |x| if (x) |sn| {
+        g = if (g) |o| @min(o, sn.generation) else sn.generation;
+    };
+    return g;
+}
+
+/// 保存的快照的内容都是它那个事务号提交之后的样子。
+fn expectSnaps(v: *Volume, models: []const Model) !void {
+    for (v.snaps) |x| if (x) |sn| try expectContentsAt(v, sn.root, &models[sn.generation - 1]);
+}
+
 fn crashAt(budget: usize, torn: usize) !void {
     var r: CrashRun = .{};
     defer r.deinit();
@@ -1377,6 +1503,7 @@ fn crashAt(budget: usize, torn: usize) !void {
     _ = try v.check();
     try std.testing.expect(v.generation >= r.completed and v.generation <= r.snapshots.items.len);
     try expectContents(v, &r.snapshots.items[v.generation - 1]);
+    try expectSnaps(v, r.snapshots.items);
     // 挂载之后还能接着用
     var prng = std.Random.DefaultPrng.init(budget);
     var model = try r.snapshots.items[v.generation - 1].clone();
@@ -1512,4 +1639,59 @@ test "读写失败：在每一次读、写、flush 时失败，事务作废或�
         }
     }
     try std.testing.expect(broken > 0); // 有些落在了提交的中间
+}
+
+test "保存的快照：之后改、删都不影响它，它的块不释放、不改写；删掉之后块空出来；重新挂载后还在" {
+    try testSetup(512);
+    defer testFree();
+    const v = &test_vol;
+    var model: Model = .{};
+    defer model.deinit();
+    var prng = std.Random.DefaultPrng.init(3);
+    const rng = prng.random();
+    for (0..60) |_| try randomOp(v, &model, rng, 50);
+    try v.commit();
+    const free_before = v.free_count;
+    var saved = try model.clone();
+    defer saved.deinit();
+    const g = try v.createSnap();
+    try std.testing.expectEqual(v.generation, g);
+    try v.commit();
+    // 改很多、删很多：快照里还是原来的样子，check 认得共用的块
+    for (0..200) |_| {
+        try randomOp(v, &model, rng, 50);
+        if (rng.uintLessThan(u8, 8) == 0) try v.commit();
+    }
+    try v.commit();
+    _ = try v.check();
+    try expectContents(v, &model);
+    try expectContentsAt(v, v.snapRoot(g).?, &saved);
+    try std.testing.expect(v.free_count < free_before);
+    // 重新挂载：快照还在
+    testReboot();
+    try v.mount();
+    _ = try v.check();
+    try expectContentsAt(v, v.snapRoot(g).?, &saved);
+    // 存满了是 TooManySnapshots；作废的事务里删掉的快照还在
+    for (1..max_snaps) |_| {
+        try randomOp(v, &model, rng, 50);
+        try v.commit();
+        _ = try v.createSnap();
+        try v.commit();
+    }
+    try std.testing.expectError(error.TooManySnapshots, v.createSnap());
+    try v.deleteSnap(g);
+    try v.abort();
+    try std.testing.expect(v.snapRoot(g) != null);
+    try std.testing.expectError(error.NotFound, v.deleteSnap(12345));
+    try v.abort();
+    // 都删掉：提交之后重走一遍树，块都空出来；当前的树不变
+    for (v.snaps) |x| if (x) |sn| try v.deleteSnap(sn.generation);
+    try v.commit();
+    _ = try v.check();
+    try expectContents(v, &model);
+    for (0..400) |_| randomOp(v, &model, rng, 50) catch |err| if (err != error.NoSpace) return err;
+    try v.commit();
+    _ = try v.check();
+    try expectContents(v, &model);
 }

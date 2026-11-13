@@ -29,6 +29,7 @@ pub const Syscall = enum(usize) {
     open = 24, mkdir = 25, unlink = 26, chdir = 27, fstat = 28, readdir = 29,
     scrub = 30, rename = 31, lseek = 32, link = 33, mknod = 34,
     symlink = 35, readlink = 36, getcwd = 37, lstat = 38, kstat = 39,
+    snapshot = 40, snaplist = 41, snapdel = 42,
     _,
 };
 pub const Major = enum(u16) { console = 1, null = 2, zero = 3, _ };   // 设备文件的设备号
@@ -39,6 +40,8 @@ pub const Errno = enum(usize) {
     srch = 3,     // ESRCH：没有这个进程（kill、setfg）
     nxio = 6,     // ENXIO：打开的设备文件的设备号内核不认识（open）
     mlink = 31,   // EMLINK：链接数到上限了（link）
+    busy = 16,    // EBUSY：删一个有文件打开着的快照（snapdel）
+    rofs = 30,    // EROFS：写保存的快照里的文件（open）
     io = 5,       // EIO：磁盘上的数据不对（校验和、结构）
     nodev = 19,   // ENODEV：没有磁盘，或者磁盘上没有文件系统
     exist = 17,   // EEXIST：已经有这个名字了（mkdir；open 带 O_CREATE 时不算错）
@@ -104,7 +107,7 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 号 | 调用 | 参数 | 返回 | 说明 |
 | --- | --- | --- | --- | --- |
 | 0 | `exit` | `a0` = 退出码 | 不返回 | 只取低 8 位（`@truncate` 成 `u8`）。打印 `[proc] pid N (NAME) exited with code C`，变成 zombie 等父进程回收（[process.md](process.md#结束进程)） |
-| 1 | `write` | `a0` = fd，`a1` = 用户缓冲区地址，`a2` = 长度 | 写出的字节数；`-EBADF`、`-EFAULT`、`-EPIPE`；文件：`-ENOSPC`、`-EFBIG`、`-EIO`、`-ENOENT`（文件被删了）、`-ETXTBSY`（文件是正在运行的程序） | 写进串口、管道或文件，详见下文 |
+| 1 | `write` | `a0` = fd，`a1` = 用户缓冲区地址，`a2` = 长度 | 写出的字节数；`-EBADF`、`-EFAULT`、`-EPIPE`；文件：`-ENOSPC`、`-EFBIG`、`-EIO`、`-ETXTBSY`（文件是正在运行的程序） | 写进串口、管道或文件，详见下文 |
 | 2 | `getpid` | 无 | 进程号 | 每创建一个进程加 1，不复用。init 是 1，shell 是 2 |
 | 3 | `uptime` | 无 | 开机以来的毫秒数 | `timer.uptimeMs()`：直接读 `time` CSR 换算 |
 | 4 | `yield` | 无 | 0 | 让出 CPU：回到调度器，别的 runnable 进程先运行，轮到它时返回。没有别的 runnable 进程时很快就会返回 |
@@ -127,9 +130,9 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 21 | `blockcount` | 无 | 磁盘的原始区域（文件系统之后的块）有多少块，没有磁盘时是 0 | 每块 `abi.block_size` = 4096 字节（[disk.md](disk.md#系统调用)） |
 | 22 | `readblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`（块号超出原始区域）、`-ENODEV`、`-EFAULT`、`-EIO`（设备报错） | 经过缓冲区缓存读原始区域的一块，4096 字节写进缓冲区 |
 | 23 | `writeblock` | `a0` = 块号，`a1` = 缓冲区地址 | 0；`-EINVAL`、`-ENODEV`、`-EFAULT`、`-EIO` | 缓冲区的 4096 字节写到原始区域的这一块，写完才返回 |
-| 24 | `open` | `a0` = 路径地址，`a1` = 路径长度，`a2` = flags | 新的 fd；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-EEXIST`、`-ENAMETOOLONG`、`-EINVAL`、`-ELOOP`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT`、`-ENFILE`、`-EMFILE`、`-ENXIO`（不认识的设备）、`-ETXTBSY`（截断正在运行的程序文件） | 打开文件、目录或设备文件（[fs.md](fs.md#接进内核fsyszig)，设备见 [files.md](files.md#设备文件)）。flags：`open_read`/`open_write`/`open_rdwr` 加上 `open_create`（没有就建一个空文件）、`open_trunc`（可写时截成 0 字节）、`open_append`（0x800，每次写都写在末尾）；别的位、读写方式是 3 都是 `-EINVAL`。目录只能只读地打开。相对路径从当前目录开始。跟着符号链接走；带 `open_create` 时最后一段是悬空的符号链接的话，建的是它指向的文件 |
+| 24 | `open` | `a0` = 路径地址，`a1` = 路径长度，`a2` = flags | 新的 fd；`-ENOENT`、`-ENOTDIR`、`-EISDIR`、`-EEXIST`、`-ENAMETOOLONG`、`-EINVAL`、`-ELOOP`、`-ENOSPC`、`-EIO`、`-ENODEV`、`-EFAULT`、`-ENFILE`、`-EMFILE`、`-ENXIO`（不认识的设备）、`-ETXTBSY`（截断正在运行的程序文件）、`-EROFS`（写方式打开快照里的文件） | 打开文件、目录或设备文件（[fs.md](fs.md#接进内核fsyszig)，设备见 [files.md](files.md#设备文件)）。flags：`open_read`/`open_write`/`open_rdwr` 加上 `open_create`（没有就建一个空文件）、`open_trunc`（可写时截成 0 字节）、`open_append`（0x800，每次写都写在末尾）；别的位、读写方式是 3 都是 `-EINVAL`。目录只能只读地打开。相对路径从当前目录开始。跟着符号链接走；带 `open_create` 时最后一段是悬空的符号链接的话，建的是它指向的文件 |
 | 25 | `mkdir` | `a0` = 路径地址，`a1` = 路径长度 | 0；`-EEXIST`、`-ENOENT`、`-ENOTDIR`、`-EINVAL`、`-ENAMETOOLONG`、`-ENOSPC` 等 | 建一个空目录 |
-| 26 | `unlink` | 同上 | 0；`-ENOENT`、`-ENOTEMPTY`、`-EINVAL` 等。删掉还有人用着（打开着、正在运行）的文件的最后一个名字只删名字，最后一个使用者放开时才删内容（[fs.md](fs.md#删掉还有人用着的文件)） | 删掉一个名字（文件、设备文件或空目录）。是最后一个名字的话文件也删掉，打开着它的 fd 之后读写是 `-ENOENT` |
+| 26 | `unlink` | 同上 | 0；`-ENOENT`、`-ENOTEMPTY`、`-EINVAL` 等。删掉还有人用着（打开着、正在运行）的文件的最后一个名字只删名字，最后一个使用者放开时才删内容（[fs.md](fs.md#删掉还有人用着的文件)） | 删掉一个名字（文件、设备文件或空目录）。是最后一个名字、又没人用着的话文件也删掉 |
 | 27 | `chdir` | 同上 | 0；`-ENOENT`、`-ENOTDIR` 等 | 换当前目录（`Process.cwd`，`fork` 继承） |
 | 28 | `fstat` | `a0` = fd，`a1` = `Stat` 的地址 | 0；`-EBADF`、`-EFAULT`、`-ENOENT` | inode 号、长度、种类、设备号、链接数。串口、管道的 inode 号、长度、链接数是 0 |
 | 29 | `readdir` | `a0` = fd，`a1` = `Dirent` 的地址 | 1；列完了是 0；`-EBADF`、`-ENOTDIR`、`-EFAULT` | 目录的下一项（不含 `.`、`..`），按名字的散列排序。读写位置就是 `fs.readdir` 的 cookie，结果写进用户内存成功了才往后挪 |
@@ -143,6 +146,9 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 37 | `getcwd` | `a0` = 缓冲区地址，`a1` = 缓冲区长度 | 路径的长度；`-ERANGE`（放不下）、`-ENOENT`（当前目录被删掉了）、`-EIO`、`-ENODEV`、`-EFAULT` | 当前目录的绝对路径，不以 0 结尾。是真实的位置：经过符号链接 `chdir` 进来的，得到的是目标目录的路径（[fs.md](fs.md#当前目录的路径getcwd)） |
 | 38 | `lstat` | `a0`、`a1` = 路径的地址、长度，`a2` = `Stat` 的地址 | 0；`-ENOENT`、`-ENOTDIR`、`-ELOOP`、`-ENAMETOOLONG`、`-EIO`、`-ENODEV`、`-EFAULT` | 路径自己的 `Stat`，最后一段是符号链接时不跟着走（种类 `symlink`，长度是目标的长度）。不用打开文件，所以内核不认识的设备文件也查得到 |
 | 39 | `kstat` | `a0` = `KStat` 的地址 | 0；`-EFAULT` | 内核的计数器（`abi.Counters`：系统调用、上下文切换、`wakeup`、缺页、TLB 刷新、缓冲区缓存、磁盘请求、文件系统的提交和作废……，开机以来所有 hart 加起来）和各种内核栈用到过的最深处（[process.md](process.md#进程表)）。用户程序 `kstat` 把它们打印出来 |
+| 40 | `snapshot` | 无 | 快照的编号（事务号）；`-ENOSPC`（已经有 4 个）、`-EIO`、`-ENODEV` | 把文件系统最后一次提交的样子存成一个快照，之后在 `/.snap/编号/` 下只读地看得到（[fs.md](fs.md#保存的快照)） |
+| 41 | `snaplist` | `a0`、`a1` = `u64` 数组的地址、元素个数 | 一共有几个快照；`-EFAULT`、`-ENODEV` | 快照的编号写进数组（最多 `a1` 个） |
+| 42 | `snapdel` | `a0` = 编号 | 0；`-ENOENT`、`-EBUSY`（有文件打开着它）、`-EIO`、`-ENODEV` | 删掉一个快照，它独占的块空出来 |
 | 其他 | | | `-ENOSYS` | |
 
 ### 分发

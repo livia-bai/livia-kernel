@@ -65,6 +65,8 @@ pub const Inode = struct {
     off: u64 = 0,
     /// open_append：每次写之前先把 off 挪到文件末尾
     append: bool = false,
+    /// 保存的快照里的文件（/.snap/编号/...）：在那个快照上读，只读；null 是当前的文件系统
+    snap: ?fsys.SnapRef = null,
 };
 
 /// 内核认识的设备（abi.Major 里有名字的那几个）。openDevice 把设备号换成它，之后读写时不会碰到不认识的设备号
@@ -111,8 +113,9 @@ pub fn openPipe() error{ TooManyFiles, OutOfMemory }![2]*File {
 }
 
 /// 打开文件系统里的 inode ino，读写位置从 0 开始。
-pub fn openInode(ino: u64, readable: bool, writable: bool, append: bool) error{TooManyFiles}!*File {
-    return alloc(.{ .readable = readable, .writable = writable, .target = .{ .inode = .{ .ino = ino, .append = append } } });
+pub fn openInode(ino: u64, readable: bool, writable: bool, append: bool, snap: ?fsys.SnapRef) error{TooManyFiles}!*File {
+    std.debug.assert(snap == null or !writable);
+    return alloc(.{ .readable = readable, .writable = writable, .target = .{ .inode = .{ .ino = ino, .append = append, .snap = snap } } });
 }
 
 /// 打开文件系统里的设备文件 ino（设备号 major）。内核没有这个设备是 NoSuchDevice。
@@ -151,7 +154,7 @@ pub fn close(f: *File) void {
     // 放开 inode 时它要是名字都删掉了，这时才删掉它（要读写磁盘，所以调用方不能拿着锁）
     switch (open.target) {
         .pipe => |p| pipe.close(p, open.writable),
-        .inode => |i| fsys.release(i.ino, .open),
+        .inode => |i| if (i.snap) |s| fsys.releaseSnap(s.generation) else fsys.release(i.ino, .open),
         .device => |d| fsys.release(d.ino, .open),
         .console => {},
     }
@@ -249,7 +252,7 @@ fn consoleWrite(src: vm.PinnedSrc) Error!usize {
 fn inodeRead(f: *File, i: *Inode, dst: vm.PinnedDst) Error!usize {
     f.pos_lock.acquire();
     defer f.pos_lock.release();
-    var r = try fsys.reader();
+    var r = try fsys.readerFor(i.snap);
     defer r.end();
     const n = try r.fs.read(i.ino, i.off, dst.len, dst);
     i.off += n;
@@ -284,7 +287,7 @@ pub fn seek(f: *File, offset: i64, whence: usize) Error!u64 {
     f.pos_lock.acquire();
     defer f.pos_lock.release();
     const st = blk: {
-        var r = try fsys.reader();
+        var r = try fsys.readerFor(i.snap);
         defer r.end();
         break :blk try r.fs.stat(i.ino);
     };

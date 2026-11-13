@@ -18,7 +18,7 @@
 - 根目录的 inode 号是 1。新 inode 号是树里最大的 `objectid` + 1：挂载时用 `Volume.lastKey()` 算出来，之后递增，不重用。
 - `Inode.nlink` 是有几个目录项指着它（[硬链接](#硬链接和设备文件)）：文件、设备文件可以有几个名字，目录总是 1。链接数是 0 的只有孤儿：名字都删掉了、还有人打开着或者正在运行它（[删掉还有人用着的文件](#删掉还有人用着的文件)）。
 - `Inode.parent` 是所在的目录，只对目录有意义（`..` 和 `check` 用它）；文件可能有几个名字，它的 `parent` 只是建它（或者最后一次 `rename` 挪进去）的那个目录。
-- 所有结构体都是 `extern struct`，内核和主机上看到的布局一样。格式改了要换 `ctree.magic`：加链接数、设备号时从 `LBFS0001` 换成了 `LBFS0002`（新字段放在原来 `Inode` 的填充字节里，大小还是 24 字节，但旧镜像里那里是 0，链接数 0 会被 `check` 当成坏的）；加符号链接时换成了 `LBFS0003`（多了一种 inode，旧的内核读到它会当成坏的）；加孤儿条目时换成了 `LBFS0004`（多了一种条目、链接数可以是 0）。旧镜像不升级：`zig build` 每次都重新生成磁盘镜像。
+- 所有结构体都是 `extern struct`，内核和主机上看到的布局一样。格式改了要换 `ctree.magic`：加链接数、设备号时从 `LBFS0001` 换成了 `LBFS0002`（新字段放在原来 `Inode` 的填充字节里，大小还是 24 字节，但旧镜像里那里是 0，链接数 0 会被 `check` 当成坏的）；加符号链接时换成了 `LBFS0003`（多了一种 inode，旧的内核读到它会当成坏的）；加孤儿条目时换成了 `LBFS0004`（多了一种条目、链接数可以是 0）；超级块里加保存的快照时换成了 `LBFS0005`。旧镜像不升级：`zig build` 每次都重新生成磁盘镜像。
 
 ## 目录
 
@@ -167,6 +167,7 @@ pub fn readText(ino: u64, off: u64, dst: []u8) error{IoError}!void
 | `mknod(path, major)` | `mknod`；`major` 是 0 或者超过 `u16` 是 `EINVAL` |
 | `lseek(fd, offset, whence)` | 改 `File.off`，`seek_end` 要先 `stat`（[files.md](files.md#文件表)） |
 | `scrub` | 先作废缓存，再 `check` 整个文件系统（[检查](#检查整个文件系统checkscrub)） |
+| `snapshot`、`snaplist`、`snapdel` | 存一个快照、列出、删掉（[保存的快照](#保存的快照)）；`open`、`lstat`、`readlink` 认 `/.snap/编号/路径` |
 | `exec` | 在 `/bin`（或给的路径）里找程序，占住它（`hold(ino, .text)`），在一个新的快照上读 ELF 的文件头和程序头；段的内容等缺页时再读（`readText`，[process.md](process.md#按需分页)） |
 
 路径先复制进内核栈上的缓冲区（最长 `abi.max_path` = 256 字节，长了是 `ENAMETOOLONG`）。错误码：`SymlinkLoop` → `ELOOP`，`NotSymlink` → `EINVAL`，`NotFound` → `ENOENT`，`Exists` → `EEXIST`，`NotDir` → `ENOTDIR`，`IsDir` → `EISDIR`，`NotEmpty` → `ENOTEMPTY`，`NameTooLong` → `ENAMETOOLONG`，`InvalidName` → `EINVAL`，`NoSpace` → `ENOSPC`，`FileTooBig` → `EFBIG`，`BadAddress` → `EFAULT`，`Corrupt` 等磁盘上的东西不对、`IoError`（磁盘读写失败，[btree.md](btree.md#事务和提交)） → `EIO`。
@@ -214,6 +215,26 @@ pub fn readText(ino: u64, off: u64, dst: []u8) error{IoError}!void
 改内容的地方拿着 `write_lock`，改之前 `beginModify(ino)`：有地址空间用着它就是 `TextBusy`；没有就记下 `modifying = ino`，事务提交或者作废之后 `endModify`。这期间 `hold(ino, .text)` 是 `TextBusy`。删掉、改名、加硬链接都不动内容，照常可以：删掉正在运行的程序只删名字，它变成孤儿，进程照常从它读页，结束之后才删掉。
 
 `t_unlink`（打开着删掉、`fork` 之后共用、删掉正在运行的程序之后它才第一次读只读数据）、`t_demand`（不能改正在运行的程序）和 QEMU 测试用例 `unlink`（打开着一个删掉了的文件时掉电，下次挂载删掉孤儿）、`tools`（`cp` 覆盖是 `TextBusy`，`rm` 一个正在运行的 `spin` 的副本可以、它接着运行）检查了这些（[testing.md](testing.md#回归测试程序)）。
+
+## 保存的快照
+
+`snap` 程序（`snapshot` 系统调用）把文件系统最后一次提交的样子存下来，返回一个编号（就是那次提交的事务号）；之后在 `/.snap/编号/` 下只读地看得到当时的所有文件：
+
+```
+> echo before > /a
+> snap
+snapshot 116: /.snap/116/
+> echo after > /a
+> cat /.snap/116/a
+before
+> snap rm 116
+```
+
+- **存、删都是一个事务**：`Fs.snapshot`、`Fs.deleteSnapshot` 只是调 `ctree.Volume.createSnap`、`deleteSnap`（[btree.md](btree.md#保存的快照snap)）：存的时候不复制任何块，之后改文件时快照还指着的块不释放；删掉之后重走一遍树，块才空出来。最多 4 个（`ENOSPC`）。
+- **`/.snap/编号/路径`**：只有 `open`、`lstat`、`readlink` 认这种路径（`fsys.snapPath`），在快照的根上（`Fs{ .view = 快照的根 }`，`fsys.snapReader`）从根目录开始找，路径里的符号链接也在快照里解析。打开的文件记着是哪个快照（`file.Inode.snap`），之后的 `read`、`fstat`、`lseek`、`readdir` 都在那个快照上做。所以 `ls`、`cat`、`cp`、`wc <` 都能直接用。只读：要写、建、截断是 `EROFS`（`error.ReadOnly`）；设备文件只能在当前的文件系统里打开。`/.snap` 本身不是目录，`ls /.snap` 找不到，列快照用 `snap ls`。
+- **读的期间不能删**：快照的块在删掉它之前都不释放，所以在快照上读不用像读者那样登记（`Reader.snap` 是 null）。只要读的期间没人删它：打开快照里的文件时 `fsys.openSnap` 占住它，最后一个 fd 关掉时 `releaseSnap`；`lstat`、`readlink` 也是占住、找完、放开。有人占着时 `snapdel` 是 `EBUSY`。快照的列表只有修改的一方改，所以 `openSnap` 拿着写锁查。
+- **和孤儿**：快照里可能有当时的孤儿（链接数 0 的 inode），只是看不到名字。挂载时 `reapOrphans` 只删当前的树里的孤儿；快照里的那份留着，它们的块因为快照还指着也不会被释放。
+- **整卷回滚**（把当前的文件系统换回某个快照）没有做：要和打开着的文件、正在运行的程序文件打交道。要拿回旧的文件就从快照里复制出来。
 
 ## 改名（`rename`）
 

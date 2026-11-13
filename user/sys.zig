@@ -351,6 +351,20 @@ pub fn kstat() abi.KStat {
     return info;
 }
 
+/// 把文件系统现在的样子保存成一个快照，返回它的编号（之后在 /.snap/编号/ 下只读地看得到）。
+pub fn snapshot() Error!u64 {
+    return check(call(.snapshot, .{}));
+}
+
+/// 保存的快照的编号写进 ids，返回一共有几个（可能比 ids.len 多）。
+pub fn snaplist(ids: []u64) Error!usize {
+    return check(call(.snaplist, .{ids}));
+}
+
+pub fn snapdel(id: u64) Error!void {
+    _ = try check(call(.snapdel, .{id}));
+}
+
 pub fn shutdown() noreturn {
     _ = call(.shutdown, .{});
     unreachable;
