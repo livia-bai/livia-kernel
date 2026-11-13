@@ -294,7 +294,13 @@ pub fn pinDst(s: *Space, va: usize, len: usize) error{BadAddress}!PinnedDst
 
 `translateUser` 用软件走一遍页表，把用户虚拟地址翻译成物理地址；要求地址在用户区里，叶子有效、带 U 位、可读（`write` 为 true 时还要可写），否则返回 null。`userPage` 翻译不了时先按缺页处理（`fault`：按需分配、写时复制的页复制一份）再翻译一次，处理不了就是 null。`copyFromUser` / `copyToUser` 在此基础上逐页翻译、逐页复制，是系统调用读写用户内存的途径之一；它们可能缺页、读盘，所以不能拿着锁调用（一开始就检查）。
 
-**拿着锁访问用户内存要先 pin**：内核有不少地方是拿着锁复制用户内存的：写管道拿着管道的锁、写串口拿着输出锁（自旋锁），写文件拿着文件系统的写锁（睡眠锁，而且 `fs.write` 从用户内存取数据时还拿着缓冲区的睡眠锁），`readdir` 拿着读写位置的锁，`wait` 拿着进程的锁写结束状态。这时不能缺页：段里来自程序文件的页要读盘、睡着等，拿着自旋锁不能睡；拿着缓冲区的睡眠锁再去拿别的缓冲区，可能和别的进程互相等。所以这些地方在拿锁之前 pin（`pinSrc`、`pinSrcPrefix`、`pinDst`）：逐页 `userPage`，把页都准备好（写的话写时复制的页也复制好），得到一个 `PinnedSrc` / `PinnedDst`；拿着锁时用它的 `copyIn` / `copyOut`，只调用 `translateUser`，不缺页、不分配，返回 `void`。哪个系统调用 pin 什么见 [syscalls.md](syscalls.md#访问用户内存)。
+**拿着锁访问用户内存要先 pin**。内核有不少地方是拿着锁复制用户内存的：
+
+- 写管道拿着管道的锁、写串口拿着输出锁（自旋锁）；
+- 写文件拿着文件系统的写锁（睡眠锁，而且 `fs.write` 从用户内存取数据时还拿着缓冲区的睡眠锁）；
+- `readdir` 拿着读写位置的锁，`wait` 拿着进程的锁写结束状态。
+
+这时不能缺页：段里来自程序文件的页要读盘、睡着等，拿着自旋锁不能睡；拿着缓冲区的睡眠锁再去拿别的缓冲区，可能和别的进程互相等。所以这些地方在拿锁之前 pin（`pinSrc`、`pinSrcPrefix`、`pinDst`）：逐页 `userPage`，把页都准备好（写的话写时复制的页也复制好），得到一个 `PinnedSrc` / `PinnedDst`。拿着锁时用它的 `copyIn` / `copyOut`，只调用 `translateUser`，不缺页、不分配，返回 `void`。哪个系统调用 pin 什么见 [syscalls.md](syscalls.md#访问用户内存)。
 
 所以拿着锁时内核不会再为用户内存分配页（以前拿着管道锁、串口的锁复制时碰到清零的页会就地分配，加锁顺序里因此有“`Pipe.lock` → 页分配器”这样的边），`vm.fault` 也不再需要“现在能不能睡”的参数（原来的 `may_sleep` 和 `WouldSleep`）。
 

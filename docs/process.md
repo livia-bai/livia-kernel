@@ -218,11 +218,23 @@ scheduler → switchContext ─ret→ forkret → forkretC（放开进程锁、c
   }
   ```
 
-  `forkretC` 先放开进程锁：调度器是拿着它切过来的，平时由 `sched` 的调用方在切回来之后放开，新进程没有这个调用方，就在这里放（xv6 的 `forkret` 第一句也是 `release(&myproc()->lock)`）。再调用 `checkKilled`（还没运行就被 kill 了的话，在这里结束，见[结束进程](#结束进程)），然后跳进 `trapExit`。第一个进程（init）在这里挂载文件系统（`fsys.init`，[fs.md](fs.md#接进内核fsyszig)）：挂载要读盘、睡着等磁盘中断，`kmain` 不是进程，做不了（xv6 的 `forkret` 里调用 `fsinit` 也是这个原因）；之后的进程都是 init 的子孙，在它之后运行，用的时候已经挂好了。`sp` 一直指向 `TrapFrame`（`forkretC` 是普通函数，只用 `sp` 以下的栈），于是 `trapExit` 按它恢复寄存器、`sret` 进入 U 模式。
+  `forkretC` 做四件事，然后跳进 `trapExit`：
+
+  1. **放开进程锁**：调度器是拿着它切过来的，平时由 `sched` 的调用方在切回来之后放开，新进程没有这个调用方，就在这里放（xv6 的 `forkret` 第一句也是 `release(&myproc()->lock)`）。
+  2. **`checkKilled`**：还没运行就被 kill 了的话，在这里结束（[结束进程](#结束进程)）。
+  3. **第一个进程（init）挂载文件系统**（`fsys.init`，[fs.md](fs.md#接进内核fsyszig)）：挂载要读盘、睡着等磁盘中断，`kmain` 不是进程，做不了（xv6 的 `forkret` 里调用 `fsinit` 也是这个原因）。之后的进程都是 init 的子孙，在它之后运行，用的时候已经挂好了。
+  4. `sp` 一直指向 `TrapFrame`（`forkretC` 是普通函数，只用 `sp` 以下的栈），于是 `trapExit` 按它恢复寄存器、`sret` 进入 U 模式。
 
 ### userinit
 
-和 xv6 的 `userinit` 一样，只在启动时调用一次（这时别的 hart 已经在各自的调度器里空转了）：新建地址空间（`vm.createUserSpace()`，复制内核的根页表），页从嵌在内核里的 `init` 程序读（`backing = .bytes`，[程序从哪来](#程序从哪来)），`loadImage` 记下它的段（`Source.bytes`）、把命令行参数 `"init"` 放到栈顶（[命令行参数](#命令行参数)）；**打开串口作为 0、1、2 号 fd**（一个 `File`，引用数 3，[files.md](files.md)），之后所有进程都从 init `fork` 继承它们；拿着空槽位的锁（`allocSlot`），用 `startFrame(frame, image)` 构造从入口开始运行的 `TrapFrame`，填好字段，状态设为 `runnable`，pid 是 1，记进 `init_proc`，最后才放开锁。`init_proc` 在放开锁之前设置：别的 hart 要先拿到这把锁才能运行 init，那时一定看得到它。没有 `init` 程序是构建配置错了，直接 `@panic`；其他错误 `kmain` 会 panic。
+和 xv6 的 `userinit` 一样，只在启动时调用一次（这时别的 hart 已经在各自的调度器里空转了）：
+
+1. 新建地址空间（`vm.createUserSpace()`，复制内核的根页表），页从嵌在内核里的 `init` 程序读（`backing = .bytes`，[程序从哪来](#程序从哪来)）。
+2. `loadImage` 记下它的段（`Source.bytes`），把命令行参数 `"init"` 放到栈顶（[命令行参数](#命令行参数)）。
+3. **打开串口作为 0、1、2 号 fd**（一个 `File`，引用数 3，[files.md](files.md)）：之后所有进程都从 init `fork` 继承它们。
+4. 拿着空槽位的锁（`allocSlot`），用 `startFrame(frame, image)` 构造从入口开始运行的 `TrapFrame`，填好字段，状态设为 `runnable`，pid 是 1，记进 `init_proc`，最后才放开锁。`init_proc` 在放开锁之前设置：别的 hart 要先拿到这把锁才能运行 init，那时一定看得到它。
+
+没有 `init` 程序是构建配置错了，直接 `@panic`；其他错误 `kmain` 会 panic。
 
 `startFrame` 构造的 `TrapFrame`：`sepc` = 入口地址，`sp`（`regs[2]`）和 `a1`（`regs[11]`）= 栈上 `Arg` 数组的地址，`a0`（`regs[10]`）= `argc`，其他寄存器为 0，`sstatus` 是当前的 `sstatus` 改三个字段（`spp = .user`、`sie = false`、`spie = true`）：
 
@@ -457,6 +469,25 @@ pub fn yield() void {
 }
 ```
 
+进程锁在调度器和进程之间交接（以 `yield` 为例；`sleep`、`finish` 也一样，只是改成别的状态）：
+
+```mermaid
+sequenceDiagram
+    participant S as 调度器（hart 0）
+    participant P as 进程 P
+    participant S2 as 调度器（hart 2）
+    S->>S: 拿 P.lock，看到 runnable，改成 running
+    S->>P: switchContext（拿着 P.lock）
+    Note over P: 回来的第一件事：放开 P.lock<br/>（新进程在 forkretC 里放，老进程由 sched 的调用方放）
+    P->>P: 运行……时间片用完，yield：<br/>拿 P.lock，改成 runnable
+    P->>S: sched → switchContext（拿着 P.lock）
+    S->>S: 换回内核页表，放开 P.lock
+    S2->>S2: 拿 P.lock，看到 runnable，改成 running
+    S2->>P: switchContext：从 sched 之后接着运行，可能在另一个 hart 上
+```
+
+从“改状态”到“切走”，P.lock 一直有人拿着，所以别的 hart 的调度器不会在 P 还在原来的栈上运行时就恢复它，也不会在它切走之前就把它的页表回收掉。
+
 `sched` 是进程切回调度器的唯一入口，切换前检查四件事（和 xv6 一样）：拿着自己的进程锁，而且只拿着这一把（拿着别的锁切走的话，下一个要这把锁的会永远自旋下去），状态已经改掉了（不再是 `running`，否则调度器会以为它还在跑），中断是关着的。等调度器下次挑中这个进程时（可能在另一个 hart 上），`switchContext` 才返回，执行从 `sched` 之后继续，这时又拿着进程锁，由调用方放开。
 
 注意 `sched` 每次现查 `cpus[hart.id()]`，不能在函数开头取一次存着：切回来的时候可能已经在另一个 hart 上了。
@@ -526,6 +557,26 @@ while (p.nread == p.nwrite and p.write_open) {
 ```
 
 **为什么不会丢唤醒**（lost wakeup：叫醒发生在睡下之前，等的人永远睡下去）：`wait` 拿着 `lock` 排进队列，先拿上自己的进程锁，再放开 `lock`，然后才改状态、切走；调度器切回来之后才放开进程锁。改条件的一方要先拿 `lock` 才能改、才能 `wakeAll`，于是它看到的要么是还没检查条件之前（那调用方会看到新的条件，不睡），要么是已经排进队列之后；它要拿进程锁才能改状态，等拿上时这个进程已经完全睡下、切走了（`sleeping`，叫醒它）。进程锁还保证了另一件事：`wakeAll` 不会在这个进程还没切走时就把它改成 `runnable`，让另一个 hart 的调度器在它还在原来的栈上运行时恢复它。
+
+```mermaid
+sequenceDiagram
+    participant W as 等的一方（管道的读者）
+    participant L as p.lock（条件的锁）
+    participant Q as p.readers（队列）
+    participant M as 改条件的一方（写者）
+    W->>L: 拿锁，看到管道是空的
+    W->>Q: 排进队列
+    W->>W: 拿上自己的进程锁
+    W->>L: 放开（从这里到切走，进程锁一直拿着）
+    W->>W: 改成 sleeping，sched 切走，调度器放开进程锁
+    M->>L: 拿锁（W 放开之后才拿得到）
+    M->>M: 写进数据
+    M->>Q: wakeAll：摘下 W
+    M->>W: 拿 W 的进程锁（W 切走之后才拿得到），改成 runnable
+    M->>L: 放开
+    W->>L: 醒来：重新拿上锁，循环里再看一遍条件
+```
+
 
 **被 `kill` 叫醒的进程还排在队列里**：`kill` 只拿进程锁，直接把 `sleeping` 改成 `runnable`（`markKilled`），不知道它排在哪个队列里，也没拿那个队列的锁。所以 `wait` 醒来、重新拿上 `lock` 之后看 `queued`：还是 `true` 就自己从队列里摘掉（单链表，要从头找，但只有被 kill 时才走这一步）。在它拿上 `lock` 之前，`wakeAll` 可能已经把它摘下来了，那时它已经不是 `sleeping`，`wakeAll` 只摘不改状态。`wait_next`、`queued` 都由队列的锁保护，所以两边不会同时改。一个进程同一时刻最多排在一个队列里：它在从 `wait` 返回之前一定已经出队了。
 
@@ -784,7 +835,12 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 
   每个 hart 记着自己拿着哪些锁（`held[hart.id()]`，按拿的顺序，最多 16 把），`acquire` 拿它和要拿的锁比等级，`release` 把锁从里面去掉（放的顺序不一定和拿的相反：`sleep` 先拿进程锁、再放条件的锁）。原来顺序只写在文档里，违反了的代码大多数时候不会死锁，要两个 hart 恰好交叉才会；现在一次正常的运行就能发现。整个 QEMU 测试跑下来没有违反的地方。
 
-  另外有**睡眠锁**（[disk.md](disk.md#睡眠锁sleeplockzig)：打开的文件的 `File.pos_lock`、文件系统的写锁 `fsys.write_lock`、缓冲区缓存的每一块）：拿着它可以睡觉，所以拿它之前不能拿着任何自旋锁（`Sleeplock.acquire` 一开始就检查）；拿着它可以再去拿自旋锁（读写磁盘时拿 `virtio_disk.lock`）。回到 U 模式时也不能拿着睡眠锁（`proc.assertNoLocksHeld`）。睡眠锁也有等级（`sleeplock.Rank`）：`file_pos`（`File.pos_lock`）→ `fs_write`（`fsys.write_lock`）→ `buf`（缓冲区），每个进程记着自己拿着每一级的几把（`Process.sleeplocks`），拿的时候一样检查。`buf` 一级允许同时拿几把：同时拿着好几个缓冲区的只有修改文件系统的一方（一次一个，`write_lock`）；文件系统的读者、`readblock`、`writeblock` 一次只拿一个，拿着的时候不等别的缓冲区，所以不会互相等（[disk.md](disk.md#找缓冲区get)）。
+  另外有**睡眠锁**（[disk.md](disk.md#睡眠锁sleeplockzig)）：打开的文件的 `File.pos_lock`、文件系统的写锁 `fsys.write_lock`、缓冲区缓存的每一块。
+
+  - **拿之前不能拿着自旋锁**：拿着它可以睡觉，`Sleeplock.acquire` 一开始就检查。反过来，拿着它可以再去拿自旋锁（读写磁盘时拿 `virtio_disk.lock`）。
+  - **回到 U 模式时不能拿着**（`proc.assertNoLocksHeld`）。
+  - **也有等级**（`sleeplock.Rank`）：`file_pos`（`File.pos_lock`）→ `fs_write`（`fsys.write_lock`）→ `buf`（缓冲区）。每个进程记着自己拿着每一级的几把（`Process.sleeplocks`），拿的时候一样检查。
+  - **`buf` 一级允许同时拿几把**：同时拿着好几个缓冲区的只有修改文件系统的一方（一次一个，`write_lock`）；文件系统的读者、`readblock`、`writeblock` 一次只拿一个，拿着的时候不等别的缓冲区，所以不会互相等（[disk.md](disk.md#找缓冲区get)）。
 
   文件系统的读者拿着的**快照**不是锁，但修改的一方可能睡着等旧树的读者读完（[btree.md](btree.md#快照读者)），所以它也算在顺序里：`File.pos_lock` → 快照，拿着快照时不去等 `pos_lock`、`write_lock`。这一条没有检查。
 - 同一个 hart 重复拿同一把锁直接 panic（`holding()` 比较锁里记的 hart 编号和 `hart.id()`）。

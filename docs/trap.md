@@ -79,6 +79,22 @@ pub const TrapFrame = extern struct {
 | 在内核里运行时（系统调用、调度器……），不在处理 S 模式的陷阱 | 这个 hart 的陷阱栈顶（`kstack.trap[hart]`，16 KiB） | 陷阱栈的最顶上 |
 | 正在处理 S 模式的陷阱时 | 0 | 被打断时的 `sp` 下面（嵌套） |
 
+三种状态之间怎么转（`kernel_sscratch` 是 `TrapFrame` 里记着的、回去时要恢复的值）：
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    U: U 模式<br/>sscratch = 进程内核栈顶
+    K: 内核里，不在处理 S 模式的陷阱<br/>sscratch = 陷阱栈顶
+    S: 处理 S 模式的陷阱<br/>sscratch = 0
+    U --> K: trapEntry（来自 U）<br/>TrapFrame 压在进程内核栈顶<br/>sscratch ← kernel_sscratch
+    K --> U: trapExit（回 U）<br/>kernel_sscratch ← 陷阱栈顶<br/>sscratch ← 进程内核栈顶
+    K --> S: trapEntry（来自 S）<br/>TrapFrame 压在陷阱栈顶<br/>sscratch ← 0
+    S --> K: trapExit（回 S）<br/>sscratch ← kernel_sscratch
+    S --> S: 再陷入（内核的 bug）<br/>TrapFrame 压在当时的 sp 下面
+```
+
+
 - 每个进程有自己的内核栈（[process.md](process.md#进程表)），`trapExit` 每次回到 U 模式时都按这次要回去的进程重新写 `sscratch`，所以切换进程不需要另外维护它。
 - **S 模式的陷阱都在陷阱栈上处理**：调度器开中断那一下来的中断，内核自己的异常（`ebreak` 自检、内核的 bug、内核栈溢出）。处理 S 模式陷阱的代码从不切换进程（S 模式的时钟中断不 `yield`，见[分发](#分发)），所以每个 hart 一块陷阱栈就够了，处理完它又是空的。
 - 处理期间 `sscratch` 为 0：处理程序自己再出异常（只可能是内核的 bug），新的 `TrapFrame` 压在当时的 `sp` 下面，不会盖掉陷阱栈顶上正在用的那个。

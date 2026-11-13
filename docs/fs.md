@@ -180,6 +180,20 @@ pub fn readText(ino: u64, off: u64, dst: []u8) error{IoError}!void
 
 **孤儿**（btrfs 的 `ORPHAN_ITEM`）：`Fs` 有一个 `keep` 回调，`remove` 删到一个文件（不是目录）的最后一个名字时问它“这个 inode 还有人用着吗”。是的话不删 inode，链接数记成 0，插一个孤儿条目 `(0, 4, ino)`，只删目录项。之后按 inode 号照常能读写它（`fs.read`、`fs.write` 都按 inode 号，不经过名字）。最后一个使用者放开时调用 `reapOrphan(ino)`：有它的孤儿条目才删（删掉这个 inode 号的所有条目，再删孤儿条目），没有就什么都不做（删名字的事务后来作废了，或者已经删过了）。内核里 `keep` 是 `fsys.keepInUse`；`mkfs`、单元测试的 `Fs` 没有它，删掉就是真删。
 
+```mermaid
+stateDiagram-v2
+    direction LR
+    N: 有名字<br/>nlink ≥ 1
+    O: 孤儿<br/>nlink = 0，有孤儿条目
+    D: 删掉了
+    N --> N: 删掉一个名字，还有别的名字
+    N --> D: 删掉最后一个名字，没人用着
+    N --> O: 删掉最后一个名字，还有人用着<br/>（打开着、正在运行）
+    O --> O: 按 inode 号照常读写
+    O --> D: 最后一个使用者放开（reapOrphan）<br/>或者掉电之后挂载（reapOrphans）
+```
+
+
 **掉电**：孤儿条目和删名字在同一个事务里，所以掉电之后盘上的孤儿条目正好就是那时还有人用着、名字已经删掉的 inode。重新启动之后不会有人用着它们了，`fsys.init` 挂载之后马上 `reapOrphans` 把它们都删掉，打印 `[ok] file system: removed N orphan inodes`。`check` 要求链接数是 0 的 inode 正好就是孤儿条目指着的那些，而且都不是目录。
 
 **记账**（`fsys.zig`）：
