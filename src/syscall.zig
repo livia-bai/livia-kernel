@@ -199,7 +199,7 @@ fn abiStat(s: fs.Stat) abi.Stat {
 
 /// 找到（或者建好、截断）要打开的 inode，返回它的 Stat。root 是读者的话 flags 里不会有要改文件系统的（见 open）。
 /// 跟着符号链接走；没有并且带 open_create 时建文件，最后一段是悬空的符号链接的话建的是它指向的那个（createFollow）。
-/// 正在运行的程序文件不能截断（TextBusy，见 fsys.holdText）。
+/// 正在运行的程序文件不能截断（TextBusy，见 fsys.hold）。
 fn openPath(root: *Fs, cwd: u64, path: []const u8, flags: usize, writable: bool) (fs.Error || error{TextBusy})!fs.Stat {
     const ino = root.resolve(cwd, path) catch |err| switch (err) {
         error.NotFound => if (flags & abi.open_create != 0) return root.stat(try root.run(Fs.createFollow, .{ cwd, path })) else return err,
@@ -334,11 +334,28 @@ const handlers = struct {
             defer r.end();
             break :blk try openPath(&r.fs, cwd, path, flags, writable);
         };
-        // 设备文件：读写交给设备，文件系统里只有它的 inode
-        const f = if (st.kind == .device)
-            try file.openDevice(st.ino, @fromBackingInt(st.major), readable, writable)
+        // 占住 inode（之后删掉它的名字只会让它变成孤儿，fsys.hold），再在新的快照上确认它还在：
+        // 找到它的那个快照可能已经旧了，在那之后它被删掉的话，占住它也没用
+        try fsys.hold(st.ino, .open);
+        {
+            var r = fsys.reader() catch |err| {
+                fsys.release(st.ino, .open);
+                return err;
+            };
+            defer r.end();
+            _ = r.fs.stat(st.ino) catch |err| {
+                fsys.release(st.ino, .open);
+                return err;
+            };
+        }
+        // 设备文件：读写交给设备，文件系统里只有它的 inode。File 接过占用，最后一个 fd 关掉时放开（file.close）
+        const f = (if (st.kind == .device)
+            file.openDevice(st.ino, @fromBackingInt(st.major), readable, writable)
         else
-            try file.openInode(st.ino, readable, writable, flags & abi.open_append != 0);
+            file.openInode(st.ino, readable, writable, flags & abi.open_append != 0)) catch |err| {
+            fsys.release(st.ino, .open);
+            return err;
+        };
         return installFd(f);
     }
 
@@ -356,9 +373,8 @@ const handlers = struct {
         const cwd = proc.current().?.cwd;
         const root = try fsys.writer();
         defer fsys.unlock();
-        // 删掉正在运行的程序文件的最后一个名字：TextBusy
-        const guarded = try fsys.beginRemove(root, cwd, path);
-        defer if (guarded) fsys.endModify();
+        // 删掉最后一个名字时，还有人用着就留下孤儿（fsys.keepInUse），否则记下 removing：做完清掉
+        defer fsys.endModify();
         try root.run(Fs.unlink, .{ cwd, path });
     }
 
@@ -374,8 +390,7 @@ const handlers = struct {
     }
 
     /// 两个路径都先复制进内核，再拿着文件系统的写锁一个事务改名（fs.Fs.rename）。
-    /// 新名字已经有了、是正在运行的程序文件的最后一个名字的话，它会被换掉（删掉）：TextBusy。
-    /// 两个名字是同一个 inode 时 rename 什么都不做，不用检查。
+    /// 新名字已经有了的话它被换掉，和 unlink 一样：还有人用着就留下孤儿。
     pub fn rename(old_arg: UserSlice, new_arg: UserSlice) !void {
         var old_buf: [abi.max_path]u8 = undefined;
         var new_buf: [abi.max_path]u8 = undefined;
@@ -384,9 +399,7 @@ const handlers = struct {
         const cwd = proc.current().?.cwd;
         const root = try fsys.writer();
         defer fsys.unlock();
-        const same = if (root.resolveNoFollow(cwd, old)) |a| (if (root.resolveNoFollow(cwd, new)) |b| a == b else |_| false) else |_| false;
-        const guarded = if (same) false else try fsys.beginRemove(root, cwd, new);
-        defer if (guarded) fsys.endModify();
+        defer fsys.endModify();
         try root.run(Fs.rename, .{ cwd, old, new });
     }
 
@@ -518,6 +531,7 @@ const handlers = struct {
             .free_blocks = root.vol.free_count,
             .blocks = root.vol.blocks,
             .generation = root.vol.generation,
+            .orphans = st.orphans,
         };
         dst.copyOut(0, std.mem.asBytes(&info)); // 拿着写锁
     }

@@ -12,8 +12,9 @@
 //! - 磁盘的前一部分是文件系统（超级块里记着它有多少块），后一部分是原始区域，
 //!   readblock/writeblock 系统调用只能读写原始区域（块号从原始区域的开头算），碰不到文件系统。
 //!   磁盘上没有文件系统时整个磁盘都是原始区域。
-//! - 正在运行的程序文件（按需分页从它读页）不能改、不能删：holdText 占住它，改它的一方（beginModify）
-//!   得到 TextBusy（和 Linux 的 ETXTBSY 一样）；正在被改的文件也不能开始运行。
+//! - 正在用的 inode（打开着的、正在运行的程序文件）记在 users 里（hold、release）。删掉它的最后一个名字时
+//!   只删名字，inode 变成孤儿，最后一个使用者放开时才删（和 Unix 一样）。正在运行的程序文件不能改内容：
+//!   改它的一方（beginModify）得到 TextBusy（和 Linux 的 ETXTBSY 一样）；正在被改的文件也不能开始运行。
 
 const std = @import("std");
 const abi = @import("abi.zig");
@@ -49,6 +50,13 @@ pub fn init() void {
         uart.print("[warn] no file system on the disk: {s}\n", .{@errorName(err)});
         return;
     };
+    root.keep = keepInUse;
+    // 上次关机、掉电时还有人用着的孤儿：现在没人用了，删掉
+    const orphans = root.run(Fs.reapOrphans, .{}) catch |err| blk: {
+        uart.print("[warn] fs: could not remove orphan inodes: {s}\n", .{@errorName(err)});
+        break :blk 0;
+    };
+    if (orphans > 0) uart.print("[ok] file system: removed {d} orphan inode{s}\n", .{ orphans, if (orphans == 1) "" else "s" });
     mounted = true;
     raw_base = vol.blocks;
     raw_count -= vol.blocks;
@@ -91,91 +99,131 @@ pub const KernelOut = struct {
     }
 };
 
-// ---- 正在运行的程序文件 ----
+// ---- 正在用的 inode：打开的文件、正在运行的程序文件 ----
 //
-// 按需分页：进程运行期间才从它的程序文件里读页（vm.Backing.file），所以程序文件在有地址空间用着它的时候
-// 不能改、不能删，不然之后读进来的页和 exec 时读的文件头就不是同一个版本了。
-// exec 占住（holdText）、fork 多占一份（dupText），进程结束、exec 换掉地址空间时放开（releaseText，见 vm.releaseBacking）。
-// 改文件的一方拿着 write_lock，改之前 beginModify：文件被占着就是 TextBusy；没被占着就记下“正在改它”，
-// 改完（事务提交或者作废之后）endModify。这段时间里 exec 它也是 TextBusy。
-// 两边都拿着 text_lock 查、改，所以“exec 占住之后再拿快照读文件头”看到的，就是之后按需分页读到的版本：
-// 占住之前开始的修改要么还没 endModify（exec 失败），要么已经提交了（快照里看得到）。
+// 两种使用者：
+// - 打开的文件（file.File 的 .inode、.device）：每个 File 一份，最后一个 fd 关掉时放开（file.close）。
+// - 正在运行的程序文件（vm.Backing.file）：按需分页在进程运行期间从它读页，exec 占住（hold(.text)）、fork 多占一份，
+//   进程结束、exec 换掉地址空间时放开（vm.releaseBacking）。
+//
+// 删除：删掉一个 inode 的最后一个名字时（fs.Fs.remove 调用 keepInUse），它还有使用者的话只删名字，inode 留着，
+// 链接数记成 0、树里记一个孤儿条目（fs.zig），这里记下 orphan；最后一个使用者放开时才真正删掉它（reapOrphan）。
+// 和 Unix 一样：打开后马上删掉的临时文件照常能读写，正在运行的程序也可以删。没人用的话照常马上删掉，
+// 这时记下 removing，删除提交之前别人不能再占住它（open、exec 看到的是 NotFound）。
+//
+// 修改内容（write、截断）：改之前 beginModify：有进程在运行它就是 TextBusy（和 Linux 的 ETXTBSY 一样，
+// 不然之后读进来的页和 exec 时读的文件头不是同一个版本）；没有就记下 modifying，改完 endModify。
+// 这段时间里 exec 它也是 TextBusy。
+//
+// 都拿着 use_lock 查、改，所以“占住之后再拿快照看一眼”看到的就是之后读到的版本：占住之前开始的修改、删除
+// 要么还没 endModify（占住失败），要么已经提交了（快照里看得到）；占住之后开始的删除只会把它变成孤儿。
 
-/// 保护 texts、modifying。叶子锁
-var text_lock: Spinlock = .init("fs text", .leaf);
-/// 一个地址空间占一份。地址空间最多是每个进程一个，再加上正在 exec 的进程新建的那个
-var texts: [2 * abi.max_procs]struct { ino: u64 = 0, refs: u32 = 0 } = @splat(.{});
-/// 修改的一方正在改的 inode，0 表示没有。修改都拿着 write_lock，同一时刻只有一个
+pub const Use = enum { open, text };
+
+/// 保护 users、modifying、removing。叶子锁
+var use_lock: Spinlock = .init("fs users", .leaf);
+/// 每个正在用的 inode 一项。最多：每个 File 一个，加上每个地址空间一个（每个进程一个，再加上正在 exec 的新建的那个）
+var users: [@import("file.zig").max_files + 2 * abi.max_procs]struct {
+    ino: u64 = 0,
+    opens: u32 = 0,
+    texts: u32 = 0,
+    /// 名字都删掉了（只剩孤儿条目），最后一个使用者放开时删掉它
+    orphan: bool = false,
+} = @splat(.{});
+/// 修改的一方正在改内容的 inode、正在删掉的 inode，0 表示没有。修改都拿着 write_lock，同一时刻各最多一个
 var modifying: u64 = 0;
+var removing: u64 = 0;
 
-pub fn holdText(ino: u64) error{TextBusy}!void {
-    text_lock.acquire();
-    defer text_lock.release();
-    if (modifying == ino) return error.TextBusy;
-    var free: ?usize = null;
-    for (&texts, 0..) |*t, i| {
-        if (t.refs > 0 and t.ino == ino) {
-            t.refs += 1;
-            return;
+fn userOf(ino: u64) ?*@TypeOf(users[0]) {
+    for (&users) |*u| {
+        if (u.opens + u.texts > 0 and u.ino == ino) return u;
+    }
+    return null;
+}
+
+/// 占住 inode ino（打开它、或者开始运行它）。正在被删掉是 NotFound；要运行的正在被改是 TextBusy。
+/// 调用方之后要拿一个新的快照确认它还在（之前找到它的快照可能已经旧了，见上面）。
+pub fn hold(ino: u64, use: Use) error{ NotFound, TextBusy }!void {
+    use_lock.acquire();
+    defer use_lock.release();
+    if (removing == ino) return error.NotFound;
+    if (use == .text and modifying == ino) return error.TextBusy;
+    const u = userOf(ino) orelse for (&users) |*u| {
+        if (u.opens + u.texts == 0) {
+            u.* = .{ .ino = ino };
+            break u;
         }
-        if (t.refs == 0 and free == null) free = i;
+    } else @panic("fsys: too many inodes in use"); // 表比 File 和地址空间加起来还多，不会满
+    switch (use) {
+        .open => u.opens += 1,
+        .text => u.texts += 1,
     }
-    // 每个地址空间最多占一份，表比地址空间多，不会满
-    const t = &texts[free orelse @panic("fsys: too many program files in use")];
-    t.* = .{ .ino = ino, .refs = 1 };
 }
 
-/// 已经占着的程序文件再占一份（fork）。
-pub fn dupText(ino: u64) void {
-    text_lock.acquire();
-    defer text_lock.release();
-    textOf(ino).refs += 1;
-}
-
-pub fn releaseText(ino: u64) void {
-    text_lock.acquire();
-    defer text_lock.release();
-    textOf(ino).refs -= 1;
-}
-
-fn textOf(ino: u64) *@TypeOf(texts[0]) {
-    for (&texts) |*t| {
-        if (t.refs > 0 and t.ino == ino) return t;
+/// 已经占着的 inode 再占一份（fork 复制地址空间）。
+pub fn dup(ino: u64, use: Use) void {
+    use_lock.acquire();
+    defer use_lock.release();
+    const u = userOf(ino) orelse std.debug.panic("fsys: inode {d} is not in use", .{ino});
+    switch (use) {
+        .open => u.opens += 1,
+        .text => u.texts += 1,
     }
-    std.debug.panic("fsys: program file {d} is not in use", .{ino});
 }
 
-/// 要改 inode ino 的内容、或者删掉它的最后一个名字之前调用（拿着 write_lock）。有进程在运行它就是 TextBusy。
-/// 成功之后改完要 endModify。
+/// 放开一份。它是孤儿、这是最后一个使用者的话，删掉它（要读写磁盘、拿 write_lock：调用方不能拿着锁）。
+/// 删不掉（读写失败）的留着孤儿条目，下次挂载时删。
+pub fn release(ino: u64, use: Use) void {
+    const reap = blk: {
+        use_lock.acquire();
+        defer use_lock.release();
+        const u = userOf(ino) orelse std.debug.panic("fsys: inode {d} is not in use", .{ino});
+        switch (use) {
+            .open => u.opens -= 1,
+            .text => u.texts -= 1,
+        }
+        break :blk u.opens + u.texts == 0 and u.orphan;
+    };
+    if (!reap) return;
+    const w = writer() catch return;
+    defer unlock();
+    w.run(Fs.reapOrphan, .{ino}) catch |err| uart.print("[warn] fs: could not remove orphan inode {d}: {s}\n", .{ ino, @errorName(err) });
+}
+
+/// fs.Fs.remove 删掉 inode ino 的最后一个名字时调用（拿着 write_lock，在事务里）：返回 true 表示它还有使用者，
+/// 只删名字、留下孤儿；false 表示连 inode 一起删掉，这时记下 removing，事务做完 endModify 之前别人占不住它。
+/// 事务后来作废了也没关系：orphan 记早了，到时候 reapOrphan 发现没有孤儿条目，什么都不做。
+fn keepInUse(ino: u64) bool {
+    std.debug.assert(write_lock.holding());
+    use_lock.acquire();
+    defer use_lock.release();
+    if (userOf(ino)) |u| {
+        u.orphan = true;
+        return true;
+    }
+    removing = ino;
+    return false;
+}
+
+/// 要改 inode ino 的内容之前调用（拿着 write_lock）。有进程在运行它就是 TextBusy。成功之后改完要 endModify。
 pub fn beginModify(ino: u64) error{TextBusy}!void {
     std.debug.assert(write_lock.holding());
-    text_lock.acquire();
-    defer text_lock.release();
-    for (texts) |t| {
-        if (t.refs > 0 and t.ino == ino) return error.TextBusy;
-    }
+    use_lock.acquire();
+    defer use_lock.release();
+    if (userOf(ino)) |u| if (u.texts > 0) return error.TextBusy;
     modifying = ino;
 }
 
+/// 改内容、删除的事务做完了（提交了或者作废了）：清掉 modifying、removing。unlink、rename 之后也要调用。
 pub fn endModify() void {
-    text_lock.acquire();
-    defer text_lock.release();
+    use_lock.acquire();
+    defer use_lock.release();
     modifying = 0;
-}
-
-/// 要删掉 path（不跟着最后一段的符号链接走）这个名字、或者换掉它（rename 的目标）之前调用（拿着 write_lock）：
-/// 它是文件、并且这是它的最后一个名字的话，内容会被删掉，按 beginModify 检查。返回 true 表示调用了 beginModify，
-/// 做完要 endModify。名字不存在等等的错误不在这里报，交给接下来的操作自己报。
-pub fn beginRemove(w: *Fs, cwd: u64, path: []const u8) error{TextBusy}!bool {
-    const ino = w.resolveNoFollow(cwd, path) catch return false;
-    const st = w.stat(ino) catch return false;
-    if (st.kind != .file or st.nlink != 1) return false;
-    try beginModify(ino);
-    return true;
+    removing = 0;
 }
 
 /// 按需分页：从程序文件 ino 的 off 处读 dst.len 个字节（vm.fault 调用，要睡着等磁盘）。
-/// 文件被占着（holdText），内容不会变，所以每次拿一个新的快照读就行，读完就放开，不挡着别人。
+/// 文件被占着（hold），内容不会变，所以每次拿一个新的快照读就行，读完就放开，不挡着别人。
 pub fn readText(ino: u64, off: u64, dst: []u8) error{IoError}!void {
     var r = reader() catch return error.IoError;
     defer r.end();

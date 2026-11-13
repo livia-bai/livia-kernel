@@ -39,7 +39,7 @@ const Ptr = btree.Ptr;
 pub const block_size = btree.block_size;
 /// 磁盘格式的版本：B 树（btree.zig、这里）或者文件系统（fs.zig 的条目）的格式改了就换一个。
 /// 0002：fs.Inode 多了链接数和设备号（硬链接、设备文件）；0003：inode 多了一种 symlink（符号链接）
-pub const magic = "LBFS0003".*;
+pub const magic = "LBFS0004".*;
 /// 最多管多大的磁盘：位图是静态的，65536 块（256 MiB）的位图是 8 KiB
 pub const max_blocks = 65536;
 /// 树最多几层。4 KiB 的节点一层最多 101 个指针，8 层远远用不完；单元测试里扇出只有 5，会长到 5、6 层

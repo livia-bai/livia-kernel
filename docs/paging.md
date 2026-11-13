@@ -225,7 +225,7 @@ pub fn allocUserPage(root: *PageTable, va: usize, perm: Perm) MapError!*align(pa
 
 - `createUserSpace`：分配一页作为根页表，内容复制 `kernel_root.*`（用 `@memcpy`：`root.* = kernel_root.*` 在 Debug 模式下会先在栈上复制一份 4 KiB），段、堆都是空的。
 - `destroyUserSpace`：释放用户区（根页表第 1 项）下面的所有东西：`freeTree` 递归地释放每个有效的叶子指向的物理页、每一张中间级页表，最后释放根页表本身；再 `releaseBacking`。叶子指向的页可能还被别的进程共用（写时复制），`page.free` 只是放掉一个引用，最后一个用它的进程释放时它才回到空闲链表（[page-allocator.md](page-allocator.md#引用数)）。**调用前必须已经切换到别的地址空间**，否则正在使用的页表会被释放。`freeTree` 把叶子都当作 4 KiB 的页释放，这依赖于“用户映射只用 4 KiB 的页”。
-- `releaseBacking`：`backing` 是程序文件的话放开对它的占用（`fsys.releaseText`，[fs.md](fs.md#正在运行的程序文件)），改成 `.none`。进程结束时（`proc.finish`）就调用：之后不会再缺页了，不用等父进程回收地址空间。
+- `releaseBacking`：`backing` 是程序文件的话放开对它的占用（`fsys.release(ino, .text)`；名字已经删掉了的话这时删掉它，[fs.md](fs.md#删掉还有人用着的文件)），改成 `.none`。进程结束时（`proc.finish`）就调用：之后不会再缺页了，不用等父进程回收地址空间。
 - `allocUserPage`：分配一页清零的物理内存，以 `perm` + U 位映射到用户地址 `va`。现在只有单元测试用它直接摆好页；内核自己的用户页都是按需分配的（`fault`）。用户映射**只用 4 KiB 的页**，每一页单独分配，所以物理上不连续也没关系。
 
 ## 按需分页
@@ -305,10 +305,10 @@ fn cloneTree(dst: *PageTable, pte: *Pte, level: u2, va: usize) error{OutOfMemory
    - `page.share` 给这个物理页加一个引用；
    - 把（改过的）叶子原样抄进 `dst`：同一个物理页、同样的权限。
 3. 中途内存不够时，`errdefer destroyUserSpace(dst)` 把 `dst` 整个释放掉（已经抄过去的叶子各放掉一个引用，正好抵消 `share`）。
-4. 段、堆、`backing` 照抄；`backing` 是程序文件的话多占一份（`fsys.dupText`）。
+4. 段、堆、`backing` 照抄；`backing` 是程序文件的话多占一份（`fsys.dup`）。
 5. 最后刷新当前 hart 的 TLB（成功、失败都刷）：`src` 是正在用的地址空间，它的可写页刚变成只读。
 
-`src` 里还没有的页（按需分页，还没访问过），`dst` 里也没有：以后谁访问谁自己分配，段里的页从同一个程序文件读，所以内容和 `src` 的一样（文件在这期间不会变，[fs.md](fs.md#正在运行的程序文件)）。
+`src` 里还没有的页（按需分页，还没访问过），`dst` 里也没有：以后谁访问谁自己分配，段里的页从同一个程序文件读，所以内容和 `src` 的一样（文件在这期间不会变，[fs.md](fs.md#删掉还有人用着的文件)）。
 
 之后父子进程读到的都是同一批物理页。谁先写一个 `cow` 页，谁就触发写缺页（W 是 0），由 `breakCow` 给它复制一份；本来就只读的页（代码、只读数据）不标 `cow`，一直共用，写它照常是用户程序的错。
 

@@ -34,7 +34,7 @@ pub const Rank = enum(u8) {
     proc,
     /// 串口的输出锁：拿着进程锁、条件的锁时都可能打印
     uart_out,
-    /// 叶子锁：拿着它们不再拿别的锁。页分配器（每个 hart 一把）、File.lock、fsys.text_lock
+    /// 叶子锁：拿着它们不再拿别的锁。页分配器（每个 hart 一把）、File.lock、fsys.use_lock
     leaf,
 
     /// 同一等级的锁能不能同时拿几把

@@ -605,7 +605,7 @@ def case_cow(q, c, mode):
 
 def case_demand(q, c, mode):
     # 按需分页：t_demand 自己检查程序的页用到才读进来、内核替它访问没读进来的页、栈按需长、
-    # 正在运行的程序文件不能改不能删
+    # 正在运行的程序文件不能改
     out = q.command("run t_demand")
     m = c.contains(out, r"reading 16 untouched pages of the program used (\d+) pages\n", "run t_demand")
     c.contains(out, r"\nthis line comes from a page that was never touched\n", "run t_demand: console write")
@@ -693,13 +693,14 @@ def case_tools(q, c, mode):
     q.command("echo 'seq 3 | xargs -n 1 sh /ttools/odd.sh' > /ttools/count.sh")
     q.command("echo 'expr $1 % 2 > /dev/null && echo $1 odd || echo $1 even' > /ttools/odd.sh")
     c.contains(out_of("sh /ttools/count.sh"), r"\n1 odd\n2 even\n3 odd\n", "sh /ttools/count.sh")
-    # 正在运行的程序不能被覆盖、删掉（按需分页要从它读页）；结束之后可以
+    # 正在运行的程序不能被覆盖（按需分页要从它读页），可以删掉（只删名字，它接着运行）；结束之后可以覆盖
     q.command("cp /bin/spin /ttools/s")
     m = c.contains(q.command("/ttools/s &"), r"\[proc\] pid (\d+) \(/ttools/s\) started in the background", "/ttools/s &")
     if m:
         q.wait_for(lambda t: re.search(rf"pid {m.group(1)} spinning", t), COMMAND_TIMEOUT, "/ttools/s to start")
         c.contains(out_of("cp /bin/hello /ttools/s"), r"cp: /ttools/s: TextBusy\n", "cp over a running program")
-        c.contains(out_of("rm /ttools/s"), r"rm: /ttools/s: TextBusy\n", "rm a running program")
+        exited(c, q.command("rm /ttools/s"), "rm", 0)
+        c.contains(out_of("ps"), rf"\n +{m.group(1)} +\d+ +run\w* +\d+ s\n", "the removed program is still running")
         q.command(f"kill {m.group(1)}")
         out = q.command("cp /bin/hello /ttools/s && /ttools/s")
         c.contains(out, r"Hello from U-mode!", "cp over a program after it exited")
@@ -867,6 +868,29 @@ def check_fs_reboots(q, c):
     reboot(q, c, "boot3", third)
     if corrupt_scrub_file(q, c):
         reboot(q, c, "boot4", fourth)
+
+
+def case_unlink(q, c, mode):
+    # 删掉还有人用着的文件：t_unlink 自己检查打开着删掉、fork 之后共用、删掉正在运行的程序；
+    # 关机之后：再启动一次，打开着一个删掉了的文件时杀掉 QEMU，下一次启动挂载时删掉这个孤儿
+    check_counts(c, q.command("run t_unlink"), "t_unlink")
+    q.after_shutdown.append((c, lambda c: check_orphan_reboot(q, c)))
+
+
+def check_orphan_reboot(q, c):
+    def hold(r):
+        r.send("run t_unlink hold &\r")
+        r.wait_for(lambda t: "hold: holding an unlinked file" in t, COMMAND_TIMEOUT, "t_unlink hold")
+        r.kill()  # 掉电：孤儿条目留在磁盘上
+
+    def after(r):
+        c.contains(r.text(), r"\[ok\] file system: removed 1 orphan inode\n", "boot after power loss with an orphan")
+        scrub_ok(c, r.command("run scrub"), "scrub after removing the orphan at mount")
+        r.send("shutdown\r")
+        c.expect(r.finish(COMMAND_TIMEOUT) == 0, "shutdown after removing the orphan")
+
+    reboot(q, c, "orphan1", hold)
+    reboot(q, c, "orphan2", after)
 
 
 def case_fs(q, c, mode):
@@ -1039,6 +1063,7 @@ CASES = {
     "sbrk": (case_sbrk, ["user/tests/t_sbrk.zig"]),
     "cow": (case_cow, ["user/tests/t_cow.zig"]),
     "demand": (case_demand, ["src/fsys.zig", "user/spin.zig", "user/tests/t_demand.zig"]),
+    "unlink": (case_unlink, ["src/fs.zig", "src/fsys.zig", "src/file.zig", "user/tests/t_unlink.zig"]),
     "tools": (case_tools, ["src/fsys.zig", "user/test.zig", "user/expr.zig", "user/seq.zig", "user/sleep.zig", "user/head.zig",
                            "user/tail.zig", "user/grep.zig", "user/cp.zig", "user/touch.zig", "user/tee.zig", "user/xargs.zig",
                            "user/echo.zig", "user/cat.zig", "user/wc.zig", "user/ls.zig", "user/rm.zig", "user/spin.zig",

@@ -147,10 +147,13 @@ pub fn close(f: *File) void {
     const open = f.open;
     f.open = undefined;
     f.lock.release();
-    // 放开 File 的锁之后再关管道：管道的锁和 File 的锁不嵌套，就不用规定加锁的顺序
+    // 放开 File 的锁之后再关管道、放开 inode：管道的锁和 File 的锁不嵌套，就不用规定加锁的顺序。
+    // 放开 inode 时它要是名字都删掉了，这时才删掉它（要读写磁盘，所以调用方不能拿着锁）
     switch (open.target) {
         .pipe => |p| pipe.close(p, open.writable),
-        else => {},
+        .inode => |i| fsys.release(i.ino, .open),
+        .device => |d| fsys.release(d.ino, .open),
+        .console => {},
     }
 }
 
@@ -261,7 +264,7 @@ fn inodeWrite(f: *File, i: *Inode, src: vm.PinnedSrc) Error!usize {
     defer f.pos_lock.release();
     const root = try fsys.writer();
     defer fsys.unlock();
-    // 正在运行的程序文件不能改（按需分页还要从它读页，见 fsys.holdText）
+    // 正在运行的程序文件不能改（按需分页还要从它读页，见 fsys.hold）
     try fsys.beginModify(i.ino);
     defer fsys.endModify();
     const off = if (i.append) (try root.stat(i.ino)).size else i.off;

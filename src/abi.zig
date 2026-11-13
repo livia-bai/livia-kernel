@@ -421,6 +421,8 @@ pub const ScrubInfo = extern struct {
     blocks: u64,
     /// 最后提交的事务号
     generation: u64,
+    /// 孤儿：名字都删掉了、还有人用着（打开着、正在运行）的 inode
+    orphans: u64,
 };
 
 /// kstat 返回的内核计数器：开机以来的累计值，所有 hart 加起来（内核里每个 hart 一份，见 kstat.zig）。

@@ -173,7 +173,7 @@ ELF 来自文件系统，任何人都能往里写一个文件再去运行它，�
 `exec` 只记下“哪些地址可以有页、页从哪来”（`vm.Space`），页表里一开始几乎是空的。用户程序访问一页还没有的地址时缺页（读是 `load_page_fault`，写是 `store_page_fault`，取指令是 `instruction_page_fault`），陷阱处理程序调用 `vm.fault`：地址在某个段、堆或者栈里，并且这次访问是那个区域允许的，就分配一页（段的页从程序文件读内容），映射上，回到那条指令重新执行；不然（没有这个区域、保护页、写代码段、执行数据）照常结束进程。写时复制也在这里处理（[paging.md](paging.md#按需分页)）。
 
 - **页从哪读**（`vm.Backing`）：init 是嵌在内核里的字节（`.bytes`），别的程序是程序文件的 inode（`.file`）。缺页时 `fsys.readText` 拿一个新的快照、按 inode 读那一页、马上放开快照。读盘要睡着等磁盘中断，陷阱处理程序这时什么锁都没拿，可以睡。
-- **程序文件运行期间不能变**：不然一个进程前后读到的页来自两个版本的文件（比如代码段的前一半是旧的、后一半是新的）。所以 `exec` 先占住它（`fsys.holdText`），之后有人要改它的内容（`write`、截断）、删掉它的最后一个名字（`unlink`、`rename` 换掉它）都是 `TextBusy`（`-ETXTBSY`，和 Linux 一样）；它正在被改时也不能开始运行（`exec` 返回 `-ETXTBSY`）。改名、加硬链接、删掉别的名字不动内容，照常可以。`fork` 出来的子进程多占一份（`fsys.dupText`），进程结束时（`finish`）就放开，不等父进程回收；`exec` 换掉地址空间时放开旧的。见 [fs.md](fs.md#正在运行的程序文件)。
+- **程序文件运行期间不能变**：不然一个进程前后读到的页来自两个版本的文件（比如代码段的前一半是旧的、后一半是新的）。所以 `exec` 先占住它（`fsys.hold(ino, .text)`），之后有人要改它的内容（`write`、截断）都是 `TextBusy`（`-ETXTBSY`，和 Linux 一样）；它正在被改时也不能开始运行（`exec` 返回 `-ETXTBSY`）。删掉它的最后一个名字（`unlink`、`rename` 换掉它）可以：和 Linux 一样只删名字，inode 变成孤儿，进程照常从它读页，最后一个用它的进程结束时才删掉。改名、加硬链接不动内容，照常可以。`fork` 出来的子进程多占一份（`fsys.dup`），进程结束时（`finish`）就放开，不等父进程回收；`exec` 换掉地址空间时放开旧的。见 [fs.md](fs.md#删掉还有人用着的文件)。
 - **内存不够**：缺页时分配不到页，进程被结束：`[proc] pid N (name) killed: out of memory (demand paging) at ...`（写时复制没内存复制是 `out of memory (copy-on-write)`），读不出程序文件是 `cannot read the program file (demand paging)`。`sbrk` 不预先分配，所以“堆长成功了、用的时候没内存”是可能的（和 Linux 的 overcommit 一样）。
 - 回归测试 `t_demand`（[testing.md](testing.md#回归测试程序)）：程序里 256 KiB 的只读数组，读其中 16 页正好多用 16 页；数据页的内容来自文件、可写、`fork` 之后各改各的；内核替它读写还没读进来的页；512 KiB 的栈；运行中的程序文件不能写、截断、删除、被 `rename` 换掉，能改名、删另一个硬链接，结束之后又都可以。
 
@@ -258,7 +258,7 @@ pub fn fork() ForkError!usize {
 - **地址空间写时复制**（`vm.cloneUserSpace`，[paging.md](paging.md#复制用户地址空间)）：子进程只新分配页表，用户页和父进程共用（引用数加 1）；可写的页两边都改成只读、标上 `cow`，谁先写哪一页，谁在写缺页里复制一份（`vm.breakCow`，[paging.md](paging.md#写时复制)），所以之后仍然各改各的。shell 运行程序是 `fork` 之后马上 `exec`，子进程的旧地址空间一页都不用复制。
 - **`TrapFrame` 原样复制**，只把 `a0` 改成 0。`fork` 是在系统调用里调用的，这时 `handleTrap` 已经把父进程 `TrapFrame` 的 `sepc` 加过 4 了，所以子进程第一次被调度时，经 `forkret` → `trapExit` 回到 U 模式，正好从 `ecall` 的下一条指令继续，看到 `fork` 返回了 0。父进程照常从系统调用返回，`a0` 是子进程的 pid。
 - **打开的文件和父进程共用**：fd 表逐项复制，每个 `File` 的引用数加 1（`file.dup`），所以父子进程的 fd 指向同一个串口、同一个管道的同一端。shell 运行管道就靠这个（[shell.md](shell.md#管道)）。`dup` 只加引用数，不会失败。
-- 段、堆（`space` 里的 `heap_start`、`brk`）、程序文件也照抄（程序文件多占一份，`fsys.dupText`），已经有的页随地址空间一起共用（写时复制）；父进程还没访问过的页，子进程访问时自己按需分配，从同一个程序文件读（[paging.md](paging.md#复制用户地址空间)）。
+- 段、堆（`space` 里的 `heap_start`、`brk`）、程序文件也照抄（程序文件多占一份，`fsys.dup`），已经有的页随地址空间一起共用（写时复制）；父进程还没访问过的页，子进程访问时自己按需分配，从同一个程序文件读（[paging.md](paging.md#复制用户地址空间)）。
 - 进程表满了是 `TooManyProcesses`，`fork` 系统调用返回 `-EAGAIN`；内存不够（页表都分配不出来）是 `OutOfMemory`（`-ENOMEM`），`cloneUserSpace` 自己释放已经建好的部分。
 - pid 用原子变量 `next_pid.fetchAdd` 分配：几个 hart 同时 `fork` 也不会拿到同一个 pid。
 
@@ -272,8 +272,8 @@ pub fn exec(path: []const u8, args: []const []const u8) ExecError!void {
         defer r.end();
         break :blk try findProgram(&r.fs, p.cwd, path);
     };
-    fsys.holdText(ino) catch return error.TextBusy;      // 占住它：运行期间不能改、不能删
-    var space = vm.createUserSpace() catch |err| { fsys.releaseText(ino); return err; };
+    fsys.hold(ino, .text) catch ...;                     // 占住它：运行期间不能改；删掉只删名字
+    var space = vm.createUserSpace() catch |err| { fsys.release(ino, .text); return err; };
     space.backing = .{ .file = ino };                    // 占用交给地址空间，destroyUserSpace 时放开
     errdefer vm.destroyUserSpace(&space);
     const image = blk: {                                 // 占住之后再拿一个快照，读文件头、记下段
@@ -294,7 +294,7 @@ pub fn exec(path: []const u8, args: []const []const u8) ExecError!void {
 ```
 
 - **找程序**（`findProgram`）：`path` 里没有 `/` 的在 `/bin` 里找（`run hello` 就是 `/bin/hello`，相当于 `PATH` 只有 `/bin`），有的按路径找，相对路径从当前目录开始，跟着符号链接走（进程名是路径的最后一段，也就是链接的名字）。找不到是 `NoSuchProgram`（`ENOENT`），是目录是 `BadElf`（`ENOEXEC`），路径中间不是目录是 `NotDir`，符号链接有环是 `SymlinkLoop`（`ELOOP`），`/bin/` 加上名字超过 256 字节是 `NameTooLong`，没挂上文件系统是 `NoDevice`。
-- **先占住、再读**：`exec` 只读文件头和程序头，段的内容要等程序运行起来、缺页时才读，那时用的是新的快照（`fsys.readText`），所以必须保证这段时间里文件不变：先 `holdText` 占住（[fs.md](fs.md#正在运行的程序文件)），再拿一个**新的**快照读文件头。找程序时的那个快照是占住之前拿的，可能已经旧了：别人可能刚好在两者之间改完了这个文件。占住之后，修改它的一方都会得到 `TextBusy`；占住之前就开始了的修改，要么还没做完（`holdText` 看到有人正在改它，`exec` 返回 `TextBusy`），要么已经提交了，新快照里看得到。所以新快照里的文件头和之后每次缺页读到的内容是同一个版本。两次之间文件被删掉了是 `NoSuchProgram`。快照都不挡着别人读写文件系统（几个 hart 同时 `exec` 各读各的）。
+- **先占住、再读**：`exec` 只读文件头和程序头，段的内容要等程序运行起来、缺页时才读，那时用的是新的快照（`fsys.readText`），所以必须保证这段时间里文件不变：先 `fsys.hold` 占住（[fs.md](fs.md#删掉还有人用着的文件)），再拿一个**新的**快照读文件头。找程序时的那个快照是占住之前拿的，可能已经旧了：别人可能刚好在两者之间改完了这个文件。占住之后，修改它的一方都会得到 `TextBusy`；占住之前就开始了的修改，要么还没做完（`holdText` 看到有人正在改它，`exec` 返回 `TextBusy`），要么已经提交了，新快照里看得到。所以新快照里的文件头和之后每次缺页读到的内容是同一个版本。两次之间文件被删掉了是 `NoSuchProgram`。快照都不挡着别人读写文件系统（几个 hart 同时 `exec` 各读各的）。
 - 先把新程序加载进**新的**地址空间（记下段、写好参数），全部成功之后才换掉旧的。失败时旧的地址空间和 `TrapFrame` 都没动，系统调用返回错误，原来的程序接着运行（xv6 也是这样）。
 - `args` 已经在**内核内存**里了：参数在旧的地址空间里，换掉之前 `exec` 系统调用就把它们复制到了内核栈上（[syscalls.md](syscalls.md#exec)）。
 - **释放旧的页表之前必须先切走**：这时 `satp` 还指着旧的根页表。`destroyUserSpace` 同时放开旧的程序文件（`vm.releaseBacking`）。
@@ -730,7 +730,6 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 - 进程表固定 64 项，内核栈和启动栈是静态的、大小固定，所以按实测用量留了余量；溢出时撞到下面的保护页，内核 panic（[进程表](#进程表)），不能像用户栈那样长。
 - `fork` 写时复制，但页表还是整个复制的；内存用完时，按需分配新页、写共用的页都只能结束进程（没有换页、没有 OOM killer 挑别的进程）。
 - 按需分页每缺一页读一次盘（经过缓冲区缓存），没有预读，也没有页缓存：同一个程序的几个进程（不是 `fork` 出来的）各读各的，代码页不共用；页一旦读进来就不会被换出去。
-- 正在运行的程序文件不能删（`TextBusy`），Linux 允许删（inode 留到最后一个用它的进程结束）；这里的文件系统没有“没名字但还打开着”的 inode。
 - `exec` 没有 `PATH`、没有 `#!` 脚本，也不检查执行权限（文件系统没有权限位）：`/bin` 之外的程序要写路径，任何文件都可以拿去试着运行，不是 ELF 的得到 `ENOEXEC`。
 - 只有一个前台进程，没有进程组和信号：Ctrl-C 杀前台进程和它的子孙；前台进程的子孙被交给 init 之后（父进程先结束了）就不算了。
 - 只有 `sbrk`，没有 `mmap`；用户栈最多 1 MiB，按需分配，不能再长（Linux 默认 8 MiB）。
@@ -754,7 +753,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 | `Volume.snap_lock` | 文件系统已提交的根、读者计数；修改的一方等旧树的读者时拿着它睡下 | [btree.md](btree.md#快照读者) |
 | `Sleeplock.lk` | 一把睡眠锁的 `locked`、`holder`；等锁的进程拿着它睡下 | [disk.md](disk.md#睡眠锁sleeplockzig) |
 | `uart.tx_lock` | 串口输出：一次 `print`、一次 `write` 系统调用整段输出，不和别的 hart 的输出交错 | [devices.md](devices.md#串口uartzig) |
-| `fsys.text_lock` | 正在运行的程序文件的表（`texts`）和正在被改的 inode（`modifying`） | [fs.md](fs.md#正在运行的程序文件) |
+| `fsys.use_lock` | 正在用的 inode 的表（`users`：打开着的、正在运行的，是不是孤儿）、正在被改的 inode（`modifying`）、正在被删的 inode（`removing`） | [fs.md](fs.md#删掉还有人用着的文件) |
 
 不用锁的：`proc.next_pid`、`proc.foreground`、每一页的引用数（`page.refs`）、缓冲区缓存的 `clock`、`evicting` 是原子变量；`init_proc` 只在启动时写一次；`cpus[i]`、`spinlock` 的 `held[i]`、`timer.deadline[i]` 只有 hart i 自己读写；进程的 `space`、`context`、`files`、`cwd` 只有进程自己读写（见[进程表](#进程表)）；内核页表启动后不再改。
 
@@ -779,7 +778,7 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
   | `bucket` | `bio` 的桶的锁 | `evict_lock`（`cond`）之后拿；`takeOldest` 同时拿两个桶，所以这一级允许同时拿几把：只有拿着 `evict_lock` 的才这样做，不会互相等 |
   | `proc` | `Process.lock` | 一次只拿一个进程的锁（`sleep` 里交接时拿着自己的进程锁和条件的锁，两者不同级） |
   | `uart_out` | `uart.tx_lock` | 拿着进程锁、条件的锁时都可能打印，所以比它们高；打印时不再拿别的锁 |
-  | `leaf` | `page.Pool.lock`、`File.lock`、`fsys.text_lock` | 拿着它们不再拿别的锁。`fork` 拿着 `wait_lock` 和子进程的锁调用 `file.dup`，`reap` 拿着锁释放页 |
+  | `leaf` | `page.Pool.lock`、`File.lock`、`fsys.use_lock` | 拿着它们不再拿别的锁。`fork` 拿着 `wait_lock` 和子进程的锁调用 `file.dup`，`reap` 拿着锁释放页 |
 
   只有 `bucket` 一级允许同时拿几把；别的同一级的锁不嵌套：`file.close` 先放开 `File.lock` 再去关管道，页分配器从别的 hart 拿页（`steal`）时先放开别人的链表的锁再拿自己的，`file.alloc` 一个槽位一个槽位地拿锁。拿着锁复制用户内存的地方都先 pin 好（[paging.md](paging.md#内核访问用户内存)），拿着锁时不会再缺页、分配页。
 

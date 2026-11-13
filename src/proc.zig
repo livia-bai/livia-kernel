@@ -301,8 +301,8 @@ pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, IoError, NoDevi
 /// 失败时原来的地址空间和 TrapFrame 都不变，系统调用照常返回错误。pid、父进程、CPU 时间、打开的文件、当前目录不变。
 ///
 /// 只读 ELF 的文件头和程序头，记下各个段（vm.Space），段的内容等程序访问到时才读（按需分页）。
-/// 所以新程序运行期间要一直能从这个文件读到同一个版本：先占住它（fsys.holdText，之后改它、删它的一方
-/// 得到 TextBusy），再在一个新的快照上读文件头（占住之前那个快照里看到的可能已经被改掉了）。
+/// 所以新程序运行期间要一直能从这个文件读到同一个版本：先占住它（fsys.hold，之后改它的一方得到 TextBusy，
+/// 删掉它只删名字），再在一个新的快照上读文件头（占住之前那个快照里看到的可能已经被改掉了）。
 /// 有人正在改这个文件时是 TextBusy。
 pub fn exec(path: []const u8, args: []const []const u8) ExecError!void {
     const p = current().?;
@@ -311,9 +311,12 @@ pub fn exec(path: []const u8, args: []const []const u8) ExecError!void {
         defer r.end();
         break :blk try findProgram(&r.fs, p.cwd, path);
     };
-    fsys.holdText(ino) catch return error.TextBusy;
+    fsys.hold(ino, .text) catch |err| return switch (err) {
+        error.TextBusy => error.TextBusy,
+        error.NotFound => error.NoSuchProgram, // 正在被删掉
+    };
     var space = vm.createUserSpace() catch |err| {
-        fsys.releaseText(ino);
+        fsys.release(ino, .text);
         return err;
     };
     space.backing = .{ .file = ino }; // 占用交给地址空间，destroyUserSpace 时放开

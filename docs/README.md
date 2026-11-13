@@ -81,7 +81,7 @@ livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 
 | `src/btree.zig` | [btree.md](btree.md#节点格式btreezig) | |
 | `src/ctree.zig` | [btree.md](btree.md) | [disk.md](disk.md#缓冲区缓存biozig) |
 | `src/fs.zig` | [fs.md](fs.md) | [btree.md](btree.md) |
-| `src/fsys.zig` | [fs.md](fs.md#接进内核fsyszig) | [fs.md](fs.md#正在运行的程序文件)、[files.md](files.md)、[disk.md](disk.md#系统调用) |
+| `src/fsys.zig` | [fs.md](fs.md#接进内核fsyszig) | [fs.md](fs.md#删掉还有人用着的文件)、[files.md](files.md)、[disk.md](disk.md#系统调用) |
 | `src/mkfs.zig` | [fs.md](fs.md#生成磁盘镜像mkfszig) | [build.md](build.md#磁盘镜像) |
 | `src/ipi.zig` | [process.md](process.md#核间中断) | [riscv-sbi.md](riscv-sbi.md#用到的扩展)、[trap.md](trap.md#分发) |
 | `src/dtb.zig` | [devicetree.md](devicetree.md) | |

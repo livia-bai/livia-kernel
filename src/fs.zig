@@ -6,11 +6,15 @@
 //!   (ino, inode,  0)                  Inode：种类、链接数、设备号、长度、父目录
 //!   (目录 ino, dir, 名字的散列 << 32 | 序号)   目录项：子 inode 号、种类、名字。散列相同的名字序号不同
 //!   (ino, extent, 页号 * 4096)        文件第几页的内容：内联（数据直接放在条目里）或者指向一个数据块
+//!   (0, orphan, ino)                  孤儿：名字都删掉了、还有人用着的 inode（链接数是 0），没有数据
 //!
 //! - 根目录的 inode 号是 1，新 inode 号是树里最大的 objectid + 1（挂载时算出来，之后递增）。
 //! - 目录不存 "." 和 ".."：路径里遇到它们时直接用自己、Inode.parent。
 //! - 硬链接：文件和设备可以有几个名字（link），Inode.nlink 记着有几个，最后一个名字删掉才删 inode。
 //!   目录只有一个名字（它的 parent 才有意义）。
+//! - 孤儿（btrfs 的 ORPHAN_ITEM）：删掉最后一个名字时，调用方说它还有人用着（keep：打开着的文件、正在运行的程序）的话，
+//!   inode 留着、链接数记成 0，再插一个孤儿条目；用的人都放开之后调用方 reapOrphan 删掉它。掉电时孤儿条目还在的，
+//!   挂载之后 reapOrphans 删掉。孤儿条目的 objectid 是 0（没有这个 inode 号），都排在树的最前面。
 //! - 设备文件（mknod）：只有 inode，没有内容，Inode.major 说是哪个设备，打开它的读写交给内核的设备（file.zig）。
 //! - 符号链接（symlink）：inode 的长度是目标路径的长度，目标内联在第 0 页的内容条目里（btrfs 也这样存）。
 //!   解析路径时遇到它就换成目标接着走（最多 max_follows 次）；unlink、rename、link 对的是链接自己。
@@ -44,6 +48,7 @@ pub const max_follows = 10;
 const type_inode: u8 = 1;
 const type_dir: u8 = 2;
 const type_extent: u8 = 3;
+const type_orphan: u8 = 4;
 
 /// inode 的种类。数值和 abi.FileKind 一样（3、4 是串口、管道，不在文件系统里）
 pub const Kind = enum(u8) { file = 1, dir = 2, device = 5, symlink = 6, _ };
@@ -155,6 +160,9 @@ pub const Fs = struct {
     /// 读者的快照：不为 null 时只读，所有查找都在这棵已提交的树上做（ctree 的 beginRead）；
     /// 为 null 时是修改的一方，在当前事务的树上做
     view: ?ctree.Root = null,
+    /// 删掉一个文件（不是目录）的最后一个名字时问一声：返回 true 表示还有人用着，留下孤儿而不是删掉 inode。
+    /// 内核里是 fsys.keepInUse；mkfs、单元测试里没人用着，null 就是都删掉
+    keep: ?*const fn (ino: u64) bool = null,
 
     /// 在磁盘上建一个只有空的根目录的文件系统。
     pub fn format(vol: *Volume, blocks: u64) Error!void {
@@ -449,8 +457,9 @@ pub const Fs = struct {
         try fs.putInode(ino, ind);
     }
 
-    /// 删掉一个名字。是 inode 的最后一个名字的话，inode 也删掉（文件的内容一起释放）。目录必须是空的。
-    /// 还打开着被删掉的 inode 的文件、以它为当前目录的进程之后再用它会得到 NotFound（没有 Unix 那样“关掉才真正删除”）。
+    /// 删掉一个名字。是 inode 的最后一个名字的话，inode 也删掉（文件的内容一起释放），除非 keep 说它还有人用着：
+    /// 那样它变成孤儿，用的人放开之后 reapOrphan。目录必须是空的；目录总是马上删掉，以它为当前目录的进程之后
+    /// 再用它会得到 NotFound。
     pub fn unlink(fs: *Fs, cwd: u64, path: []const u8) Error!void {
         const dir, const name = try fs.resolveParent(cwd, path);
         const found, _ = try fs.scan(dir, name);
@@ -458,7 +467,7 @@ pub const Fs = struct {
     }
 
     /// 删掉目录 dir 里的目录项 e（unlink、rename 换掉已有的名字）。e 指向的 inode 还有别的名字的话
-    /// 只把链接数减 1，否则 inode 也删掉。目录必须是空的。
+    /// 只把链接数减 1；还有人用着（keep）的话链接数记成 0、变成孤儿；否则 inode 也删掉。目录必须是空的。
     fn remove(fs: *Fs, dir: u64, e: Found) Error!void {
         if (e.kind == .dir) {
             if (try fs.next(Key.init(e.ino, type_dir, 0), null)) |f| {
@@ -466,18 +475,43 @@ pub const Fs = struct {
             }
         } else {
             var ind = try fs.getInode(e.ino);
-            if (ind.nlink > 1) {
+            if (ind.nlink > 1 or (if (fs.keep) |keep| keep(e.ino) else false)) {
                 ind.nlink -= 1;
                 try fs.putInode(e.ino, ind);
+                if (ind.nlink == 0) try fs.vol.insert(Key.init(0, type_orphan, e.ino), &.{});
                 return fs.vol.delete(Key.init(dir, type_dir, e.offset));
             }
         }
-        // inode 号为 e.ino 的所有条目：inode 和文件内容
-        while (try fs.next(Key.init(e.ino, 0, 0), null)) |f| {
-            if (f.key.objectid != e.ino) break;
+        try fs.deleteInode(e.ino);
+        try fs.vol.delete(Key.init(dir, type_dir, e.offset));
+    }
+
+    /// inode 号为 ino 的所有条目：inode 和文件内容（数据块一起释放）。
+    fn deleteInode(fs: *Fs, ino: u64) Error!void {
+        while (try fs.next(Key.init(ino, 0, 0), null)) |f| {
+            if (f.key.objectid != ino) break;
             try fs.dropItem(f.key);
         }
-        try fs.vol.delete(Key.init(dir, type_dir, e.offset));
+    }
+
+    /// 删掉孤儿 ino（用它的人都放开了）。没有它的孤儿条目（删名字的事务作废了、已经删过了）就什么都不做。
+    pub fn reapOrphan(fs: *Fs, ino: u64) Error!void {
+        const key = Key.init(0, type_orphan, ino);
+        if (try fs.lookup(key, null) == null) return;
+        if ((try fs.getInode(ino)).nlink != 0) return error.Corrupt;
+        try fs.deleteInode(ino);
+        try fs.vol.delete(key);
+    }
+
+    /// 删掉所有孤儿（挂载之后：上次关机或者掉电时还有人用着的那些，现在不会有人用了）。返回删了几个。
+    pub fn reapOrphans(fs: *Fs) Error!u64 {
+        var n: u64 = 0;
+        while (try fs.next(Key.init(0, type_orphan, 0), null)) |f| {
+            if (f.key.objectid != 0 or f.key.type != type_orphan) break;
+            try fs.reapOrphan(f.key.offset);
+            n += 1;
+        }
+        return n;
     }
 
     /// 把 old 改名成 new，可以换到别的目录。一个事务做完（调用方用 run），所以要么改好了、要么什么都没变，
@@ -729,6 +763,8 @@ pub const Fs = struct {
         dirs: u64 = 0,
         devices: u64 = 0,
         symlinks: u64 = 0,
+        /// 孤儿（名字都删掉了、还有人用着的 inode）
+        orphans: u64 = 0,
         /// 读过、校验和对得上的数据块
         data_blocks: u64 = 0,
     };
@@ -747,6 +783,7 @@ pub const Fs = struct {
     ///   （一个 inode 多一个名字、另一个少一个，这三个同时对上的概率可以忽略）。
     /// - 设备文件没有内容、长度是 0；只有设备文件的 major 不是 0。
     /// - 符号链接的长度是 1..max_symlink，正好有一个内联在第 0 页的内容条目（目标），长度就是 inode 的长度。
+    /// - 链接数是 0 的 inode 正好就是孤儿条目指着的那些，而且不是目录。
     pub fn check(fs: *Fs) Error!CheckStats {
         var stats: CheckStats = .{ .tree = try fs.vol.check() };
         var buf: [btree.max_data]u8 = undefined;
@@ -755,18 +792,30 @@ pub const Fs = struct {
         var cur_inline = false;
         var names: Tally = .{};
         var inodes: Tally = .{};
+        var orphans: Tally = .{}; // 孤儿条目指着的
+        var unlinked: Tally = .{}; // 链接数是 0 的
         var k = Key.init(0, 0, 0);
         while (try fs.next(k, &buf)) |f| : (k = f.key.successor() orelse break) {
             const ino = f.key.objectid;
             const data = buf[0..f.size]; // ctree 的 check 保证了不超过 max_data
             if (ino >= fs.next_ino) return error.Corrupt;
+            if (f.key.type == type_orphan) {
+                if (ino != 0 or data.len != 0 or f.key.offset == root_ino or f.key.offset >= fs.next_ino) return error.Corrupt;
+                orphans.add(f.key.offset);
+                stats.orphans += 1;
+                continue;
+            }
             if (f.key.type != type_inode and (cur == null or cur_ino != ino)) return error.Corrupt; // 没有 inode 的条目
             switch (f.key.type) {
                 type_inode => {
                     if (missingTarget(cur, cur_inline)) return error.Corrupt;
                     if (f.key.offset != 0 or data.len != @sizeOf(Inode)) return error.Corrupt;
                     const ind = std.mem.bytesToValue(Inode, data);
-                    if (ind.nlink == 0 or (ind.kind != .device and ind.major != 0) or ind._pad != 0) return error.Corrupt;
+                    if ((ind.kind != .device and ind.major != 0) or ind._pad != 0) return error.Corrupt;
+                    if (ind.nlink == 0) {
+                        if (ino == root_ino or ind.kind == .dir) return error.Corrupt;
+                        unlinked.add(ino);
+                    }
                     switch (ind.kind) {
                         .file => stats.files += 1,
                         .dir => {
@@ -826,7 +875,7 @@ pub const Fs = struct {
                 else => return error.Corrupt,
             }
         }
-        if (missingTarget(cur, cur_inline) or stats.dirs == 0 or !std.meta.eql(names, inodes)) return error.Corrupt;
+        if (missingTarget(cur, cur_inline) or stats.dirs == 0 or !std.meta.eql(names, inodes) or !std.meta.eql(orphans, unlinked)) return error.Corrupt;
         return stats;
     }
 
@@ -1451,6 +1500,76 @@ test "dirPath：目录的路径（getcwd）" {
     try std.testing.expectError(error.NotFound, fs.dirPath(y, &out));
 }
 
+/// 测试用的 keep：test_keep_all 为 true 时，每个被删掉最后一个名字的 inode 都“还有人用着”。
+var test_keep_all = false;
+fn testKeep(ino: u64) bool {
+    _ = ino;
+    return test_keep_all;
+}
+
+test "孤儿：删掉还有人用着的文件只删名字，按 inode 号照常读写；reapOrphan 之后块都还回来；挂载后 reapOrphans" {
+    const expectEqual = std.testing.expectEqual;
+    var fs = try testSetup(256);
+    defer testFree();
+    defer test_keep_all = false;
+    fs.keep = testKeep;
+    const free_empty = fs.vol.free_count;
+    const a = try fs.run(Fs.create, .{ root_ino, "/a", Kind.file });
+    var data: [3 * block_size]u8 = undefined;
+    for (&data, 0..) |*c, i| c.* = @truncate(i * 5);
+    try writeAt(&fs, a, 0, &data);
+    // 没人用着：照常马上删掉
+    try fs.run(Fs.unlink, .{ root_ino, "/a" });
+    try std.testing.expectError(error.NotFound, fs.stat(a));
+    try expectEqual(free_empty, fs.vol.free_count);
+
+    // 有人用着：只删名字，inode 变成孤儿（链接数 0），按 inode 号还能读写，check 认得它
+    test_keep_all = true;
+    const b = try fs.run(Fs.create, .{ root_ino, "/b", Kind.file });
+    try writeAt(&fs, b, 0, &data);
+    try fs.run(Fs.unlink, .{ root_ino, "/b" });
+    try std.testing.expectError(error.NotFound, fs.resolve(root_ino, "/b"));
+    try expectEqual(0, (try fs.stat(b)).nlink);
+    try writeAt(&fs, b, 2 * block_size, "tail");
+    var buf: [3 * block_size]u8 = undefined;
+    try expectEqual(data.len, try fs.read(b, 0, data.len, SliceOut{ .buf = &buf }));
+    try std.testing.expectEqualSlices(u8, "tail", buf[2 * block_size ..][0..4]);
+    try expectEqual(1, (try fs.check()).orphans);
+
+    // rename 换掉一个有人用着的文件也一样（/c 原来的 inode 变成孤儿，/c 现在是 e 的第二个名字）；
+    // 有两个名字的删掉一个，链接数减 1，不是孤儿
+    const c = try fs.run(Fs.create, .{ root_ino, "/c", Kind.file });
+    const e = try fs.run(Fs.create, .{ root_ino, "/e", Kind.file });
+    try fs.run(Fs.link, .{ root_ino, "/e", "/e2" });
+    try fs.run(Fs.link, .{ root_ino, "/e", "/e3" });
+    try fs.run(Fs.rename, .{ root_ino, "/e2", "/c" });
+    try fs.run(Fs.unlink, .{ root_ino, "/e3" });
+    try expectEqual(0, (try fs.stat(c)).nlink);
+    try expectEqual(2, (try fs.stat(e)).nlink);
+    try expectEqual(2, (try fs.check()).orphans);
+
+    // 用的人放开了：删掉；再删一次、删一个不是孤儿的什么都不做
+    try fs.run(Fs.reapOrphan, .{b});
+    try std.testing.expectError(error.NotFound, fs.stat(b));
+    try fs.run(Fs.reapOrphan, .{b});
+    try fs.run(Fs.reapOrphan, .{e});
+    try expectEqual(2, (try fs.stat(e)).nlink);
+    try expectEqual(1, (try fs.check()).orphans);
+
+    // 重新挂载（上次关机时还有人用着 c）：孤儿还在，reapOrphans 删掉它
+    testReboot();
+    fs = try Fs.mount(&test_vol);
+    try expectEqual(1, (try fs.check()).orphans);
+    try expectEqual(1, try fs.run(Fs.reapOrphans, .{}));
+    try expectEqual(0, try fs.run(Fs.reapOrphans, .{}));
+    try std.testing.expectError(error.NotFound, fs.stat(c));
+    try expectEqual(0, (try fs.check()).orphans);
+    // 重新挂载得到的 Fs 没有 keep：删掉就是真删
+    try fs.run(Fs.unlink, .{ root_ino, "/e" });
+    try fs.run(Fs.unlink, .{ root_ino, "/c" });
+    try expectEqual(free_empty, fs.vol.free_count);
+}
+
 test "check：条目之间对不上的都是 Corrupt" {
     var fs = try testSetup(256);
     defer testFree();
@@ -1484,6 +1603,9 @@ test "check：条目之间对不上的都是 Corrupt" {
         symlink_no_target,
         symlink_wrong_size,
         symlink_in_block,
+        orphan_with_name,
+        orphan_dir,
+        orphan_missing,
     };
     for (std.enums.values(Bad)) |bad| {
         var entry: [@sizeOf(DirHeader) + 1]u8 = undefined;
@@ -1536,6 +1658,16 @@ test "check：条目之间对不上的都是 Corrupt" {
             .symlink_wrong_size => try v.update(Key.init(sym, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .symlink, .size = 2, .parent = d })),
             // 符号链接的目标在数据块里
             .symlink_in_block => try v.update(Fs.extentKey(sym, 0), std.mem.asBytes(&BlockExtent{ .head = .{ .kind = .block }, .blockno = 2, .generation = 1 })),
+            // 孤儿条目指着一个还有名字的 inode
+            .orphan_with_name => try v.insert(Key.init(0, type_orphan, f), &.{}),
+            // 目录不能是孤儿（链接数 0、有孤儿条目也不行）
+            .orphan_dir => {
+                try v.update(Key.init(e, type_inode, 0), std.mem.asBytes(&Inode{ .kind = .dir, .nlink = 0, .size = 0, .parent = d }));
+                try v.delete(Key.init(d, type_dir, (try fs.scan(d, "e"))[0].?.offset));
+                try v.insert(Key.init(0, type_orphan, e), &.{});
+            },
+            // 孤儿条目指着不存在的 inode
+            .orphan_missing => try v.insert(Key.init(0, type_orphan, n), &.{}),
         }
         std.testing.expectError(error.Corrupt, fs.check()) catch |err| {
             std.debug.print("not detected: {s}\n", .{@tagName(bad)});
@@ -1590,6 +1722,7 @@ const FsCrashRun = struct {
 
     fn run(r: *FsCrashRun, budget: ?usize) !void {
         var fs = try testSetup(96);
+        fs.keep = testKeep;
         _ = try fs.run(Fs.create, .{ root_ino, "/d", Kind.dir });
         var model: FsModel = .{};
         defer model.deinit();
@@ -1635,6 +1768,11 @@ const FsCrashRun = struct {
 /// 对名字 i 做一个随机操作（不存在就创建；否则删除、截断、改名成另一个名字 j（j 有的话换掉它）、
 /// 给它建一个硬链接（链接到一个还没有的名字），或者在随机位置写一段），同时改 next。
 fn step(fs: *Fs, next: *FsModel, i: usize, path: []const u8, rng: std.Random, step_no: usize, data: []u8) !void {
+    // 有孤儿的那一遍：时不时把孤儿都删掉（用的人放开了），名字都不变
+    if (test_keep_all and step_no % 4 == 3) {
+        _ = try fs.run(Fs.reapOrphans, .{});
+        return;
+    }
     const k = next.names[i] orelse {
         const free = next.freeFile();
         next.files[free].clearRetainingCapacity();
@@ -1703,12 +1841,23 @@ fn fsExpect(fs: *Fs, m: *const FsModel) !void {
 }
 
 test "掉电：文件系统操作之间、写数据块、写节点、写超级块的任何时候掉电，重新挂载后都是某一步做完的样子" {
+    try fsCrashAll();
+}
+
+test "掉电（删掉的文件都还有人用着）：孤儿和删掉孤儿的事务也一样，重新挂载后 reapOrphans 把块都还回来" {
+    test_keep_all = true;
+    defer test_keep_all = false;
+    try fsCrashAll();
+}
+
+/// 完整跑一遍 FsCrashRun 数写了几次盘，再对每一个 N 在第 N 次写之后掉电、重新挂载、核对。
+fn fsCrashAll() !void {
     defer testFree();
     var full: FsCrashRun = .{};
     defer full.deinit();
     try full.run(null);
     const total = test_writes;
-    try std.testing.expect(total > 100);
+    try std.testing.expect(total > 60);
     for (0..total + 1) |budget| {
         var r: FsCrashRun = .{};
         defer r.deinit();

@@ -253,7 +253,7 @@ pub const Backing = union(enum) {
     none,
     /// 嵌在内核里的字节：init（第一个进程要在挂载文件系统之前加载）、单元测试
     bytes: []const u8,
-    /// 文件系统里的程序文件（exec），inode 号。有地址空间用着它时它不能改、不能删（fsys.holdText），
+    /// 文件系统里的程序文件（exec），inode 号。有地址空间用着它时它不能改（fsys.hold；删掉名字只会让它变成孤儿），
     /// 所以什么时候读，读到的都是 exec 时的那个版本
     file: u64,
 
@@ -335,11 +335,11 @@ pub fn destroyUserSpace(s: *Space) void {
     releaseBacking(s);
 }
 
-/// 不再从程序文件读页了：放开对它的占用（fsys.releaseText），它又可以改、可以删了。
+/// 不再从程序文件读页了：放开对它的占用（fsys.release），它又可以改了；名字已经删掉了的话，这时删掉它。
 /// 进程结束时（proc.finish）就调用，不用等父进程回收；之后这个地址空间不会再缺页。
 pub fn releaseBacking(s: *Space) void {
     switch (s.backing) {
-        .file => |ino| fsys.releaseText(ino),
+        .file => |ino| fsys.release(ino, .text),
         else => {},
     }
     s.backing = .none;
@@ -414,7 +414,7 @@ fn leafOf(root: *PageTable, va: usize) ?*Pte {
 /// 可写的页在两边都改成只读、标上 cow：之后谁先写谁触发缺页，由 breakCow 给它复制一份，所以两边仍然各改各的。
 /// 本来就只读的页（代码、只读数据）不会被写，一直共用。需要新分配的只有子进程的页表。
 /// src 里还没访问过的页，dst 里也没有：以后谁访问谁按需分配（段的内容从同一个程序文件读，所以和 src 的一样）。
-/// 段、堆、程序文件都照抄，程序文件多一个占用（fsys.dupText）。
+/// 段、堆、程序文件都照抄，程序文件多一个占用（fsys.dup）。
 ///
 /// src 是当前 hart 正在用的地址空间（fork 的父进程），改了它的页表项，最后刷新 TLB。
 /// 中途内存不够时 dst 整个释放掉；src 里已经改成 cow 的页留着不改回去：以后写的时候 breakCow
@@ -429,7 +429,7 @@ pub fn cloneUserSpace(src: *Space) error{OutOfMemory}!Space {
     dst.heap_start = src.heap_start;
     dst.brk = src.brk;
     switch (src.backing) {
-        .file => |ino| fsys.dupText(ino),
+        .file => |ino| fsys.dup(ino, .text),
         else => {},
     }
     dst.backing = src.backing;

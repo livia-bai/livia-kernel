@@ -17,7 +17,7 @@
 pub const Super = extern struct {
     csum: u32,              // crc32c，覆盖这一块 csum 之后的所有字节
     _pad: u32,
-    magic: [8]u8,           // "LBFS0003"（磁盘格式的版本，B 树或文件系统的格式改了就换）
+    magic: [8]u8,           // "LBFS0004"（磁盘格式的版本，B 树或文件系统的格式改了就换）
     generation: u64,        // 事务号
     blocks: u64,            // 文件系统有多少块
     root: u64,              // 根节点的块号

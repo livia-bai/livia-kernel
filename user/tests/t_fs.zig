@@ -319,10 +319,10 @@ pub fn main() u8 {
         expect(sys.unlink("/t_fs/many/.") == error.InvalidArgument, "unlink .", .{});
         expect(sys.unlink("/t_fs/zzz") == error.NotFound, "unlink a missing file", .{});
         expect(sys.unlink("/") == error.InvalidArgument, "unlink /", .{});
-        // 打开着的文件被删了：之后读它是 NotFound（没有 Unix 的“最后一个关掉才删”）
+        // 打开着的文件被删了：只删名字，fd 照常能读（和 Unix 一样，最后一个关掉才删，更多见 t_unlink）
         const ofd = mustOpen("/t_fs/many/f0", .{});
         expect(sys.unlink("/t_fs/many/f0") != error.NotFound, "unlink an open file", .{});
-        expect(sys.read(ofd, &buf) == error.NotFound, "read a deleted file", .{});
+        expect((sys.read(ofd, &buf) catch 999) != 999, "read a deleted file that is still open", .{});
         sys.close(ofd) catch {};
         expect(sys.open("/t_fs/many/f0", .{}) == error.NotFound, "open after unlink", .{});
     }

@@ -4,8 +4,8 @@
 //! - 内核替程序读写还没读进来的页（write 写管道、文件，read、readdir、fstat、wait 的输出参数）也行：
 //!   这些有的是拿着锁复制的，要先准备好（vm.pinSrc 这些），没准备好的话拿着锁时缺页。
 //! - 栈按需长，最多 1 MiB。
-//! - 正在运行的程序文件不能改、不能删（TextBusy）：复制一份 spin 运行起来，试着写它、截断它、删它、
-//!   用 rename 换掉它；改名、删掉它的另一个硬链接可以；它结束之后又都可以了。
+//! - 正在运行的程序文件不能改（TextBusy）：复制一份 spin 运行起来，试着写它、截断它；改名、加一个硬链接
+//!   再删掉都可以（删掉正在运行的程序见 t_unlink）；它结束之后又都可以改了。
 //! 失败的项打印 "FAIL: ..."，最后打印检查了几项、失败了几项。
 
 const std = @import("std");
@@ -155,7 +155,7 @@ fn recurse(n: usize) usize {
     return recurse(n - 1) + v[n % 1024];
 }
 
-/// 4. 正在运行的程序文件不能改、不能删
+/// 4. 正在运行的程序文件不能改内容
 fn textBusy() void {
     sys.mkdir("/tdemand") catch {};
     if (!copyFile("/bin/spin", "/tdemand/s")) {
@@ -177,14 +177,11 @@ fn textBusy() void {
         sys.close(fd) catch {};
     }
     expect(sys.open("/tdemand/s", .{ .write = true, .truncate = true }) == error.TextBusy, "truncating a running program", .{});
-    expect(sys.unlink("/tdemand/s") == error.TextBusy, "removing a running program", .{});
     _ = copyFile("/bin/hello", "/tdemand/h");
-    expect(sys.rename("/tdemand/h", "/tdemand/s") == error.TextBusy, "renaming over a running program", .{});
     // 改名、多一个名字再删掉一个，都不碰内容：可以
     sys.rename("/tdemand/s", "/tdemand/s2") catch |err| expect(false, "renaming a running program: {s}", .{@errorName(err)});
     sys.link("/tdemand/s2", "/tdemand/s3") catch |err| expect(false, "linking a running program: {s}", .{@errorName(err)});
     sys.unlink("/tdemand/s3") catch |err| expect(false, "removing a second name of a running program: {s}", .{@errorName(err)});
-    expect(sys.unlink("/tdemand/s2") == error.TextBusy, "removing the renamed running program", .{});
     sys.kill(pid) catch {};
     _ = sys.wait(pid, false) catch {};
     // 结束了：又可以改、可以删了

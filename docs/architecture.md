@@ -132,6 +132,6 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 - init（pid 1）一直存在：结束的进程由父进程回收，父进程先结束的交给 init 回收。init 结束内核就 panic。
 - 用户程序只能用根页表第 1 项；内核的映射不能放进 `0x4000_0000..0x8000_0000`（[paging.md](paging.md)）。
 - 内核从不直接解引用用户给的指针，`sstatus.SUM` 始终为 0，访问用户内存一律走 `vm.copyFromUser`（[syscalls.md](syscalls.md)）。拿着锁复制用户内存的系统调用先 pin（`vm.pinSrc`、`pinDst`），拿着锁时只用 pin 好的 `PinnedSrc`/`PinnedDst` 复制：拿着锁时不能缺页（[paging.md](paging.md#内核访问用户内存)）。
-- 正在运行的程序文件不能改、不能删（`ETXTBSY`）：按需分页一直要从它读页（[fs.md](fs.md#正在运行的程序文件)）。
+- 正在运行的程序文件不能改内容（`ETXTBSY`）：按需分页一直要从它读页。可以删：和打开着的文件一样只删名字，最后一个使用者放开时才删（[fs.md](fs.md#删掉还有人用着的文件)）。
 - `TrapFrame` 的布局和 `trapEntry`/`trapExit` 的汇编绑在一起；`proc.Context` 和 `proc.contextAsm` 绑在一起。
 - 内核和用户程序都不用浮点（目标是 rv64imac），陷阱处理不保存浮点寄存器；`sstatus.FS` 在启动时清成 Off，手写的浮点指令也会触发非法指令异常（[build.md](build.md)）。

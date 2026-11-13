@@ -2,6 +2,13 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-13 删掉还有人用着的文件只删名字（孤儿）
+
+- 改动：删掉一个文件的最后一个名字时，还有打开着它的 fd、正在运行它的进程的话，只删名字：inode 留着、链接数记成 0，树里插一个孤儿条目 `(0, 4, ino)`，最后一个使用者放开时（`file.close`、`vm.releaseBacking`）才删掉。和 Unix 一样，打开后马上删掉的临时文件照常能读写；正在运行的程序文件也可以删了（原来是 `TextBusy`），只有改它的内容还是 `TextBusy`。掉电留下的孤儿在挂载时删掉，打印 `removed N orphan inodes`。
+- 改动：`fsys` 的“正在运行的程序文件”表推广成“正在用的 inode”表（`hold`、`dup`、`release`，打开的文件和程序文件分开计数），`holdText`、`dupText`、`releaseText`、`beginRemove` 去掉了。`open` 先占住 inode 再拿新快照确认它还在。
+- 改动：磁盘格式换成 `LBFS0004`（多了孤儿条目，链接数可以是 0），旧镜像要重新 `mkfs`。`check` 认得孤儿，`ScrubInfo` 多了 `orphans`。
+- 新增：回归测试程序 `t_unlink`，QEMU 测试用例 `unlink`。
+
 ## 2026-11-13 时钟不再固定 100 Hz（tickless）
 
 - 改动：计时直接读 `time` CSR（`timer.uptimeMs`），去掉了 `ticks` 和“只由启动 hart 加 1”的特殊角色。`sleep` 系统调用按到期时刻排进 `timer.sleepers`（`timer.sleepUntil`），只为最早的那个预约时钟中断，精度不再是 10 ms。时间片由调度器切到进程时开始（`timer.startSlice`），过了 10 ms 的时钟中断才让 U 模式的进程让出 CPU。空闲的 hart 没有 sleeper 时不预约时钟中断：4 个 hart 空闲 5 秒，时钟中断从约 2000 次变成 4 次。

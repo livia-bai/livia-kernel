@@ -13,11 +13,12 @@
 | `(ino, 1, 0)` | `Inode { kind, major, nlink, size, parent }`（24 字节） | 种类（文件、目录、设备、符号链接）、设备号、链接数、长度、所在的目录 |
 | `(目录 ino, 2, 散列 << 32 \| 序号)` | `DirHeader { ino, kind, name_len }` + 名字 | 目录项。散列是名字的 crc32c |
 | `(ino, 3, 页号 × 4096)` | `ExtentHeader { kind, csum }` + 内容或 `{ blockno, generation }` | 文件第几页的内容：内联，或者指向一个数据块；符号链接的目标（总是内联在第 0 页） |
+| `(0, 4, ino)` | 没有数据 | 孤儿：名字都删掉了、还有人用着的 inode（[删掉还有人用着的文件](#删掉还有人用着的文件)）。objectid 0 不是任何 inode 号，所以孤儿条目都排在树的最前面 |
 
 - 根目录的 inode 号是 1。新 inode 号是树里最大的 `objectid` + 1：挂载时用 `Volume.lastKey()` 算出来，之后递增，不重用。
-- `Inode.nlink` 是有几个目录项指着它（[硬链接](#硬链接和设备文件)）：文件、设备文件可以有几个名字，目录总是 1。没有 Unix 那种“打开着的文件也算一个引用”，见[目录](#目录)里的删除。
+- `Inode.nlink` 是有几个目录项指着它（[硬链接](#硬链接和设备文件)）：文件、设备文件可以有几个名字，目录总是 1。链接数是 0 的只有孤儿：名字都删掉了、还有人打开着或者正在运行它（[删掉还有人用着的文件](#删掉还有人用着的文件)）。
 - `Inode.parent` 是所在的目录，只对目录有意义（`..` 和 `check` 用它）；文件可能有几个名字，它的 `parent` 只是建它（或者最后一次 `rename` 挪进去）的那个目录。
-- 所有结构体都是 `extern struct`，内核和主机上看到的布局一样。格式改了要换 `ctree.magic`：加链接数、设备号时从 `LBFS0001` 换成了 `LBFS0002`（新字段放在原来 `Inode` 的填充字节里，大小还是 24 字节，但旧镜像里那里是 0，链接数 0 会被 `check` 当成坏的）；加符号链接时换成了 `LBFS0003`（多了一种 inode，旧的内核读到它会当成坏的）。
+- 所有结构体都是 `extern struct`，内核和主机上看到的布局一样。格式改了要换 `ctree.magic`：加链接数、设备号时从 `LBFS0001` 换成了 `LBFS0002`（新字段放在原来 `Inode` 的填充字节里，大小还是 24 字节，但旧镜像里那里是 0，链接数 0 会被 `check` 当成坏的）；加符号链接时换成了 `LBFS0003`（多了一种 inode，旧的内核读到它会当成坏的）；加孤儿条目时换成了 `LBFS0004`（多了一种条目、链接数可以是 0）。旧镜像不升级：`zig build` 每次都重新生成磁盘镜像。
 
 ## 目录
 
@@ -29,7 +30,7 @@
 
 **路径**（`resolve`）：以 `/` 开头的从根目录找，否则从调用方给的当前目录找；多个 `/` 当一个；中间的每一段都必须是目录（`NotDir`）。名字最长 255 字节（`NameTooLong`）；创建、删除时最后一段不能是空的、`.`、`..`（`InvalidName`）。遇到符号链接就换成它的目标接着走（[符号链接](#符号链接)）。
 
-**删除**（`unlink`）：目录必须是空的（`NotEmpty`）。删掉目录项；指向的 inode 还有别的名字（`nlink > 1`）的话只把链接数减 1，否则删掉这个 inode 号的所有条目（inode 和文件内容，指向的数据块一起释放）。inode 删掉之后，还打开着它的文件、以它为当前目录的进程再用它，会得到 `NotFound`：没有 Unix 那种“最后一个打开的人关掉才真正删除”。
+**删除**（`unlink`）：目录必须是空的（`NotEmpty`）。删掉目录项；指向的 inode 还有别的名字（`nlink > 1`）的话只把链接数减 1；是最后一个名字、而且还有人用着的话，它变成孤儿（[删掉还有人用着的文件](#删掉还有人用着的文件)）；否则删掉这个 inode 号的所有条目（inode 和文件内容，指向的数据块一起释放）。目录总是马上删掉：以它为当前目录的进程再用它会得到 `NotFound`（Unix 会留着这个空目录，直到没有进程以它为当前目录）。
 
 ## 硬链接和设备文件
 
@@ -117,13 +118,12 @@ pub fn reader() error{NoDevice}!Reader     // 读：拿一个已提交的树的�
 pub fn writer() error{NoDevice}!*Fs        // 改：拿着 write_lock 返回文件系统
 pub fn unlock() void                       // 放开 write_lock
 
-// 正在运行的程序文件（按需分页从它读页），见下面
-pub fn holdText(ino: u64) error{TextBusy}!void
-pub fn dupText(ino: u64) void
-pub fn releaseText(ino: u64) void
-pub fn beginModify(ino: u64) error{TextBusy}!void    // 拿着 write_lock，改 ino 之前
+// 正在用的 inode（打开着的文件、正在运行的程序文件），见“删掉还有人用着的文件”
+pub fn hold(ino: u64, use: Use) error{ NotFound, TextBusy }!void
+pub fn dup(ino: u64, use: Use) void
+pub fn release(ino: u64, use: Use) void
+pub fn beginModify(ino: u64) error{TextBusy}!void    // 拿着 write_lock，改 ino 的内容之前
 pub fn endModify() void
-pub fn beginRemove(w: *Fs, cwd: u64, path: []const u8) error{TextBusy}!bool
 pub fn readText(ino: u64, off: u64, dst: []u8) error{IoError}!void
 ```
 
@@ -167,40 +167,53 @@ pub fn readText(ino: u64, off: u64, dst: []u8) error{IoError}!void
 | `mknod(path, major)` | `mknod`；`major` 是 0 或者超过 `u16` 是 `EINVAL` |
 | `lseek(fd, offset, whence)` | 改 `File.off`，`seek_end` 要先 `stat`（[files.md](files.md#文件表)） |
 | `scrub` | 先作废缓存，再 `check` 整个文件系统（[检查](#检查整个文件系统checkscrub)） |
-| `exec` | 在 `/bin`（或给的路径）里找程序，占住它（`holdText`），在一个新的快照上读 ELF 的文件头和程序头；段的内容等缺页时再读（`readText`，[process.md](process.md#按需分页)） |
+| `exec` | 在 `/bin`（或给的路径）里找程序，占住它（`hold(ino, .text)`），在一个新的快照上读 ELF 的文件头和程序头；段的内容等缺页时再读（`readText`，[process.md](process.md#按需分页)） |
 
 路径先复制进内核栈上的缓冲区（最长 `abi.max_path` = 256 字节，长了是 `ENAMETOOLONG`）。错误码：`SymlinkLoop` → `ELOOP`，`NotSymlink` → `EINVAL`，`NotFound` → `ENOENT`，`Exists` → `EEXIST`，`NotDir` → `ENOTDIR`，`IsDir` → `EISDIR`，`NotEmpty` → `ENOTEMPTY`，`NameTooLong` → `ENAMETOOLONG`，`InvalidName` → `EINVAL`，`NoSpace` → `ENOSPC`，`FileTooBig` → `EFBIG`，`BadAddress` → `EFAULT`，`Corrupt` 等磁盘上的东西不对、`IoError`（磁盘读写失败，[btree.md](btree.md#事务和提交)） → `EIO`。
 
 **内核栈**：系统调用在 24 KiB 的进程内核栈上运行，B 树的操作走得很深。开发时内核栈被撑爆过一次（Debug 模式用到 54 KiB）：`std.bit_set` 的 `isSet`、`count` 按值接收整个位图，每调用一次在栈上复制 8 KiB；`x.* = y.*` 复制 4 KiB 的块也会先放在栈上。改成自己写的 `Bitmap`（方法接收指针）和 `@memcpy` 之后，实测跑完全部 QEMU 测试（包括 `t_fs`、掉电后重新启动、从文件系统 `exec`），最深 Debug 13912 字节、safe 8992 字节、small 8632 字节（内核关机时自己量、自己打印，见 [process.md](process.md#进程表)）。路径解析（`walk`）跟着符号链接走时不递归，只在栈上多放一个 256 字节的缓冲区。
 
-## 正在运行的程序文件
+## 删掉还有人用着的文件
 
-按需分页（[process.md](process.md#按需分页)）：进程运行期间才从它的程序文件里读页，每次缺页拿一个新的快照、按 inode 号读那一页（`readText`）。所以程序文件在有地址空间用着它的时候不能变，不然之后读进来的页和 `exec` 时读的文件头、和之前读进来的页就不是同一个版本了。和 Linux 一样，改它的一方得到 `TextBusy`（`-ETXTBSY`）：
+和 Unix 一样，删掉一个文件的最后一个名字时，还打开着它的 fd、正在运行它的进程照常能用：名字没了，内容留到最后一个使用者放开时才删。原来这里没有“没有名字、但还有人用着”的 inode，删掉最后一个名字就删掉了内容：打开着它的 fd 再读写是 `NotFound`，正在运行的程序文件干脆不让删（`TextBusy`）。
+
+**孤儿**（btrfs 的 `ORPHAN_ITEM`）：`Fs` 有一个 `keep` 回调，`remove` 删到一个文件（不是目录）的最后一个名字时问它“这个 inode 还有人用着吗”。是的话不删 inode，链接数记成 0，插一个孤儿条目 `(0, 4, ino)`，只删目录项。之后按 inode 号照常能读写它（`fs.read`、`fs.write` 都按 inode 号，不经过名字）。最后一个使用者放开时调用 `reapOrphan(ino)`：有它的孤儿条目才删（删掉这个 inode 号的所有条目，再删孤儿条目），没有就什么都不做（删名字的事务后来作废了，或者已经删过了）。内核里 `keep` 是 `fsys.keepInUse`；`mkfs`、单元测试的 `Fs` 没有它，删掉就是真删。
+
+**掉电**：孤儿条目和删名字在同一个事务里，所以掉电之后盘上的孤儿条目正好就是那时还有人用着、名字已经删掉的 inode。重新启动之后不会有人用着它们了，`fsys.init` 挂载之后马上 `reapOrphans` 把它们都删掉，打印 `[ok] file system: removed N orphan inodes`。`check` 要求链接数是 0 的 inode 正好就是孤儿条目指着的那些，而且都不是目录。
+
+**记账**（`fsys.zig`）：
+
+```zig
+pub const Use = enum { open, text };
+var use_lock: Spinlock = .init("fs users", .leaf);   // 叶子锁
+var users: [file.max_files + 2 * abi.max_procs]struct { ino: u64, opens: u32, texts: u32, orphan: bool };
+var modifying: u64 = 0;   // 正在改内容的 inode（write、截断）
+var removing: u64 = 0;    // 正在删掉的 inode（没人用着，连 inode 一起删）
+
+pub fn hold(ino: u64, use: Use) error{ NotFound, TextBusy }!void
+pub fn dup(ino: u64, use: Use) void
+pub fn release(ino: u64, use: Use) void
+pub fn beginModify(ino: u64) error{TextBusy}!void    // 拿着 write_lock，改 ino 的内容之前
+pub fn endModify() void                              // 改内容、删除的事务做完之后
+pub fn readText(ino: u64, off: u64, dst: []u8) error{IoError}!void
+```
+
+- **两种使用者**：打开的文件，每个 `file.File` 一份（`open` 占住，最后一个 fd 关掉时 `file.close` 放开；`dup`、`fork` 只加 `File` 的引用数，不加这里的）；正在运行的程序文件，每个地址空间一份（`exec` 占住，`fork` 复制地址空间时 `dup`，进程结束、`exec` 换掉地址空间时 `vm.releaseBacking` 放开）。表的大小是两者的上限之和，不会满。
+- **删除**：`keepInUse` 拿着 `use_lock` 查表：有使用者就记下 `orphan`，返回 true；没有就记下 `removing = ino`，返回 false，连 inode 一起删。`removing` 到事务做完、`endModify` 才清掉，这期间 `hold` 它是 `NotFound`：不然别人可能在“决定删掉”和“提交”之间占住一个马上就没了的 inode。代价是删除的事务后来作废了的话，那一小段时间里 `open` 它会白白失败。
+- **最后一个使用者放开**：`release` 发现计数减到 0、记着 `orphan`，就拿 `write_lock`、`run(Fs.reapOrphan, .{ino})`。这要读写磁盘、睡着等，所以放开的地方都不能拿着锁（`file.close`、`proc.finish`、`exec` 换掉旧的地址空间都是）。删不掉（读写失败）的留着孤儿条目，下次挂载时删。
+- **先占住、再看一眼**：`open`、`exec` 在一个快照上按路径找到 inode，再 `hold` 它，然后拿一个新的快照确认它还在。找的那个快照可能已经旧了：别人可能在两者之间删掉了它、提交了。两边都拿着 `use_lock`：占住之前开始的删除，要么还没 `endModify`（`hold` 看到 `removing`，`NotFound`），要么已经提交了（新快照里没有它，放开、`NotFound`）；占住之后开始的删除只会让它变成孤儿。
+
+**正在运行的程序文件不能改内容**。按需分页（[process.md](process.md#按需分页)）：进程运行期间才从它的程序文件里读页，每次缺页拿一个新的快照、按 inode 号读那一页（`readText`）。所以有地址空间用着它的时候它的内容不能变，不然之后读进来的页和 `exec` 时读的文件头、和之前读进来的页就不是同一个版本了。和 Linux 一样，改它的一方得到 `TextBusy`（`-ETXTBSY`）：
 
 | 操作 | 什么时候是 `TextBusy` |
 | --- | --- |
 | `write` | 写的是正在运行的程序文件（`file.inodeWrite`） |
 | 带 `O_TRUNC` 的 `open` | 截断的是正在运行的程序文件（`syscall.openPath`） |
-| `unlink` | 删的是正在运行的程序文件的**最后一个**名字（`nlink == 1`，删了内容就没了） |
-| `rename` | 新名字已经有了、是正在运行的程序文件的最后一个名字（会被换掉）；两个名字是同一个 inode 时 `rename` 什么都不做，不算 |
 | `exec` | 程序文件正在被改（上面某个操作做到一半） |
 
-改名（`rename` 的旧名字）、加硬链接、删掉别的名字都不动内容，照常可以。Linux 允许删掉正在运行的程序（inode 留到最后一个用它的进程结束）；这里的文件系统没有“没有名字、但还有人用着”的 inode，删掉最后一个名字就删掉了内容，所以干脆不让删。
+改内容的地方拿着 `write_lock`，改之前 `beginModify(ino)`：有地址空间用着它就是 `TextBusy`；没有就记下 `modifying = ino`，事务提交或者作废之后 `endModify`。这期间 `hold(ino, .text)` 是 `TextBusy`。删掉、改名、加硬链接都不动内容，照常可以：删掉正在运行的程序只删名字，它变成孤儿，进程照常从它读页，结束之后才删掉。
 
-**记账**（`fsys.zig` 末尾）：
-
-```zig
-var text_lock: Spinlock = .init("fs text", .leaf);                   // 叶子锁
-var texts: [2 * abi.max_procs]struct { ino: u64 = 0, refs: u32 = 0 } = @splat(.{});
-var modifying: u64 = 0;                                       // 修改的一方正在改的 inode
-```
-
-- **占住**：`exec` 找到程序文件之后 `holdText(ino)`，引用数加 1（`modifying == ino` 的话是 `TextBusy`）；占用交给新的地址空间（`vm.Space.backing = .{ .file = ino }`）。`fork` 复制地址空间时 `dupText`；进程结束（`proc.finish`）、`exec` 换掉旧的地址空间、地址空间被释放时 `releaseText`（`vm.releaseBacking`，只放一次）。表按 inode 记，每个地址空间最多占一份，表的大小是地址空间最多能有的个数（每个进程一个，加上 `exec` 新建、还没换上的），不会满。
-- **修改**：上面那几个操作拿着 `write_lock`，在改之前 `beginModify(ino)`：有人占着就是 `TextBusy`；没有就记下 `modifying = ino`，事务提交或者作废之后 `endModify`。`unlink`、`rename` 先用 `beginRemove` 找到要删掉的 inode（用写的一方的 `Fs` 找：拿着 `write_lock`，没有做到一半的事务，它就是已提交的样子），是文件、并且是最后一个名字才检查。名字不存在之类的错误留给接下来的操作自己报。修改都拿着 `write_lock`，所以同一时刻最多一个 `modifying`。
-- **为什么 `exec` 占住之后要重新拿快照**：`exec` 先在一个快照上按路径找到 inode，再占住它。找的那个快照可能已经旧了：别人可能在两者之间改完、提交了这个文件。两边都拿着 `text_lock` 查、改：占住之前开始的修改，要么还没 `endModify`（`holdText` 看到 `modifying == ino`，`exec` 失败），要么已经提交了；占住之后开始的修改都会失败。所以占住之后新拿的快照里的文件，就是之后每次缺页读到的版本。
-- 加锁顺序：`text_lock` 是叶子锁。`proc.finish` 什么锁都没拿时放开；`beginModify` 拿着 `write_lock`（睡眠锁）拿它。
-
-`t_demand` 和 QEMU 测试用例 `tools`（`cp` 覆盖、`rm` 一个正在运行的 `spin` 的副本）检查了这张表（[testing.md](testing.md#回归测试程序)）。
+`t_unlink`（打开着删掉、`fork` 之后共用、删掉正在运行的程序之后它才第一次读只读数据）、`t_demand`（不能改正在运行的程序）和 QEMU 测试用例 `unlink`（打开着一个删掉了的文件时掉电，下次挂载删掉孤儿）、`tools`（`cp` 覆盖是 `TextBusy`，`rm` 一个正在运行的 `spin` 的副本可以、它接着运行）检查了这些（[testing.md](testing.md#回归测试程序)）。
 
 ## 改名（`rename`）
 
@@ -269,12 +282,15 @@ mkfs <输出文件> <总块数> <文件系统的块数> <文件>...
 - `readdir` 列出 62 个名字一个不少、不重复；散列相同的两个名字都找得到，删掉一个另一个还在。
 - 文件内容：内联的读写、中间补 0；正好 512 字节还是内联，再长一个字节换成数据块、内容不变；跨页的写；洞读出来是 0、不占块；读到末尾之后返回 0；写到一半“用户内存”出错，整个写作废、文件不变；`FileTooBig`；截断之后再写又是内联；删除文件之后空闲块数和创建之前一样。
 - 数据块的校验和：在磁盘上改一个字节，读这一页是 `Corrupt`，别的页照常；重新挂载之后内容还在。
-- `check`：数对文件、目录（含根目录）、数据块（有洞的文件只算有块的页）；在磁盘上改一个数据块、改根节点，缓存里还是好的时 `check` 照样通过，`bio.invalidate` 之后就是 `Corrupt`，改回来又通过。条目之间对不上的 16 种坏法（没有名字的 inode、指向不存在的 inode 的目录项、目录的 `parent` 不对、没有 inode 的条目、内容条目超出文件长度、名字比链接数多、名字比链接数少、目录有两个名字、链接数是 0、设备文件有内容、普通文件带设备号、两个目录成环、文件里有目录项、符号链接没有目标、符号链接的长度和目标对不上、符号链接的目标在数据块里）在当前事务里直接改 B 树做出来，每一种都是 `Corrupt`，`abort` 之后又通过。验证过它能抓住错误：去掉“每个 inode 正好一个名字”那一项，没有名字的 inode 就查不出来了；去掉“符号链接要有目标”那一项，测试报 `not detected: symlink_no_target`。
+- `check`：数对文件、目录（含根目录）、数据块（有洞的文件只算有块的页）；在磁盘上改一个数据块、改根节点，缓存里还是好的时 `check` 照样通过，`bio.invalidate` 之后就是 `Corrupt`，改回来又通过。条目之间对不上的 19 种坏法（没有名字的 inode、指向不存在的 inode 的目录项、目录的 `parent` 不对、没有 inode 的条目、内容条目超出文件长度、名字比链接数多、名字比链接数少、目录有两个名字、链接数是 0、设备文件有内容、普通文件带设备号、两个目录成环、文件里有目录项、符号链接没有目标、符号链接的长度和目标对不上、符号链接的目标在数据块里、孤儿条目指着还有名字的 inode、孤儿是目录、孤儿条目指着不存在的 inode）在当前事务里直接改 B 树做出来，每一种都是 `Corrupt`，`abort` 之后又通过。验证过它能抓住错误：去掉“每个 inode 正好一个名字”那一项，没有名字的 inode 就查不出来了；去掉“符号链接要有目标”那一项，测试报 `not detected: symlink_no_target`。
 - 硬链接、设备文件：链接到别的目录，两个名字同一个 inode、链接数 2、改了内容两边一样、不复制数据块；目录不能链接、新名字已经有了、旧名字没有、新目录没有、`..`；`rename` 到同一个 inode 的另一个名字什么都不做；删掉一个名字另一个照常；`rename` 换掉有两个名字的文件只少一个名字；删到最后一个名字，数据块都还回来；`mknod` 的设备文件长度 0、设备号对、可以链接和删除；链接数重新挂载之后还在。每一步之后 `check`。
 - 符号链接：绝对的、相对的目标（相对于链接所在的目录）；`resolveNoFollow` 停在链接上；中间一段是指向目录的链接、链接后面的 `..`、链接的链、在链接后面建文件；悬空的链接解析是 `NotFound`，`createFollow` 建出目标（目标的目录没有是 `NotFound`）；自己指自己、两个互指是 `SymlinkLoop`，正好跟 10 次可以、11 次不行；空的、超长的目标，正好 256 字节的目标，拼出来超长的路径；`rename`、`link`、`unlink` 对链接自己，目标不动；重新挂载之后还在。每一步之后 `check`。
+- 孤儿：没人用着时删掉照常马上删；有人用着时删掉只删名字，链接数 0，按 inode 号还能读写，`check` 数出一个孤儿；`rename` 换掉有人用着的文件也一样；删掉有两个名字的文件的一个名字不会变成孤儿；`reapOrphan` 之后 inode 没了、再调用和对不是孤儿的 inode 调用都什么都不做；重新挂载之后孤儿还在，`reapOrphans` 删掉它；最后空闲块数和开始时一样。验证过它能抓住错误：删名字时不插孤儿条目，这一条和下面有孤儿的掉电测试都失败。
 - `dirPath`：根目录、深处的目录、同一个目录里有别的名字、文件是 `NotDir`、经过符号链接到的目录是它真正的路径、改名之后跟着变、缓冲区正好放得下和差一个字节、删掉了的目录。
 - `rename`：同一个目录里改名、换目录（`..` 跟着变）、目录连着下面的东西一起挪；换掉已有的文件（它的块都还回来）、换掉空目录，不空的不行；没有的名字、新目录不存在、目录换文件、文件换目录、挪进自己下面、`/`、`..`、穿过文件的路径、太长的名字都报错，并且事务号不变（什么都没写）；改成自己什么都不做；改成 255 字节的名字。每一步之后 `check`。验证过它能抓住错误：换目录时不改 `parent`，测试失败。
 - **掉电**：一串 25 个随机操作（创建、删除、截断、改名成另一个名字（有的话换掉它）、建硬链接、在随机位置写最多 3 页；不含符号链接：建链接和建文件一样是插入 inode 和目录项，只多一个内联的条目），每个操作提交一次，完整跑一遍写盘 124 次；对每一个 N，在第 N 次写之后掉电，重新挂载，要求：挂载成功、`check` 通过、所有名字的内容正好是某一个操作做完之后的样子、不早于最后一个做完了的操作，指着同一个文件的名字是同一个 inode、链接数就是名字的个数。参照模型记的是“名字 → 文件”，几个名字可以指着同一个文件。然后接着创建、写一个新文件，再核对一遍旧文件：挂载时漏算了哪个块（当成了空闲块），这里就会被改写。
+
+  **掉电（删掉的文件都还有人用着）**：同样的 25 步，`keep` 总说“还有人用着”，所以每次删除、换掉都留下孤儿，每 4 步做一次 `reapOrphans`（用的人都放开了）。要求一样，重新挂载之后 `check` 认得留下的孤儿。
 
   验证过它能抓住错误：`link` 不加链接数，掉电测试失败（随机种子是挑过的：原来的种子 25 步里一次链接都没做成，测不到它）；改数据页时直接在旧块上改（不写时复制），掉电测试失败；挂载时不把数据块算作用着的（`dataRefs` 总返回 null），掉电测试失败（这一种是在加了“挂载之后接着写”之后才抓到的）。
 
@@ -289,5 +305,5 @@ mkfs <输出文件> <总块数> <文件系统的块数> <文件>...
 - 只能截成 0；没有权限、时间戳。
 - 一页一个数据块，没有 btrfs 那种连续多块的 extent；也没有压缩。
 - 每个操作一个事务，每次都写超级块。
-- 删除打开着的文件之后，打开它的人再读写会出错（`ENOENT`）。正在运行的程序文件干脆不能删（`ETXTBSY`），见[正在运行的程序文件](#正在运行的程序文件)。
+- 删掉的目录不留着：以它为当前目录的进程再用它是 `ENOENT`（Unix 留到没有进程以它为当前目录）。
 - 修改之间排队：改不同文件的进程也要一个一个来（读不排队）。
