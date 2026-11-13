@@ -339,32 +339,41 @@ sh: /.snap/116/tsnap/a: ReadOnly
 `kstat`（`user/kstat.zig`）调用 `kstat` 系统调用，打印内核的计数器和栈的高水位。计数器的名字就是 `abi.Counters` 的字段名，程序对字段做 `inline for` 逐个打印，内核加了计数器这里不用改。下面是跑完全部 QEMU 测试（safe、4 核）时的输出：
 
 ```
-syscalls           43623
-context_switches   20384
-timer_interrupts   3769
-ipis_sent          14028
-wakeup_calls       166268
-processes_woken    17583
-lock_contended     46391
-faults_zero        95662
-faults_file        1694
-faults_cow         3583
+syscalls           45851
+context_switches   27579
+timer_interrupts   782
+ipis_sent          21633
+wakeup_calls       207931
+processes_woken    25057
+lock_contended     64299
+faults_zero        95665
+faults_file        333
+faults_cached      1508
+faults_cow         4305
 tlb_full_flushes   4
-tlb_user_flushes   42188
-bio_hits           123234
-bio_misses         2724
-disk_reads         2724
-disk_writes        5930
-disk_flushes       2080
-fs_commits         1040
+tlb_user_flushes   56654
+bio_hits           141820
+bio_misses         9342
+disk_reads         9342
+disk_writes        6922
+disk_flushes       2472
+fs_commits         1236
 fs_aborts          0
 fs_clean_aborts    57
-stack_process      9632 of 24576 bytes
-stack_boot         6192 of 32768 bytes
-stack_trap         736 of 16384 bytes
+stack_process      10960 of 24576 bytes
+stack_boot         6736 of 32768 bytes
+stack_trap         648 of 16384 bytes
 ```
 
-几个数说明了之前改动的效果：`wakeAll` 调了 16.6 万次，一共只叫醒了 1.8 万个进程，绝大多数时候队列是空的，什么锁都不拿（[process.md](process.md#等待队列waitqueue)）。原来每次 `wakeup` 都要扫进程表、拿 64 把进程锁，换成等待队列之前的一次同样的运行里 `lock_contended` 是 9.1 万，之后是 4.6 万（各只量了一次）；57 次失败的文件系统操作什么都没改，作废时不用重走整棵树（[btree.md](btree.md#事务和提交)）；整个 TLB 只在每个 hart 启动时刷了一次，切换地址空间只作废用户映射，大约每次上下文切换 2 次（原来是每次 4 次全量刷新，[paging.md](paging.md#切换地址空间)）。每次跑的数都不太一样（几个 hart 谁先抢到进程是随机的）。计数器是每个 hart 一份、只有自己加的普通整数（`src/kstat.zig`），读的时候把所有 hart 的加起来。
+几个数说明了之前改动的效果（上面这次输出是加了快照、孤儿、页缓存这些测试之后跑的，用例比前几次多，和前几次的数不能直接比）：
+
+- `wakeAll` 调了 20.8 万次，一共只叫醒了 2.5 万个进程，绝大多数时候队列是空的，什么锁都不拿（[process.md](process.md#等待队列waitqueue)）。换成等待队列之前的一次运行里 `lock_contended` 是 9.1 万，刚换完是 4.6 万（各只量了一次）。
+- 57 次失败的文件系统操作什么都没改，作废时不用重走整棵树（[btree.md](btree.md#事务和提交)）。
+- 整个 TLB 只在每个 hart 启动时刷了一次，切换地址空间只作废用户映射，大约每次上下文切换 2 次（原来是每次 4 次全量刷新，[paging.md](paging.md#切换地址空间)）。
+- 时钟中断只有 782 次：没有固定 tick，空闲的 hart 不收时钟中断（加这一项之前的一次运行约 3700 次，那时用例还少一些，[devices.md](devices.md#定时器timerzig)）。
+- 程序文件的页 1508 次在页缓存里，只有 333 次从文件读（[paging.md](paging.md#程序页缓存)）。
+
+每次跑的数都不太一样（几个 hart 谁先抢到进程是随机的）。计数器是每个 hart 一份、只有自己加的普通整数（`src/kstat.zig`），读的时候把所有 hart 的加起来。
 
 ### 写脚本用的程序
 

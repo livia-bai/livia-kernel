@@ -70,20 +70,21 @@ main.zig ─┬─ uart.zig ──────────── 串口输出（
           │            │                   file.zig、page.zig、timer.zig、uart.zig、sbi.zig、bio.zig（原始区域）、
           │            │                   fsys.zig（文件系统的调用）、kstat.zig（计数器）
           │            ├─ virtio_disk.zig（磁盘中断）
-          │            └─ proc.zig（让出 CPU、wakeup、杀进程）
-          ├─ virtio_disk.zig ───── virtio 块设备驱动（proc.zig 的 sleep/wakeup 等磁盘）
+          │            └─ proc.zig（让出 CPU、等待队列、杀进程）
+          ├─ virtio_disk.zig ───── virtio 块设备驱动（proc.WaitQueue 等磁盘中断）
           ├─ bio.zig ───────────── 缓冲区缓存（每块一把睡眠锁 sleeplock.zig），读写交给 virtio_disk.zig
           ├─ dtb.zig ───────────── 设备树
           ├─ page.zig ──────────── 物理页
-          ├─ vm.zig ────────────── 页表（用 page.zig 分配页表）
-          ├─ plic.zig、timer.zig
+          ├─ vm.zig ────────────── 页表、用户地址空间（区域表）、按需分页、写时复制
+          │                        └─ pagecache.zig（程序文件的页缓存）
+          ├─ plic.zig、timer.zig（没有固定 tick：时间片、按到期时刻排队的 sleep）、ipi.zig（核间中断）
           └─ proc.zig ──────────── userinit、scheduler（每个 hart 最后都调用它，永不返回）
                                    vm.zig、trap.zig（进入 U 模式）、file.zig（fd 表）、abi.zig、嵌入的 init、fsys.zig（exec 从 /bin 找程序）、
                                    loader.zig（ELF 加载器、命令行参数，只依赖 vm.zig）
 
 file.zig ─┬─ uart.zig（串口作为文件）
-          ├─ pipe.zig ─── page.zig（每个管道一页）、vm.zig（复制用户内存）、proc.zig（sleep/wakeup）
-          └─ fsys.zig ─── 挂载（proc.zig 的 forkretC 调用）、一把睡眠锁、错误码
+          ├─ pipe.zig ─── page.zig（每个管道一页）、vm.zig（复制用户内存）、proc.zig（WaitQueue）
+          └─ fsys.zig ─── 挂载（proc.zig 的 forkretC 调用）、写锁、正在用的 inode（孤儿）、保存的快照（/.snap）
                 └─ fs.zig ─── inode、目录、文件内容
                       └─ ctree.zig ─── 写时复制 B 树、事务 ─── btree.zig（节点格式）、bio.zig
 
@@ -107,13 +108,13 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 
 **shell**（[shell.md](shell.md)）：普通的用户程序：`read` 一个字节、自己回显 → 回车时执行命令；`run` 用 `fork` + `exec` 启动程序（带命令行参数），前台程序用 `setfg` 登记、`wait` 等它结束；`run a | b` 用 `pipe` + `dup` 把 a 的标准输出接到 b 的标准输入。
 
-**文件**（[files.md](files.md)）：`read`/`write`/`close`/`dup` 的 fd 是当前进程 fd 表的下标，指向全局文件表里的 `File`（串口或管道的一端，带引用计数）；`fork` 复制 fd 表，进程结束时全部关掉。
+**文件**（[files.md](files.md)）：`read`/`write`/`close`/`dup` 的 fd 是当前进程 fd 表的下标，指向全局文件表里的 `File`（串口、管道的一端、文件系统里的文件或设备，带引用计数；文件可以来自保存的快照，只读）；`fork` 复制 fd 表，进程结束时全部关掉。
 
 **中断**（[trap.md](trap.md)、[devices.md](devices.md)）：硬件跳到 `trap.trapEntry` → 压 `TrapFrame`（来自 U 模式时换回内核的 `tp`）→ `handleTrap` 按 `scause` 分发：时钟中断叫醒到期的 `sleep`、重新预约这个 hart 的下一次，打断的是 U 模式而且时间片用完了就让出 CPU；外部中断向 PLIC 领取中断号，串口中断把字符搬进环形缓冲区、处理 Ctrl-C、叫醒在 `read` 里等的进程 → 回到 U 模式之前检查 `killed` → `trapExit` 恢复寄存器、`sret`。
 
-**创建进程**（[process.md](process.md#创建进程)）：`fork` 系统调用 → `proc.fork`：写时复制地址空间（只建页表，用户页和父进程共用，谁先写谁在写缺页里复制一份）、复制 `TrapFrame`（子进程的 `a0` 改成 0）→ 拿着 `wait_lock` 和新槽位的锁一次填好，状态 `runnable`，父进程是调用者。`exec` 系统调用 → 把命令行参数复制进内核 → `proc.exec`：占住程序文件（运行期间不能改、不能删）、新建地址空间、读 ELF 的程序头记下各个段、参数放到栈顶（分配栈最顶上那一页）→ 换掉旧的地址空间 → `TrapFrame` 改成从新程序的入口开始（`a0` = argc，`a1` = argv）。
+**创建进程**（[process.md](process.md#创建进程)）：`fork` 系统调用 → `proc.fork`：写时复制地址空间（只建页表，用户页和父进程共用，谁先写谁在写缺页里复制一份）、复制 `TrapFrame`（子进程的 `a0` 改成 0）→ 拿着 `wait_lock` 和新槽位的锁一次填好，状态 `runnable`，父进程是调用者。`exec` 系统调用 → 把命令行参数复制进内核 → `proc.exec`：占住程序文件（运行期间不能改内容；删掉只删名字）、新建地址空间、读 ELF 的程序头记下各个段、参数放到栈顶（分配栈最顶上那一页）→ 换掉旧的地址空间 → `TrapFrame` 改成从新程序的入口开始（`a0` = argc，`a1` = argv）。
 
-**缺页**（[process.md](process.md#按需分页)）：用户程序访问还没有的页 → `handleTrap` → `vm.fault`：在段、堆、栈里的话分配一页（段的页从程序文件读，睡着等磁盘）、映射上，回去重新执行那条指令；写时复制的页复制一份；别的地址结束进程。
+**缺页**（[process.md](process.md#按需分页)）：用户程序访问还没有的页 → `handleTrap` → `vm.fault`：在区域表里（段、堆、栈）的话分配一页、映射上（段的页先查程序页缓存，不在才从程序文件读、睡着等磁盘，可写的段按写时复制映射），回去重新执行那条指令；写时复制的页复制一份；别的地址结束进程。
 
 **系统调用**（[syscalls.md](syscalls.md)）：用户程序 `ecall` → `trapEntry` 通过 `sscratch` 换到内核栈 → `handleTrap` → `syscall.dispatch` → 返回值写进 `TrapFrame` 的 `a0` → `trapExit` 回到 U 模式。
 
@@ -125,7 +126,7 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 
 - `sscratch`：在 U 模式运行时存着当前进程的内核栈顶；在内核里是这个 hart 的陷阱栈顶（S 模式的陷阱都在陷阱栈上处理）；正在处理 S 模式的陷阱时为 0（[trap.md](trap.md#sscratch-约定)）。
 - 内核代码全程关着中断（`sstatus.SIE = 0`）：初始化、陷阱处理、系统调用、调度器扫描进程表。中断只会打断 U 模式，或者调度器每一轮开头开中断的那一下，不会嵌套（[trap.md](trap.md)）。
-- 拿自旋锁时中断关着；切换进程（`sched`）时只拿着这个进程自己的锁，回到 U 模式时不拿着任何锁；要拿着锁等待的用 `proc.WaitQueue`；同时拿几把锁时按固定的顺序（[process.md](process.md#锁)）。
+- 拿自旋锁时中断关着；切换进程（`sched`）时只拿着这个进程自己的锁，回到 U 模式时不拿着任何锁；要拿着锁等待的用 `proc.WaitQueue`；同时拿几把锁时按等级从低往高（`acquire` 检查）。进程归锁管的字段只经过 `p.locked()`、`p.family()` 读写，它们检查拿着锁（[process.md](process.md#锁)）。
 - 进程切换只在关中断、拿着这个进程的锁时发生，并且总是经过调度器：`scheduler` ↔ 进程，进程只通过 `proc.sched` 切回，进程之间不直接切换（[process.md](process.md#切换上下文)）。一个进程同一时刻只在一个 hart 上运行。
 - 内核里 `tp` 是当前 hart 的编号；用户程序的 `tp` 在进出 U 模式时换掉（[trap.md](trap.md#tp-约定)）。
 - 被 kill 的进程不会再回到 U 模式：陷阱返回前、新进程第一次进入 U 模式前都检查 `killed`（[process.md](process.md#结束进程)）。
@@ -134,4 +135,5 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 - 内核从不直接解引用用户给的指针，`sstatus.SUM` 始终为 0，访问用户内存一律走 `vm.copyFromUser`（[syscalls.md](syscalls.md)）。拿着锁复制用户内存的系统调用先 pin（`vm.pinSrc`、`pinDst`），拿着锁时只用 pin 好的 `PinnedSrc`/`PinnedDst` 复制：拿着锁时不能缺页（[paging.md](paging.md#内核访问用户内存)）。
 - 正在运行的程序文件不能改内容（`ETXTBSY`）：按需分页一直要从它读页。可以删：和打开着的文件一样只删名字，最后一个使用者放开时才删（[fs.md](fs.md#删掉还有人用着的文件)）。
 - `TrapFrame` 的布局和 `trapEntry`/`trapExit` 的汇编绑在一起；`proc.Context` 和 `proc.contextAsm` 绑在一起。
+- 写时复制 B 树：已提交的树的块从来不改，释放的块提交之后才能再用；有保存的快照时，事务号不大于最新快照的块不释放（[btree.md](btree.md#事务和提交)）。
 - 内核和用户程序都不用浮点（目标是 rv64imac），陷阱处理不保存浮点寄存器；`sstatus.FS` 在启动时清成 Off，手写的浮点指令也会触发非法指令异常（[build.md](build.md)）。

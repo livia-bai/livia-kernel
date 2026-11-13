@@ -46,15 +46,15 @@ livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 
 | [boot.md](boot.md) | 启动流程：OpenSBI 交接、链接脚本、`_start`、每个 hart 的启动栈、`kmain` 的初始化顺序、启动其他 hart、交给调度器、panic 时让所有 hart 停下 |
 | [riscv-sbi.md](riscv-sbi.md) | CSR 访问和 SBI 调用 |
 | [trap.md](trap.md) | 陷阱处理：异常委托、`TrapFrame`、`sscratch` 和 `tp` 约定、陷阱栈、入口/出口汇编、分发、内核栈溢出 |
-| [devices.md](devices.md) | 串口（含输入缓冲区和 Ctrl-C）、PLIC、定时器 |
+| [devices.md](devices.md) | 串口（含输入缓冲区和 Ctrl-C）、PLIC、定时器（没有固定 tick：时间片、按到期时刻排队的 `sleep`） |
 | [devicetree.md](devicetree.md) | 设备树：格式、解析器、QEMU 给的内容、错误和限制 |
 | [page-allocator.md](page-allocator.md) | 物理页分配器、每一页的引用数 |
-| [paging.md](paging.md) | Sv39 分页：页表格式、建立映射、内核页表（内核栈的保护页）、用户地址空间、按需分页、`fork` 的写时复制 |
+| [paging.md](paging.md) | Sv39 分页：页表格式、建立映射、内核页表（内核栈的保护页）、用户地址空间（区域表）、按需分页、程序页缓存、`fork` 的写时复制 |
 | [user-programs.md](user-programs.md) | 用户程序：运行时（`start.zig`、`sys.zig`）、示例程序、写脚本用的程序（`test`、`expr`、`xargs`……）、怎么写新程序 |
 | [process.md](process.md) | 进程：进程表、ELF 加载器、按需分页、`userinit`/`fork`/`exec`、命令行参数、`sbrk`、xv6 式调度（每个 hart 的 `scheduler`、`sched`、等待队列 `WaitQueue`）、核间中断、切换上下文、`exit`/`wait`/`kill`、Ctrl-C、锁和加锁顺序 |
-| [disk.md](disk.md) | 磁盘：virtio 块设备驱动、睡眠锁、缓冲区缓存、读写块的系统调用 |
+| [disk.md](disk.md) | 磁盘：virtio 块设备驱动（读写失败交回文件系统）、睡眠锁、缓冲区缓存、读写块的系统调用 |
 | [btree.md](btree.md) | 写时复制 B 树（文件系统的基础，类似 btrfs）：节点格式、写时复制、事务和提交、空闲空间、保存的快照、掉电测试 |
-| [fs.md](fs.md) | 文件系统：inode、目录、文件内容（内联、数据块、洞、校验和），每个操作一个事务，接进内核（挂载、锁、系统调用、当前目录），`mkfs`，掉电测试 |
+| [fs.md](fs.md) | 文件系统：inode、目录、文件内容（内联、数据块、洞、校验和），每个操作一个事务，接进内核（挂载、锁、系统调用、当前目录），`mkfs`，掉电测试，删掉还有人用着的文件（孤儿），保存的快照（`/.snap`） |
 | [files.md](files.md) | 文件：fd 表、文件表、串口、管道和文件系统里的文件的读写 |
 | [syscalls.md](syscalls.md) | 系统调用：调用约定、调用列表、访问用户内存、怎么加新调用 |
 | [shell.md](shell.md) | shell（用户程序）：输入处理、前台和后台进程、命令 |
