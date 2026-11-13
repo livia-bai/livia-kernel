@@ -2,6 +2,11 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-14 进程的字段只经过检查锁的访问函数读写
+
+- 改动：进程归进程锁管的字段（`state`、`hart`、`pid`、`name`、`killed`、`xstatus`、`cpu_time`）收进 `Process.under_lock`，归 `wait_lock` 管的（`parent`、`child_exit`）收进 `under_wait_lock`，只经过 `p.locked()`、`p.family()` 读写，没拿着锁就 panic。单元测试扫描源码，不许别处直接碰这两个子结构。
+- 修了：几处原来不拿锁读进程字段的地方：`checkStack` 拼 panic 信息、`exit`/`killCurrent` 打印、`fork` 读父进程的名字、`procinfo`/`getppid` 读父进程的 pid（`procinfo` 原来拿着一把进程锁读另一个进程的 pid）、`getpid`。panic 信息里不拿锁读的改用 `racyForPanic()`。
+
 ## 2026-11-13 程序页缓存
 
 - 新增：程序文件的页缓存（`src/pagecache.zig`，最多 256 页）。按需分页从程序文件读的页放进去，同一个程序再 `exec`、几个进程运行同一个程序时共用；可写的段的页按写时复制映射。改程序文件的内容、删掉它时作废；表满了、缺页时没有内存了，丢掉只有缓存还拿着的页。

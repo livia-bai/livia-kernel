@@ -39,23 +39,30 @@ pub const State = abi.ProcState;       // procinfo 原样交给用户程序
 pub const ProcState = enum(u8) { unused, runnable, running, sleeping, zombie };   // abi.zig
 
 pub const Process = struct {
-    lock: Spinlock = .init("proc", .proc),    // 保护下面标着 lock 的字段，见“锁”
-    state: State = .unused,            // lock
-    hart: usize = 0,                   // lock。running 时在哪个 hart 上运行（kill 发核间中断用）
-    pid: usize = 0,                    // lock
-    name: Name = .{},                  // lock。程序名（最多 16 字节，存在这里），exec 时换掉；fork 出来的子进程沿用父进程的
-    space: vm.Space = undefined,       // 地址空间：根页表、各个段、堆（按需分页要用，见 paging.md）
-    parent: ?*Process = null,          // wait_lock。父进程；init 没有
+    lock: Spinlock = .init("proc", .proc),
+    under_lock: Guarded = .{},         // 归 lock 管，只经过 p.locked() 读写（它检查拿着 lock）
+    under_wait_lock: Family = .{},     // 归 wait_lock 管，只经过 p.family() 读写
+    space: vm.Space = undefined,       // 地址空间：根页表、区域表（按需分页要用，见 paging.md）
     context: Context = undefined,      // 不在运行时保存的内核上下文
     wait_next: ?*Process = null,       // 排在某个 WaitQueue 里时的下一个进程
     queued: bool = false,              // 在不在某个 WaitQueue 里。这两个由那个队列的锁保护
-    child_exit: WaitQueue = .{},       // wait_lock。在 wait 里等子进程结束时排在这里
-    killed: ?[]const u8 = null,        // lock。被 kill 了的话是原因
-    xstatus: u32 = 0,                  // lock。zombie 的结束状态，父进程 wait 时取走
-    cpu_time: u64 = 0,                 // lock。用掉的 CPU 时间（time CSR 的单位），调度器每次切到它、它切回来时累加
     files: [abi.max_fds]?*file.File = @splat(null),  // 打开的文件，下标就是 fd
     sleeplocks: sleeplock.Held = .{},  // 拿着每一级的睡眠锁各几把，回到 U 模式时必须都是 0
     cwd: u64 = fs.root_ino,            // 当前目录的 inode 号（chdir），fork 继承，exec 不变
+
+    pub const Guarded = struct {
+        state: State = .unused,
+        hart: usize = 0,               // running 时在哪个 hart 上运行（kill 发核间中断用）
+        pid: usize = 0,
+        name: Name = .{},              // 程序名（最多 16 字节，存在这里），exec 时换掉；fork 出来的子进程沿用父进程的
+        killed: ?[]const u8 = null,    // 被 kill 了的话是原因
+        xstatus: u32 = 0,              // zombie 的结束状态，父进程 wait 时取走
+        cpu_time: u64 = 0,             // 用掉的 CPU 时间（time CSR 的单位），调度器每次切到它、它切回来时累加
+    };
+    pub const Family = struct {
+        parent: ?*Process = null,      // 父进程；init 没有
+        child_exit: WaitQueue = .{},   // 在 wait 里等子进程结束时排在这里
+    };
 };
 
 pub var table: [max_procs]Process = @splat(.{});
@@ -805,6 +812,8 @@ Ctrl-C 结束的是**前台进程和它的所有子孙**：shell 用 `fork` 启�
 | `Sleeplock.lk` | 一把睡眠锁的 `locked`、`holder`；等锁的进程拿着它睡下 | [disk.md](disk.md#睡眠锁sleeplockzig) |
 | `uart.tx_lock` | 串口输出：一次 `print`、一次 `write` 系统调用整段输出，不和别的 hart 的输出交错 | [devices.md](devices.md#串口uartzig) |
 | `fsys.use_lock` | 正在用的 inode 的表（`users`：打开着的、正在运行的，是不是孤儿）、正在被改的 inode（`modifying`）、正在被删的 inode（`removing`） | [fs.md](fs.md#删掉还有人用着的文件) |
+
+**归锁管的字段只经过访问函数**：上表里归进程锁、`wait_lock` 管的进程字段收在 `Process.under_lock`、`under_wait_lock` 里，读写都写成 `p.locked().state`、`p.family().parent`。访问函数先检查拿着对应的锁，没拿就 panic；一个扫描源码的单元测试保证没有别处直接碰这两个子结构（[invariants.md](invariants.md#进程的字段归哪把锁管)）。只有 panic 信息不拿锁读，用名字说明这一点的 `racyForPanic()`。
 
 不用锁的：`proc.next_pid`、`proc.foreground`、每一页的引用数（`page.refs`）、缓冲区缓存的 `clock`、`evicting` 是原子变量；`init_proc` 只在启动时写一次；`cpus[i]`、`spinlock` 的 `held[i]`、`timer.deadline[i]` 只有 hart i 自己读写；进程的 `space`、`context`、`files`、`cwd` 只有进程自己读写（见[进程表](#进程表)）；内核页表启动后不再改。
 

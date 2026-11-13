@@ -80,41 +80,91 @@ pub const max_procs = abi.max_procs;
 pub const State = abi.ProcState;
 
 pub const Process = struct {
-    /// 保护下面标着“lock”的字段。槽位一直在，锁也一直在：回收时不能连锁一起清掉（见 fill）
+    /// 保护 under_lock 里的字段。槽位一直在，锁也一直在：回收时不能连锁一起清掉（见 fill）
     lock: Spinlock = .init("proc", .proc),
-    /// lock
-    state: State = .unused,
-    /// lock。state 为 running 时，它在哪个 hart 上运行（kill 要给那个 hart 发核间中断）
-    hart: usize = 0,
-    /// lock
-    pid: usize = 0,
-    /// lock（exec 会改，procinfo 要读）
-    name: Name = .{},
+    /// 归 lock 管的字段，只能经过 locked() 读写（它检查拿着 lock）
+    under_lock: Guarded = .{},
+    /// 归 wait_lock 管的字段，只能经过 family() 读写（它检查拿着 wait_lock）
+    under_wait_lock: Family = .{},
     /// 这个进程的地址空间：根页表，各个段、堆从哪到哪（按需分页要用）
     space: vm.Space = undefined,
-    /// wait_lock。父进程。init 没有父进程；父进程先结束时，子进程交给 init（见 finish）
-    parent: ?*Process = null,
     /// 不在运行时，它的内核上下文保存在这里（见 switchContext）
     context: Context = undefined,
     /// 在某个 WaitQueue 里排着时的下一个进程，和 queued 一起由那个队列的锁（保护等待条件的锁）保护
     wait_next: ?*Process = null,
     /// 在不在某个 WaitQueue 里：wakeAll 把它摘下来时清掉；被 kill 叫醒的还排着，自己摘（见 WaitQueue.wait）
     queued: bool = false,
-    /// wait_lock。在 wait 里等子进程结束的父进程排在这里，子进程的 finish、reparent 叫醒它
-    child_exit: WaitQueue = .{},
-    /// lock。被 kill 了的话是原因。进程回到 U 模式之前看到它就自己结束（见 checkKilled）
-    killed: ?[]const u8 = null,
-    /// lock。zombie 的结束状态，父进程 wait 时取走：正常退出时是退出码，被杀时是 abi.killed_status
-    xstatus: u32 = 0,
-    /// lock。用掉的 CPU 时间（time CSR 的单位）：调度器每次切到它、它切回来时累加中间的差值，U 模式和内核里的都算
-    cpu_time: u64 = 0,
     /// 打开的文件，下标就是 fd
     files: [abi.max_fds]?*file.File = @splat(null),
     /// 拿着每一级的睡眠锁各几把（sleeplock.zig，检查加锁顺序）。只有自己改；回到 U 模式时必须都是 0
     sleeplocks: sleeplock.Held = .{},
     /// 当前目录的 inode 号，相对路径从这里开始找。fork 继承，exec 不变；只有自己读写
     cwd: u64 = fs.root_ino,
+
+    /// 归进程锁管的字段。别的 hart 上的调度器、kill、wait、procinfo 都会读写它们
+    pub const Guarded = struct {
+        state: State = .unused,
+        /// state 为 running 时，它在哪个 hart 上运行（kill 要给那个 hart 发核间中断）
+        hart: usize = 0,
+        pid: usize = 0,
+        /// exec 会改，procinfo 要读
+        name: Name = .{},
+        /// 被 kill 了的话是原因。进程回到 U 模式之前看到它就自己结束（见 checkKilled）
+        killed: ?[]const u8 = null,
+        /// zombie 的结束状态，父进程 wait 时取走：正常退出时是退出码，被杀时是 abi.killed_status
+        xstatus: u32 = 0,
+        /// 用掉的 CPU 时间（time CSR 的单位）：调度器每次切到它、它切回来时累加中间的差值，U 模式和内核里的都算
+        cpu_time: u64 = 0,
+    };
+
+    /// 归 wait_lock 管的字段：父子关系
+    pub const Family = struct {
+        /// 父进程。init 没有父进程；父进程先结束时，子进程交给 init（见 finish）
+        parent: ?*Process = null,
+        /// 在 wait 里等子进程结束的父进程排在这里，子进程的 finish、reparent 叫醒它
+        child_exit: WaitQueue = .{},
+    };
+
+    /// 归进程锁管的字段。没拿着这个进程的锁就 panic：原来这是一条写在注释里的约定
+    /// （“state、pid……只在拿着它的锁时读写”），漏了的话只有两个 hart 恰好同时碰它时才出错。
+    pub fn locked(p: *Process) *Guarded {
+        if (!p.lock.holding()) std.debug.panic("process fields used without holding the process lock (slot {d})", .{slotOf(p)});
+        return &p.under_lock;
+    }
+
+    /// 归 wait_lock 管的字段（父子关系）。没拿着 wait_lock 就 panic。
+    pub fn family(p: *Process) *Family {
+        if (!wait_lock.holding()) std.debug.panic("parent/child_exit used without holding wait_lock (slot {d})", .{slotOf(p)});
+        return &p.under_wait_lock;
+    }
+
+    /// 只给 panic 信息用：不拿锁读（就要停机了，锁可能在别人手里，读到半新半旧的也只是信息不准）。
+    pub fn racyForPanic(p: *const Process) *const Guarded {
+        return &p.under_lock;
+    }
+
+    /// 单元测试用：直接摆好、直接看，不拿锁（测试里只有一个线程）。内核代码不能用
+    fn testFields(p: *Process) *Guarded {
+        return &p.under_lock;
+    }
+
+    fn testFamily(p: *Process) *Family {
+        return &p.under_wait_lock;
+    }
 };
+
+/// 当前进程的 pid（getpid）。
+pub fn currentPid() usize {
+    const p = current().?;
+    p.lock.acquire();
+    defer p.lock.release();
+    return p.locked().pid;
+}
+
+/// p 在进程表里的下标（panic 信息里用：不拿锁也能说出是哪个进程）。
+fn slotOf(p: *const Process) usize {
+    return (@intFromPtr(p) - @intFromPtr(&table)) / @sizeOf(Process);
+}
 
 /// 进程表。槽位 i 的进程用 kstack.process[i] 作内核栈。
 pub var table: [max_procs]Process = @splat(.{});
@@ -159,7 +209,7 @@ const Context = extern struct {
 fn allocSlot() error{TooManyProcesses}!*Process {
     for (&table) |*p| {
         p.lock.acquire();
-        if (p.state == .unused) {
+        if (p.locked().state == .unused) {
             canary.set(stackOf(p));
             return p;
         }
@@ -194,7 +244,7 @@ fn stackOf(p: *Process) *[kstack.Process.stack_size]u8 {
 /// 这时栈已经退回去了，但溢出时踩坏的东西（相邻进程的 TrapFrame）还没被用到。
 pub fn checkStack() void {
     const p = current().?;
-    canary.check(stackOf(p), "pid {d} ({s})", .{ p.pid, p.name.slice() });
+    canary.check(stackOf(p), "pid {d} ({s})", .{ p.racyForPanic().pid, p.racyForPanic().name.slice() }); // 只给 panic 信息用
 }
 
 /// 从程序入口开始运行的 TrapFrame：a0 = argc，a1 = sp = 栈上 Arg 数组的地址（见 pushArgs），
@@ -244,8 +294,7 @@ pub fn userinit() SpawnError!void {
     files[abi.stderr] = file.dup(console);
     startFrame(frameOf(p), image);
     fill(p, .{
-        .pid = next_pid.fetchAdd(1, .monotonic),
-        .name = .init("init"),
+        .under_lock = .{ .pid = next_pid.fetchAdd(1, .monotonic), .name = .init("init") },
         .space = space,
         .context = firstContext(p),
         .files = files,
@@ -267,6 +316,12 @@ pub const ForkError = error{ TooManyProcesses, OutOfMemory };
 /// 子进程从别的 hart 看来要么还不存在，要么已经完整地 runnable 了。
 pub fn fork() ForkError!usize {
     const parent = current().?;
+    // 父进程的名字归它自己的锁管：先取出来。下面拿着子进程的锁时不能再拿它（两把都是进程锁，同一等级不能嵌套）
+    const name = blk: {
+        parent.lock.acquire();
+        defer parent.lock.release();
+        break :blk parent.locked().name;
+    };
     var space = try vm.cloneUserSpace(&parent.space);
     errdefer vm.destroyUserSpace(&space);
     wait_lock.acquire();
@@ -280,10 +335,9 @@ pub fn fork() ForkError!usize {
     for (&files, parent.files) |*c, f| c.* = if (f) |x| file.dup(x) else null;
     const pid = next_pid.fetchAdd(1, .monotonic);
     fill(child, .{
-        .pid = pid,
-        .name = parent.name,
+        .under_lock = .{ .pid = pid, .name = name },
+        .under_wait_lock = .{ .parent = parent },
         .space = space,
-        .parent = parent,
         .context = firstContext(child),
         .files = files,
         .cwd = parent.cwd,
@@ -337,7 +391,7 @@ pub fn exec(path: []const u8, args: []const []const u8) ExecError!void {
     vm.activate(space.root);
     vm.destroyUserSpace(&old);
     p.lock.acquire();
-    p.name = .init(std.fs.path.basenamePosix(path));
+    p.locked().name = .init(std.fs.path.basenamePosix(path));
     p.lock.release();
     startFrame(frameOf(p), image);
 }
@@ -453,17 +507,17 @@ pub fn scheduler(boot_stack: []u8) noreturn {
         for (&table) |*p| {
             p.lock.acquire();
             defer p.lock.release();
-            if (p.state != .runnable) continue;
+            if (p.locked().state != .runnable) continue;
             ipi.setIdle(false);
-            p.state = .running;
-            p.hart = hart.id();
+            p.locked().state = .running;
+            p.locked().hart = hart.id();
             c.proc = p;
             vm.activate(p.space.root);
             kstat.inc(.context_switches);
             timer.startSlice();
             const start = timer.now();
             switchContext(&c.context, &p.context);
-            p.cpu_time += timer.now() - start;
+            p.locked().cpu_time += timer.now() - start;
             timer.endSlice();
             // 进程让出了 CPU，切回来时又拿着它的锁。先切回内核页表再放开锁：它可能已经结束，
             // 父进程拿到它的锁才能回收它、释放它的页表，那时这个 hart 不能还在用这张页表
@@ -488,7 +542,7 @@ fn sched() void {
     if (!p.lock.holding()) @panic("sched: not holding the process lock");
     // 拿着别的锁切走的话，别的进程再拿这把锁就会死锁
     if (spinlock.heldCount() != 1) std.debug.panic("sched: {d} spinlocks held", .{spinlock.heldCount()});
-    std.debug.assert(p.state != .running);
+    std.debug.assert(p.locked().state != .running);
     std.debug.assert(!riscv.interruptsEnabled());
     checkStack();
     // 不能缓存 cpus[hart.id()]：切回来时可能已经在另一个 hart 上了
@@ -499,7 +553,7 @@ fn sched() void {
 pub fn yield() void {
     const p = current().?;
     p.lock.acquire();
-    p.state = .runnable;
+    p.locked().state = .runnable;
     sched();
     p.lock.release();
 }
@@ -508,7 +562,7 @@ pub fn yield() void {
 pub fn yieldTimeslice() void {
     const p = current().?;
     p.lock.acquire();
-    p.state = .runnable;
+    p.locked().state = .runnable;
     sched();
     p.lock.release();
 }
@@ -539,7 +593,7 @@ pub const WaitQueue = struct {
         p.queued = true;
         p.lock.acquire();
         lock.release();
-        p.state = .sleeping;
+        p.locked().state = .sleeping;
         sched();
         p.lock.release();
         lock.acquire();
@@ -562,7 +616,7 @@ pub const WaitQueue = struct {
             p.queued = false;
             p.lock.acquire();
             defer p.lock.release();
-            if (p.state == .sleeping) {
+            if (p.locked().state == .sleeping) {
                 makeRunnable(p);
                 woken += 1;
             }
@@ -594,23 +648,39 @@ pub const WaitQueue = struct {
 /// 要调用 ipi.wakeIdle”，漏了的话空闲的 hart 不会来：没有 sleeper 时它不预约时钟中断（timer.zig）。调用方拿着 p.lock。
 /// 进程自己让出 CPU（yield）时不用：它在自己的 hart 上切回调度器，这个调度器接着扫描就会看到它。
 fn makeRunnable(p: *Process) void {
-    std.debug.assert(p.lock.holding() and p.state != .running);
-    p.state = .runnable;
+    std.debug.assert(p.lock.holding() and p.locked().state != .running);
+    p.locked().state = .runnable;
     ipi.wakeIdle(1);
 }
 
 /// 当前进程调用了 exit。由系统调用处理程序调用，不返回。
 pub fn exit(code: u8) noreturn {
     const p = current().?;
-    uart.print("[proc] pid {d} ({s}) exited with code {d}\n", .{ p.pid, p.name.slice(), code });
+    const id = identity(p);
+    uart.print("[proc] pid {d} ({s}) exited with code {d}\n", .{ id.pid, id.name.slice(), code });
     finish(p, code);
 }
 
 /// 强行结束当前进程。由陷阱处理程序调用，不返回。
 pub fn killCurrent(comptime reason: []const u8, args: anytype) noreturn {
     const p = current().?;
-    uart.print("[proc] pid {d} ({s}) killed: " ++ reason ++ "\n", .{ p.pid, p.name.slice() } ++ args);
+    const id = identity(p);
+    uart.print("[proc] pid {d} ({s}) killed: " ++ reason ++ "\n", .{ id.pid, id.name.slice() } ++ args);
     finish(p, abi.killed_status);
+}
+
+/// p 的 pid 和名字（拿着它的锁取一份，打印用）。
+fn identity(p: *Process) struct { pid: usize, name: Name } {
+    p.lock.acquire();
+    defer p.lock.release();
+    return .{ .pid = p.locked().pid, .name = p.locked().name };
+}
+
+/// p 的 pid（拿着它的锁读）。调用方不能拿着别的进程锁（同一等级不能嵌套）。
+fn pidOf(p: *Process) usize {
+    p.lock.acquire();
+    defer p.lock.release();
+    return p.locked().pid;
 }
 
 /// 当前进程是否被 kill 了。等待的循环里用它提前返回，回到陷阱处理程序后结束。
@@ -619,7 +689,7 @@ pub fn isKilled() bool {
     const p = current() orelse return false;
     p.lock.acquire();
     defer p.lock.release();
-    return p.killed != null;
+    return p.locked().killed != null;
 }
 
 /// 当前进程被 kill 过的话就结束它，否则返回。陷阱处理程序回到 U 模式之前、新进程第一次进入 U 模式之前调用，
@@ -627,7 +697,7 @@ pub fn isKilled() bool {
 pub fn checkKilled() void {
     const p = current().?;
     p.lock.acquire();
-    const reason = p.killed;
+    const reason = p.locked().killed;
     p.lock.release();
     if (reason) |r| killCurrent("{s}", .{r});
 }
@@ -648,10 +718,10 @@ fn finish(p: *Process, status: u32) noreturn {
     wait_lock.acquire();
     reparent(p, init);
     // 父进程可能在 wait 里睡着。它要拿 wait_lock 才能检查子进程，所以先叫醒、后改状态也不会漏掉
-    p.parent.?.child_exit.wakeAll(&wait_lock);
+    p.family().parent.?.family().child_exit.wakeAll(&wait_lock);
     p.lock.acquire();
-    p.xstatus = status;
-    p.state = .zombie;
+    p.locked().xstatus = status;
+    p.locked().state = .zombie;
     wait_lock.release();
     // 拿着自己的锁切走，调度器换回内核页表之后才放开：父进程要拿到这把锁才能回收它
     sched();
@@ -663,9 +733,9 @@ fn reparent(p: *Process, init: *Process) void {
     std.debug.assert(wait_lock.holding());
     for (&table) |*c| {
         // 空槽位的 parent 是 null（回收时清掉的），不会等于 p
-        if (c.parent == p) {
-            c.parent = init;
-            init.child_exit.wakeAll(&wait_lock);
+        if (c.family().parent == p) {
+            c.family().parent = init;
+            init.family().child_exit.wakeAll(&wait_lock);
         }
     }
 }
@@ -685,13 +755,13 @@ pub fn wait(pid: usize, nohang: bool, status: ?vm.PinnedDst) WaitError!?usize {
         if (try findZombieChild(p, pid)) |c| {
             defer c.lock.release();
             // 拿着锁写进用户内存，所以 status 是调用方 pin 好的
-            if (status) |dst| dst.copyOut(0, std.mem.asBytes(&c.xstatus));
-            const child_pid = c.pid;
+            if (status) |dst| dst.copyOut(0, std.mem.asBytes(&c.locked().xstatus));
+            const child_pid = c.locked().pid;
             reap(c);
             return child_pid;
         }
         if (nohang or isKilled()) return null;
-        p.child_exit.wait(&wait_lock);
+        p.family().child_exit.wait(&wait_lock);
     }
 }
 
@@ -702,11 +772,11 @@ fn findZombieChild(p: *Process, pid: usize) WaitError!?*Process {
     std.debug.assert(wait_lock.holding());
     var have_kids = false;
     for (&table) |*c| {
-        if (c.parent != p) continue;
+        if (c.family().parent != p) continue;
         c.lock.acquire();
-        if (pid == abi.wait_any or c.pid == pid) {
+        if (pid == abi.wait_any or c.locked().pid == pid) {
             have_kids = true;
-            if (c.state == .zombie) return c;
+            if (c.locked().state == .zombie) return c;
         }
         c.lock.release();
     }
@@ -717,7 +787,7 @@ fn findZombieChild(p: *Process, pid: usize) WaitError!?*Process {
 /// 调用方拿着 wait_lock（清 parent）和 c.lock。c 已经不在任何 hart 上运行了：它是拿着自己的锁切回调度器的，
 /// 调度器换回内核页表之后才放开这把锁，所以这里拿得到锁时，它的页表和内核栈都没人在用了。
 fn reap(c: *Process) void {
-    std.debug.assert(c.state == .zombie);
+    std.debug.assert(c.locked().state == .zombie);
     for (c.files) |f| std.debug.assert(f == null); // finish 关掉了
     vm.destroyUserSpace(&c.space);
     fill(c, .{});
@@ -740,13 +810,13 @@ pub fn kill(pid: usize, reason: []const u8) KillError!void {
 
 /// 调用方拿着 p.lock。同一个进程被杀两次，保留第一次的原因。
 fn markKilled(p: *Process, reason: []const u8) void {
-    if (p.killed == null) p.killed = reason;
-    switch (p.state) {
+    if (p.locked().killed == null) p.locked().killed = reason;
+    switch (p.locked().state) {
         .sleeping => makeRunnable(p),
         // 正在别的 hart 上运行：打断它。在 U 模式里的话马上陷入内核，回到 U 模式之前结束；
         // 在内核里（中断关着）的话，中断挂着，它本来就会在回到 U 模式之前检查 killed，这个中断只是多余的一次。
-        // 拿着 p.lock，p.hart 不会变；它可能刚好在切走，那样别的进程会收到一个什么也不做的中断
-        .running => if (p.hart != hart.id()) ipi.send(p.hart),
+        // 拿着 p.lock，p.locked().hart 不会变；它可能刚好在切走，那样别的进程会收到一个什么也不做的中断
+        .running => if (p.locked().hart != hart.id()) ipi.send(p.locked().hart),
         else => {},
     }
 }
@@ -768,7 +838,7 @@ pub fn interruptForeground() void {
     wait_lock.acquire();
     defer wait_lock.release();
     const fg = lockPid(foreground.load(.monotonic)) orelse return;
-    const alive = fg.state != .zombie and fg != init_proc;
+    const alive = fg.locked().state != .zombie and fg != init_proc;
     fg.lock.release();
     if (!alive) return;
     uart.write("^C\n");
@@ -777,14 +847,14 @@ pub fn interruptForeground() void {
         if (!isDescendant(p, fg)) continue;
         p.lock.acquire();
         defer p.lock.release();
-        if (p.state != .unused) markKilled(p, "interrupted by Ctrl-C");
+        if (p.locked().state != .unused) markKilled(p, "interrupted by Ctrl-C");
     }
 }
 
 /// p 是不是 ancestor 自己或者它的子孙。调用方拿着 wait_lock。
 fn isDescendant(p: *Process, ancestor: *Process) bool {
     var q: ?*Process = p;
-    while (q) |x| : (q = x.parent) {
+    while (q) |x| : (q = x.family().parent) {
         if (x == ancestor) return true;
     }
     return false;
@@ -795,7 +865,7 @@ fn lockPid(pid: usize) ?*Process {
     if (pid == 0) return null;
     for (&table) |*p| {
         p.lock.acquire();
-        if (p.state != .unused and p.pid == pid) return p;
+        if (p.locked().state != .unused and p.locked().pid == pid) return p;
         p.lock.release();
     }
     return null;
@@ -805,8 +875,8 @@ fn lockPid(pid: usize) ?*Process {
 pub fn parentPid() usize {
     wait_lock.acquire();
     defer wait_lock.release();
-    // 拿着 wait_lock，父进程不会被回收，它的 pid 不会变
-    return if (current().?.parent) |q| q.pid else 0;
+    // 拿着 wait_lock，父进程不会被回收，它的 pid 不会变；pid 归它的锁管，拿着读
+    return if (current().?.family().parent) |q| pidOf(q) else 0;
 }
 
 /// 进程表第 i 个槽位的进程信息（procinfo 系统调用），空槽位返回 null。
@@ -814,16 +884,19 @@ pub fn info(i: usize) ?abi.ProcInfo {
     wait_lock.acquire();
     defer wait_lock.release();
     const p = &table[i];
+    // 父进程的 pid 归父进程的锁管：先拿它读（拿着 wait_lock，父子关系不会变），放开之后再拿 p 的锁。
+    // 两把都是进程锁，同一等级不能嵌套
+    const ppid = if (p.family().parent) |q| pidOf(q) else 0;
     p.lock.acquire();
     defer p.lock.release();
-    if (p.state == .unused) return null;
+    if (p.locked().state == .unused) return null;
     return .{
-        .pid = p.pid,
-        .ppid = if (p.parent) |q| q.pid else 0,
-        .cpu_ms = timer.toMs(p.cpu_time),
-        .state = p.state,
-        .name_len = p.name.len,
-        .name = p.name.buf,
+        .pid = p.locked().pid,
+        .ppid = ppid,
+        .cpu_ms = timer.toMs(p.locked().cpu_time),
+        .state = p.locked().state,
+        .name_len = p.locked().name.len,
+        .name = p.locked().name.buf,
     };
 }
 
@@ -886,7 +959,7 @@ fn contextAsm(comptime op: []const u8, comptime base: []const u8) []const u8 {
 
 /// 测试用：表里直接摆好的 sleeping 进程没走 WaitQueue.wait，替它排进队列。
 fn testEnqueue(q: *WaitQueue, p: *Process) void {
-    std.debug.assert(p.state == .sleeping and !p.queued);
+    std.debug.assert(p.testFields().state == .sleeping and !p.queued);
     p.wait_next = q.first;
     q.first = p;
     p.queued = true;
@@ -907,11 +980,11 @@ test "wakeAll 只叫醒排在这个队列里的进程，清空队列；kill 只�
     var lock: Spinlock = .init("test cond", .cond);
     var a: WaitQueue = .{};
     var b: WaitQueue = .{};
-    table[0] = .{ .state = .sleeping, .pid = 1 };
-    table[1] = .{ .state = .sleeping, .pid = 2 };
-    table[2] = .{ .state = .sleeping, .pid = 3 };
-    table[3] = .{ .state = .runnable, .pid = 4 };
-    table[4] = .{ .state = .zombie, .pid = 5 };
+    table[0] = .{ .under_lock = .{ .state = .sleeping, .pid = 1 } };
+    table[1] = .{ .under_lock = .{ .state = .sleeping, .pid = 2 } };
+    table[2] = .{ .under_lock = .{ .state = .sleeping, .pid = 3 } };
+    table[3] = .{ .under_lock = .{ .state = .runnable, .pid = 4 } };
+    table[4] = .{ .under_lock = .{ .state = .zombie, .pid = 5 } };
     init_proc = &table[0];
     testEnqueue(&a, &table[0]);
     testEnqueue(&a, &table[1]);
@@ -921,29 +994,29 @@ test "wakeAll 只叫醒排在这个队列里的进程，清空队列；kill 只�
     a.wakeAll(&lock);
     a.wakeAll(&lock); // 空队列：什么都不做
     lock.release();
-    try expectEqual(.runnable, table[0].state);
-    try expectEqual(.runnable, table[1].state);
-    try expectEqual(.sleeping, table[2].state);
+    try expectEqual(.runnable, table[0].testFields().state);
+    try expectEqual(.runnable, table[1].testFields().state);
+    try expectEqual(.sleeping, table[2].testFields().state);
     try std.testing.expect(a.isEmpty() and !b.isEmpty());
     try std.testing.expect(!table[0].queued and !table[1].queued and table[2].queued);
 
     // kill 叫醒在睡的进程，只记第一次的原因；runnable 的进程状态不变，等它自己结束
     try kill(3, "first");
     try kill(3, "second");
-    try expectEqual(.runnable, table[2].state);
+    try expectEqual(.runnable, table[2].testFields().state);
     // 被 kill 叫醒的还排在 b 里（醒来的进程自己摘掉，见 WaitQueue.wait）；这时 wakeAll 把它摘下来，状态不变
     try std.testing.expect(table[2].queued);
     lock.acquire();
     b.remove(&table[2]);
     lock.release();
     try std.testing.expect(b.isEmpty() and !table[2].queued and table[2].wait_next == null);
-    try std.testing.expectEqualStrings("first", table[2].killed.?);
+    try std.testing.expectEqualStrings("first", table[2].testFields().killed.?);
     try kill(4, "x");
-    try expectEqual(.runnable, table[3].state);
+    try expectEqual(.runnable, table[3].testFields().state);
     try kill(5, "x"); // zombie：成功，状态不变
-    try expectEqual(.zombie, table[4].state);
+    try expectEqual(.zombie, table[4].testFields().state);
     try std.testing.expectError(error.PermissionDenied, kill(1, "x"));
-    try expectEqual(null, table[0].killed);
+    try expectEqual(null, table[0].testFields().killed);
     try std.testing.expectError(error.NoSuchProcess, kill(99, "x"));
     try std.testing.expectError(error.NoSuchProcess, kill(0, "x"));
     for (&table) |*p| try std.testing.expect(!p.lock.holding()); // 都放开了
@@ -954,16 +1027,16 @@ test "setfg 检查 pid；Ctrl-C 找的是前台进程和它的子孙，没有前
     testReset();
     defer testReset();
     const init = &table[0];
-    init.* = .{ .state = .sleeping, .pid = 1 };
-    table[1] = .{ .state = .sleeping, .pid = 2, .parent = init }; // sh
-    table[2] = .{ .state = .sleeping, .pid = 3, .parent = &table[1] }; // 前台的管道组长
-    table[3] = .{ .state = .runnable, .pid = 4, .parent = &table[2] };
-    table[4] = .{ .state = .sleeping, .pid = 5, .parent = &table[3] }; // 孙进程
-    table[5] = .{ .state = .runnable, .pid = 6, .parent = &table[1] }; // 后台进程
+    init.* = .{ .under_lock = .{ .state = .sleeping, .pid = 1 } };
+    table[1] = .{ .under_lock = .{ .state = .sleeping, .pid = 2 }, .under_wait_lock = .{ .parent = init } }; // sh
+    table[2] = .{ .under_lock = .{ .state = .sleeping, .pid = 3 }, .under_wait_lock = .{ .parent = &table[1] } }; // 前台的管道组长
+    table[3] = .{ .under_lock = .{ .state = .runnable, .pid = 4 }, .under_wait_lock = .{ .parent = &table[2] } };
+    table[4] = .{ .under_lock = .{ .state = .sleeping, .pid = 5 }, .under_wait_lock = .{ .parent = &table[3] } }; // 孙进程
+    table[5] = .{ .under_lock = .{ .state = .runnable, .pid = 6 }, .under_wait_lock = .{ .parent = &table[1] } }; // 后台进程
     init_proc = init;
 
     interruptForeground(); // 没有前台进程
-    for (table[0..6]) |p| try expectEqual(null, p.killed);
+    for (table[0..6]) |*p| try expectEqual(null, p.testFields().killed);
 
     try setForeground(3);
     try std.testing.expectError(error.NoSuchProcess, setForeground(99));
@@ -983,12 +1056,12 @@ test "wait 只找自己的子进程，按 pid 挑；子进程结束时交给 ini
     defer testReset();
     const init = &table[0];
     const sh = &table[1];
-    init.* = .{ .state = .sleeping, .pid = 1 };
-    testEnqueue(&init.child_exit, init); // 在 wait 里睡着
-    sh.* = .{ .state = .running, .pid = 2, .parent = init };
-    table[2] = .{ .state = .runnable, .pid = 3, .parent = sh };
-    table[3] = .{ .state = .zombie, .pid = 4, .parent = sh };
-    table[4] = .{ .state = .zombie, .pid = 5, .parent = init }; // 不是 sh 的子进程
+    init.* = .{ .under_lock = .{ .state = .sleeping, .pid = 1 } };
+    testEnqueue(&init.testFamily().child_exit, init); // 在 wait 里睡着
+    sh.* = .{ .under_lock = .{ .state = .running, .pid = 2 }, .under_wait_lock = .{ .parent = init } };
+    table[2] = .{ .under_lock = .{ .state = .runnable, .pid = 3 }, .under_wait_lock = .{ .parent = sh } };
+    table[3] = .{ .under_lock = .{ .state = .zombie, .pid = 4 }, .under_wait_lock = .{ .parent = sh } };
+    table[4] = .{ .under_lock = .{ .state = .zombie, .pid = 5 }, .under_wait_lock = .{ .parent = init } }; // 不是 sh 的子进程
     init_proc = init;
 
     wait_lock.acquire();
@@ -1008,10 +1081,10 @@ test "wait 只找自己的子进程，按 pid 挑；子进程结束时交给 ini
 
     // sh 结束时，它的子进程（包括已经结束的）都交给 init，init 被叫醒
     reparent(sh, init);
-    try expectEqual(init, table[2].parent.?);
-    try expectEqual(init, table[3].parent.?);
-    try expectEqual(.runnable, init.state);
-    try std.testing.expect(init.child_exit.isEmpty());
+    try expectEqual(init, table[2].testFamily().parent.?);
+    try expectEqual(init, table[3].testFamily().parent.?);
+    try expectEqual(.runnable, init.testFields().state);
+    try std.testing.expect(init.testFamily().child_exit.isEmpty());
     try std.testing.expectError(error.NoChildren, findZombieChild(sh, abi.wait_any));
     const z5 = (try findZombieChild(init, abi.wait_any)).?;
     try expectEqual(&table[3], z5);
@@ -1020,11 +1093,47 @@ test "wait 只找自己的子进程，按 pid 挑；子进程结束时交给 ini
 }
 
 test "fill 换掉除了锁以外的所有字段" {
-    var p: Process = .{ .state = .zombie, .pid = 7, .name = .init("x"), .cpu_time = 3, .sleeplocks = .{ .counts = .{ 0, 1, 2 } } };
+    var p: Process = .{ .under_lock = .{ .state = .zombie, .pid = 7, .name = .init("x"), .cpu_time = 3 }, .sleeplocks = .{ .counts = .{ 0, 1, 2 } } };
     p.lock.acquire();
     fill(&p, .{});
     try std.testing.expect(p.lock.holding());
-    try std.testing.expectEqual(.unused, p.state);
-    try std.testing.expectEqual(0, p.pid + p.cpu_time + p.sleeplocks.total());
+    try std.testing.expectEqual(.unused, p.testFields().state);
+    try std.testing.expectEqual(0, p.testFields().pid + p.testFields().cpu_time + p.sleeplocks.total());
     p.lock.release();
+}
+
+test "归锁管的字段只经过 locked()、family() 读写（扫描源码）" {
+    // locked()、family() 在运行时检查拿着锁；这里检查没有人绕过它们直接碰 under_lock、under_wait_lock。
+    // 允许的写法：字段的声明、整个新值的字面量（fill、测试里摆好进程表）、注释，和下面数过个数的几个访问函数。
+    // 新加一个直接取地址的访问函数、或者在别的文件里碰它们，这个测试就失败
+    const sources = .{
+        .{ "proc.zig", @embedFile("proc.zig") },
+        .{ "trap.zig", @embedFile("trap.zig") },
+        .{ "syscall.zig", @embedFile("syscall.zig") },
+        .{ "file.zig", @embedFile("file.zig") },
+        .{ "fsys.zig", @embedFile("fsys.zig") },
+        .{ "vm.zig", @embedFile("vm.zig") },
+        .{ "ipi.zig", @embedFile("ipi.zig") },
+        .{ "sleeplock.zig", @embedFile("sleeplock.zig") },
+        .{ "kstack.zig", @embedFile("kstack.zig") },
+    };
+    var accessors: usize = 0;
+    inline for (sources) |src| {
+        var lines = std.mem.splitScalar(u8, src[1], '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " ");
+            if (std.mem.indexOf(u8, line, "under_lock") == null and std.mem.indexOf(u8, line, "under_wait_lock") == null) continue;
+            if (std.mem.startsWith(u8, line, "//") or std.mem.indexOfScalar(u8, line, '"') != null) continue; // 注释、这个测试自己
+            const ok = std.mem.startsWith(u8, line, "under_lock: Guarded") or std.mem.startsWith(u8, line, "under_wait_lock: Family") or
+                std.mem.indexOf(u8, line, ".under_lock = .{") != null or std.mem.indexOf(u8, line, ".under_wait_lock = .{") != null;
+            if (std.mem.eql(u8, line, "return &p.under_lock;") or std.mem.eql(u8, line, "return &p.under_wait_lock;")) {
+                accessors += 1;
+            } else if (!ok) {
+                std.debug.print("{s}: touches a lock-guarded field directly: {s}\n", .{ src[0], line });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+    // locked、racyForPanic、testFields；family、testFamily
+    try std.testing.expectEqual(5, accessors);
 }

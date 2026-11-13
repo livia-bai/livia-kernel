@@ -352,8 +352,8 @@ fn stackOverflow(owner: kstack.Owner, frame: *TrapFrame) noreturn {
         .trap => |h| std.debug.panic("kernel stack overflow: trap stack of hart {d} hit its guard page at 0x{x}, sepc=0x{x}", .{ h, stval, frame.sepc }),
         .process => |slot| {
             // 不拿锁读 pid、name：就要 panic 了，锁可能在别人手里
-            const p = &proc.table[slot];
-            std.debug.panic("kernel stack overflow: pid {d} ({s}) hit its guard page at 0x{x}, sepc=0x{x}", .{ p.pid, p.name.slice(), stval, frame.sepc });
+            const g = proc.table[slot].racyForPanic();
+            std.debug.panic("kernel stack overflow: pid {d} ({s}) hit its guard page at 0x{x}, sepc=0x{x}", .{ g.pid, g.name.slice(), stval, frame.sepc });
         },
     }
 }

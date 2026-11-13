@@ -6,7 +6,7 @@
 2. **运行时断言**：违反的那一刻 panic，说出是哪条规矩。只要那条路径跑到过一次就能发现，不用等它真的出错。
 3. **类型约束**：错误的写法编译不过。不用跑，也不用跑到那条路径。
 
-越往后越可靠，代价也越大：断言要在运行时付出一点检查，类型约束常常要把接口重新设计一遍，编译错误也更难读。下面五个例子都是这个仓库里真实发生过的改动：原来是第 1 种，改成了第 2 种或第 3 种。每个例子保留了改动前后的代码（摘录，省略了无关的部分），讲为什么停在那一级、没有再往前走。
+越往后越可靠，代价也越大：断言要在运行时付出一点检查，类型约束常常要把接口重新设计一遍，编译错误也更难读。下面六个例子都是这个仓库里真实发生过的改动：原来是第 1 种，改成了第 2 种或第 3 种。每个例子保留了改动前后的代码（摘录，省略了无关的部分），讲为什么停在那一级、没有再往前走。
 
 | 规矩 | 原来 | 现在 | 违反了会怎样 |
 | --- | --- | --- | --- |
@@ -15,6 +15,7 @@
 | 内核和用户程序对系统调用的参数个数、顺序、类型理解一致 | 注释约定（四处各写一遍） | 编译期核对（`abi.params`） | 编译不过 |
 | 打开的文件只读写和它的种类相符的字段 | 注释约定（字段旁边写“kind 为 X 时”） | 类型（tagged union） | 编译不过，或者运行时 panic |
 | 等待的一方和叫醒的一方用同一个“通道” | 注释约定（两边写同一个地址表达式） | 类型（每个条件一个 `WaitQueue` 字段）+ 断言（拿着锁） | 多半编译不过；没拿锁 panic |
+| 进程的 `state`、`pid`……只在拿着进程锁时读写，`parent` 只在拿着 `wait_lock` 时 | 注释约定（字段旁边写“lock”“wait_lock”） | 断言（访问函数检查拿着锁）+ 扫描源码的单元测试 | 读写的那一刻 panic；绕过访问函数，单元测试失败 |
 
 ## 拿着锁复制用户内存之前先把页准备好
 
@@ -222,11 +223,64 @@ p.readers.wakeAll(&p.lock);    // 写的一方写进了数据
 
 **为什么还要断言**：类型只管住了“用哪个队列”，管不住“拿着哪把锁调用”：`WaitQueue` 不知道保护它的是哪把锁（把锁的指针存进队列，对管道这种放在一页里、对睡眠锁这种静态数组里的结构体都不方便）。所以锁作为参数传进去，在运行时检查。
 
+## 进程的字段归哪把锁管
+
+**规矩**：进程的 `state`、`hart`、`pid`、`name`、`killed`、`xstatus`、`cpu_time` 只在拿着这个进程的锁时读写，`parent`、`child_exit` 只在拿着 `wait_lock` 时读写。别的 hart 上的调度器、`kill`、`wait`、`procinfo` 随时可能同时碰它们（[process.md](process.md#锁)）。
+
+**原来**：字段旁边的注释写着归哪把锁管，`AGENTS.md` 里再写一遍：
+
+```zig
+pub const Process = struct {
+    lock: Spinlock = .init("proc", .proc),
+    /// lock
+    state: State = .unused,
+    /// lock
+    pid: usize = 0,
+    /// wait_lock。父进程
+    parent: ?*Process = null,
+    ...
+};
+```
+
+`p.pid` 和 `p.space` 写起来一模一样，哪个要锁全靠记。
+
+**现在**：归锁管的字段收进两个子结构，只能经过访问函数拿到，访问函数先检查锁：
+
+```zig
+pub const Process = struct {
+    lock: Spinlock = .init("proc", .proc),
+    under_lock: Guarded = .{},          // state、hart、pid、name、killed、xstatus、cpu_time
+    under_wait_lock: Family = .{},      // parent、child_exit
+    space: vm.Space = undefined,        // 只有自己读写的，照旧
+    ...
+
+    pub fn locked(p: *Process) *Guarded {
+        if (!p.lock.holding()) std.debug.panic("process fields used without holding the process lock (slot {d})", .{slotOf(p)});
+        return &p.under_lock;
+    }
+    pub fn family(p: *Process) *Family { ... } // 检查 wait_lock
+};
+
+p.locked().state = .runnable;
+```
+
+每一次读写都写成 `p.locked().x`，读代码时一眼能看出它要锁；没拿锁就 panic。剩下的漏洞是有人绕过访问函数，直接写 `p.under_lock.state`，这一条交给一个扫描源码的单元测试：它用 `@embedFile` 读进 `proc.zig`、`trap.zig`、`syscall.zig` 等文件，`under_lock`、`under_wait_lock` 只许出现在字段的声明、整个新值的字面量（`fill` 一次填好新进程）和注释里，直接取地址的访问函数正好 5 个（`locked`、`family`、给 panic 信息用的 `racyForPanic`、两个只给单元测试用的）。在 `getpid` 里改成直接读 `under_lock.pid`，这个测试失败，打印出那一行。
+
+**改的过程中发现的**：第一次跑 QEMU 测试就 panic 了，接下来几处都是原来没拿锁读的：
+
+- `checkStack` 每次都把 pid、名字当参数传给 `canary.check`，用来拼 panic 信息。参数总是先求值，所以每次检查栈都在不拿锁地读。这里本来就只给 panic 信息用，改成 `racyForPanic()`，名字说明它是故意的。
+- `exit`、`killCurrent` 打印 `[proc] pid N (name) exited` 时不拿锁读；改成先拿锁取一份（`identity`）。
+- `fork` 拿着子进程的锁读父进程的名字；`procinfo` 拿着一个进程的锁读它父进程的 pid。两把都是进程锁，同一等级不能嵌套，原来就是不拿锁直接读。现在先拿父进程的锁读完、放开，再拿另一把。
+- `getpid` 不拿锁读自己的 pid。
+
+这些地方实际上都不会出错：自己的 pid、名字只有自己改（`exec`），父进程的 pid 在 `wait_lock` 下不会变。但“这里不拿锁也没事”要靠读的人自己想清楚，现在规矩只有一条，例外有名字（`racyForPanic`）。
+
+**为什么不做成类型**：真正的“持锁凭证”（拿锁返回一个凭证，读写字段要传凭证，放锁之后凭证作废）在 Zig 里做不到：没有线性类型，凭证可以被复制、放锁之后还能用。进程锁还会在调度器和进程之间交接（[process.md](process.md#调度器)），凭证跨不过 `switchContext`。所以停在断言加源码扫描：断言管住“拿着锁”，扫描管住“只经过访问函数”。
+
 ## 还停在注释里的
 
 有些规矩还只写在 `AGENTS.md` 和注释里，是下一步可以做的：
 
-- **字段归哪把锁管**：进程的 `state`、`pid` 只能拿着进程锁读写，`parent` 只能拿着 `wait_lock`。可以把这些字段包进一个只能通过“持锁凭证”访问的结构体，像 `PinnedDst` 那样。
 - **硬件约定**：`sscratch` 在三种情况下各存什么，`tp` 在内核里一定是 hart 编号。这类规矩没法交给类型，现在做到了运行时检查：启动时、每次进陷阱处理程序、调度器每一轮各核对一次（[trap.md](trap.md#sscratch-约定)）。
 - **改程序文件之前先 `beginModify`**：现在靠每个改文件的地方记得调用（[fs.md](fs.md#删掉还有人用着的文件)），可以像 pin 那样做成凭证。
 

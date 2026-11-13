@@ -248,7 +248,7 @@ const handlers = struct {
     }
 
     pub fn getpid() usize {
-        return proc.current().?.pid;
+        return proc.currentPid();
     }
 
     pub fn getppid() usize {

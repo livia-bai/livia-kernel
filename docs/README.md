@@ -27,7 +27,7 @@ livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 
 | 范本 | `spinlock.zig`、`ipi.zig`、`page.zig` | 加锁顺序由等级检查；无锁的部分都有几行论证 |
 | 范本 | `btree.zig`、`ctree.zig` | 写时复制、提交、快照读者，掉电和读写失败的穷举测试 |
 | 范本 | `riscv.zig`、`abi.zig`、`syscall.zig` 的 `dispatch` | CSR 的位、系统调用的签名和错误码都只写一次，别的地方在编译期和它核对 |
-| 够用 | `proc.zig` | 结构照 xv6；哪个字段归哪把锁管还只写在注释里，没有交给类型 |
+| 够用 | `proc.zig` | 结构照 xv6；归锁管的字段只经过检查锁的访问函数读写 |
 | 范本 | `vm.zig` | 按需分页、写时复制、pin；用户地址空间是一张区域表（`Region`），段、堆、栈都只是其中一项 |
 | 够用 | `timer.zig`、`file.zig`、`pipe.zig`、`sleeplock.zig`、`bio.zig`、`fsys.zig`、`loader.zig`、`dtb.zig`、`kstat.zig`、`main.zig`、`sbi.zig`、`plic.zig` | 清楚、有测试，没有特别值得学的写法 |
 | 待重构 | `fs.zig` | 一千七百多行，路径解析、目录、文件内容、检查放在一起，可以按这几块拆开 |
