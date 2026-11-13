@@ -2,6 +2,10 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-14 页缓存的统计不再把整张表复制到栈上
+
+- 修了：`pagecache.counts()`（每次 `meminfo` 都调用）按值遍历 256 项的表，整张 8 KiB 的表先复制到进程内核栈上，safe 模式下进程内核栈最深从约 10.5 KiB 变成约 17.1 KiB。改成按指针遍历。
+
 ## 2026-11-14 进程的字段只经过检查锁的访问函数读写
 
 - 改动：进程归进程锁管的字段（`state`、`hart`、`pid`、`name`、`killed`、`xstatus`、`cpu_time`）收进 `Process.under_lock`，归 `wait_lock` 管的（`parent`、`child_exit`）收进 `under_wait_lock`，只经过 `p.locked()`、`p.family()` 读写，没拿着锁就 panic。单元测试扫描源码，不许别处直接碰这两个子结构。

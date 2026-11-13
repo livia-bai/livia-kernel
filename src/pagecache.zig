@@ -135,7 +135,7 @@ pub fn counts() Counts {
     lock.acquire();
     defer lock.release();
     var c: Counts = .{};
-    for (entries) |e| if (e.page) |p| {
+    for (&entries) |*e| if (e.page) |p| { // 按指针：按值的话整个 8 KiB 的表先复制到栈上
         c.cached += 1;
         if (page.isExclusive(p)) c.reclaimable += 1;
     };
