@@ -2,6 +2,10 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-13 用户地址空间是一张区域表
+
+- 改动：`vm.Space` 的段数组、`heap_start` 换成一张区域表（`vm.Region`：起止、权限、内容是清零还是来自程序文件）：第 0 项是栈，第 1 项是堆（建地址空间时就放好，加载完程序 `setHeap`，`sbrk` 用 `setBrk` 只改它的末尾），程序的段从第 2 项起。`regionOf` 只是查表，`fork` 照抄整张表。`vm.Segment` 去掉了。
+
 ## 2026-11-13 检查 sscratch、tp 约定
 
 - 新增：`trap.checkBoot`（每个 hart 启动时）、`checkEntry`（每次进陷阱处理程序）、`checkIdle`（调度器每一轮）核对 `sscratch` 和 `tp` 的约定，违反了 panic（`trap convention broken: ...`）。`proc.frameOf` 改成 `pub`。

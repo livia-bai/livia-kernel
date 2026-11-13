@@ -237,16 +237,30 @@ pub const heap_limit = stack_limit - page.size;
 /// 一个程序最多几个要加载的段（ELF 的 PT_LOAD）。user/linker.ld 链接出来的是 3 个
 pub const max_segments = 8;
 
-/// 程序的一个段，exec 时只记下来（loader.load），里面的页第一次被访问时才分配（fault）：
-/// 段在文件里的那部分（从程序文件的 file_off 开始的 file_size 字节）读进来，剩下的（.bss）是 0。
-pub const Segment = struct {
-    /// 段的起点（按页对齐）和终点（向上对齐到页）
+/// 用户地址空间里的一个区域：一段按页对齐的地址 [start, end)，访问权限，页的内容从哪来。
+/// 里面的页第一次被访问时才分配（fault）。
+pub const Region = struct {
     start: usize,
     end: usize,
     perm: Perm,
-    file_off: u64,
-    file_size: u64,
+    source: Source = .zero,
+
+    pub const Source = union(enum) {
+        /// 清零的页（堆、栈）
+        zero,
+        /// 程序的段：从 start 起的 size 字节来自 backing（程序文件）的 off 处，剩下的（.bss）是 0
+        file: struct { off: u64, size: u64 },
+    };
+
+    fn contains(r: Region, va: usize) bool {
+        return va >= r.start and va < r.end;
+    }
 };
+
+/// 区域表里固定的两项：栈、堆（建地址空间时就放好，堆一开始是空的）；程序的段从第 2 项起
+const stack_region = 0;
+const heap_region = 1;
+const max_regions = 2 + max_segments;
 
 /// 段的内容从哪读。
 pub const Backing = union(enum) {
@@ -267,53 +281,84 @@ pub const Backing = union(enum) {
     }
 };
 
-/// 一个用户地址空间：根页表，和按需分页要知道的“哪些地址可以有页、页从哪来”。
-/// 页表里只有已经访问过的页；用户区里别的地址按下面的顺序看（regionOf）：
-///   segments               程序的各个段：权限按段，内容从 backing 读
-///   [heap_start, brk)      堆（sbrk）：可读写，清零。按页算，brk 所在的那一页整页都能用
-///   [stack_limit, user_end) 栈：可读写，清零
-/// 都不是的地址（包括栈下面的保护页）访问时缺页，结束进程。
+/// 一个用户地址空间：根页表，和按需分页要知道的“哪些地址可以有页、页从哪来”：一张区域表（Region）。
+/// 页表里只有已经访问过的页；别的地址在区域表里查（regionOf）：
+///   regions[0]  栈 [stack_limit, user_end)：可读写，清零
+///   regions[1]  堆 [堆的起点, brk 向上对齐到页)（sbrk）：可读写，清零。brk 所在的那一页整页都能用
+///   regions[2..] 程序的各个段：权限按段，内容从 backing 读
+/// 都不在的地址（包括栈下面的保护页）访问时缺页，结束进程。以后加匿名映射、文件映射，就是往表里加一项。
 /// 只有它所属的进程自己读写（没有线程），不用加锁。
 pub const Space = struct {
     root: *PageTable,
-    segments: [max_segments]Segment = undefined,
-    nsegments: usize = 0,
+    regions: [max_regions]Region = undefined,
+    nregions: usize = 0,
     backing: Backing = .none,
-    /// 堆的起点（最后一个段之后的页边界）和当前的末尾，见 proc.sbrk
-    heap_start: usize = 0,
+    /// 堆的末尾（字节，sbrk 挪它）；堆那一项的 end 是它向上对齐到页
     brk: usize = 0,
 
-    /// 记下一个段。段按页对齐，不能和已有的段重叠（Overlap），最多 max_segments 个（TooMany）。
-    pub fn addSegment(s: *Space, seg: Segment) error{ Overlap, TooMany }!void {
-        std.debug.assert(seg.start % page.size == 0 and seg.end % page.size == 0 and seg.start < seg.end);
-        std.debug.assert(seg.start >= user_base and seg.end <= heap_limit and seg.file_size <= seg.end - seg.start);
-        for (s.segments[0..s.nsegments]) |o| {
-            if (seg.start < o.end and o.start < seg.end) return error.Overlap;
+    /// 加一个程序的段：按页对齐，不能和已有的区域重叠（Overlap），最多 max_segments 个（TooMany）。
+    pub fn addSegment(s: *Space, r: Region) error{ Overlap, TooMany }!void {
+        std.debug.assert(r.start % page.size == 0 and r.end % page.size == 0 and r.start < r.end);
+        std.debug.assert(r.start >= user_base and r.end <= heap_limit);
+        switch (r.source) {
+            .file => |f| std.debug.assert(f.size <= r.end - r.start),
+            .zero => {},
         }
-        if (s.nsegments == max_segments) return error.TooMany;
-        s.segments[s.nsegments] = seg;
-        s.nsegments += 1;
+        for (s.regions[0..s.nregions]) |o| {
+            if (r.start < o.end and o.start < r.end) return error.Overlap;
+        }
+        if (s.nregions == max_regions) return error.TooMany;
+        s.regions[s.nregions] = r;
+        s.nregions += 1;
+    }
+
+    /// 程序的各个段。
+    pub fn segments(s: *const Space) []const Region {
+        return s.regions[2..s.nregions];
+    }
+
+    /// 堆从 start（按页对齐，在所有段之后）开始，现在是空的（loader 加载完程序之后调用）。
+    pub fn setHeap(s: *Space, start: usize) void {
+        std.debug.assert(start % page.size == 0 and start <= heap_limit);
+        for (s.segments()) |seg| std.debug.assert(seg.end <= start);
+        s.regions[heap_region].start = start;
+        s.regions[heap_region].end = start;
+        s.setBrk(start);
+    }
+
+    pub fn heapStart(s: *const Space) usize {
+        return s.regions[heap_region].start;
+    }
+
+    /// 把堆的末尾挪到 brk（sbrk 检查过范围）。
+    pub fn setBrk(s: *Space, brk: usize) void {
+        std.debug.assert(brk >= s.heapStart() and brk <= heap_limit);
+        s.brk = brk;
+        s.regions[heap_region].end = std.mem.alignForward(usize, brk, page.size);
     }
 
     /// 页 base（按页对齐）该是什么样的，不在任何区域里返回 null。
-    fn regionOf(s: *const Space, base: usize) ?Region {
-        for (s.segments[0..s.nsegments]) |seg| {
-            if (base < seg.start or base >= seg.end) continue;
-            const o = base - seg.start;
-            return .{
-                .perm = seg.perm,
-                .file_off = seg.file_off + o,
-                .file_len = if (o < seg.file_size) @intCast(@min(page.size, seg.file_size - o)) else 0,
+    fn regionOf(s: *const Space, base: usize) ?Page {
+        for (s.regions[0..s.nregions]) |r| {
+            if (!r.contains(base)) continue;
+            return switch (r.source) {
+                .zero => .{ .perm = r.perm },
+                .file => |f| blk: {
+                    const o = base - r.start;
+                    break :blk .{
+                        .perm = r.perm,
+                        .file_off = f.off + o,
+                        .file_len = if (o < f.size) @intCast(@min(page.size, f.size - o)) else 0,
+                    };
+                },
             };
         }
-        const rw: Region = .{ .perm = .{ .r = true, .w = true } };
-        if (base >= s.heap_start and base < std.mem.alignForward(usize, s.brk, page.size)) return rw;
-        if (base >= stack_limit and base < stack_top) return rw;
         return null;
     }
 };
 
-const Region = struct {
+/// 一页该是什么样的（regionOf 查出来的）。
+const Page = struct {
     perm: Perm,
     /// 这一页开头的 file_len 个字节来自文件的 file_off，其余是 0
     file_off: u64 = 0,
@@ -324,7 +369,11 @@ const Region = struct {
 pub fn createUserSpace() error{OutOfMemory}!Space {
     const root: *PageTable = @ptrCast(try page.allocUninit()); // 整页马上被覆盖
     @memcpy(root, kernel_root); // 不写成 root.* = kernel_root.*：Debug 模式下会先在栈上复制一份 4 KiB
-    return .{ .root = root };
+    var s: Space = .{ .root = root, .nregions = 2 };
+    const rw: Perm = .{ .r = true, .w = true };
+    s.regions[stack_region] = .{ .start = stack_limit, .end = stack_top, .perm = rw };
+    s.regions[heap_region] = .{ .start = user_base, .end = user_base, .perm = rw }; // 空的，loader 设好起点
+    return s;
 }
 
 /// 释放用户地址空间：用户区里的页、装这些页的页表，最后是根页表本身；还有对程序文件的占用（releaseBacking）。
@@ -414,7 +463,7 @@ fn leafOf(root: *PageTable, va: usize) ?*Pte {
 /// 可写的页在两边都改成只读、标上 cow：之后谁先写谁触发缺页，由 breakCow 给它复制一份，所以两边仍然各改各的。
 /// 本来就只读的页（代码、只读数据）不会被写，一直共用。需要新分配的只有子进程的页表。
 /// src 里还没访问过的页，dst 里也没有：以后谁访问谁按需分配（段的内容从同一个程序文件读，所以和 src 的一样）。
-/// 段、堆、程序文件都照抄，程序文件多一个占用（fsys.dup）。
+/// 区域表（段、堆、栈）、程序文件都照抄，程序文件多一个占用（fsys.dup）。
 ///
 /// src 是当前 hart 正在用的地址空间（fork 的父进程），改了它的页表项，最后刷新 TLB。
 /// 中途内存不够时 dst 整个释放掉；src 里已经改成 cow 的页留着不改回去：以后写的时候 breakCow
@@ -424,9 +473,8 @@ pub fn cloneUserSpace(src: *Space) error{OutOfMemory}!Space {
     var dst = try createUserSpace();
     errdefer destroyUserSpace(&dst);
     for (vpn(user_base, 2)..vpn(user_end - 1, 2) + 1) |i| try cloneTree(dst.root, &src.root[i], 2, i * levelSize(2));
-    dst.segments = src.segments;
-    dst.nsegments = src.nsegments;
-    dst.heap_start = src.heap_start;
+    dst.regions = src.regions;
+    dst.nregions = src.nregions;
     dst.brk = src.brk;
     switch (src.backing) {
         .file => |ino| fsys.dup(ino, .text),
@@ -825,10 +873,10 @@ const test_image: [6000]u8 = blk: {
 fn testSpace() !Space {
     var s = try createUserSpace();
     s.backing = .{ .bytes = &test_image };
-    try s.addSegment(.{ .start = user_base, .end = user_base + 2 * page.size, .perm = .{ .r = true, .x = true }, .file_off = 0, .file_size = 6000 });
-    try s.addSegment(.{ .start = user_base + 2 * page.size, .end = user_base + 4 * page.size, .perm = .{ .r = true, .w = true }, .file_off = 100, .file_size = 10 });
-    s.heap_start = user_base + 4 * page.size;
-    s.brk = s.heap_start + 100;
+    try s.addSegment(.{ .start = user_base, .end = user_base + 2 * page.size, .perm = .{ .r = true, .x = true }, .source = .{ .file = .{ .off = 0, .size = 6000 } } });
+    try s.addSegment(.{ .start = user_base + 2 * page.size, .end = user_base + 4 * page.size, .perm = .{ .r = true, .w = true }, .source = .{ .file = .{ .off = 100, .size = 10 } } });
+    s.setHeap(user_base + 4 * page.size);
+    s.setBrk(s.heapStart() + 100);
     return s;
 }
 
@@ -864,8 +912,8 @@ test "按需分页：段、堆、栈的页第一次访问时才分配；段的�
     try std.testing.expectEqual(pages - 1, page.freePages());
 
     // 堆：brk 所在的那一页整页都能用，再往后不行；栈：[stack_limit, stack_top)，下面的保护页不行
-    try copyToUser(&s, s.heap_start + page.size - 1, "h");
-    try std.testing.expectError(error.BadAddress, copyToUser(&s, s.heap_start + page.size, "h"));
+    try copyToUser(&s, s.heapStart() + page.size - 1, "h");
+    try std.testing.expectError(error.BadAddress, copyToUser(&s, s.heapStart() + page.size, "h"));
     try copyToUser(&s, stack_top - 1, "s");
     try copyToUser(&s, stack_limit, "s");
     try std.testing.expectError(error.BadAddress, copyToUser(&s, stack_limit - 1, "s"));
@@ -874,8 +922,8 @@ test "按需分页：段、堆、栈的页第一次访问时才分配；段的�
     try std.testing.expectError(error.BadAddress, fault(&s, user_end, .read));
 
     // pin 也按需分配；整个范围都在区域里才通过
-    _ = try pinDst(&s, s.heap_start, page.size);
-    try std.testing.expectError(error.BadAddress, pinSrc(&s, s.heap_start, page.size + 1));
+    _ = try pinDst(&s, s.heapStart(), page.size);
+    try std.testing.expectError(error.BadAddress, pinSrc(&s, s.heapStart(), page.size + 1));
 
     destroyUserSpace(&s);
     try std.testing.expectEqual(before, page.freePages());
@@ -887,9 +935,11 @@ test "按需分页：段不能重叠，最多 max_segments 个；程序文件的
     const before = page.freePages();
     var s = try testSpace();
     const rx: Perm = .{ .r = true, .x = true };
-    try std.testing.expectError(error.Overlap, s.addSegment(.{ .start = user_base + page.size, .end = user_base + 3 * page.size, .perm = rx, .file_off = 0, .file_size = 0 }));
-    for (2..max_segments) |i| try s.addSegment(.{ .start = user_base + (10 + i) * page.size, .end = user_base + (11 + i) * page.size, .perm = rx, .file_off = 0, .file_size = 0 });
-    try std.testing.expectError(error.TooMany, s.addSegment(.{ .start = user_base + 100 * page.size, .end = user_base + 101 * page.size, .perm = rx, .file_off = 0, .file_size = 0 }));
+    try std.testing.expectError(error.Overlap, s.addSegment(.{ .start = user_base + page.size, .end = user_base + 3 * page.size, .perm = rx }));
+    // 和堆重叠（堆已经有一页了）
+    try std.testing.expectError(error.Overlap, s.addSegment(.{ .start = user_base + 4 * page.size, .end = user_base + 5 * page.size, .perm = rx }));
+    for (2..max_segments) |i| try s.addSegment(.{ .start = user_base + (10 + i) * page.size, .end = user_base + (11 + i) * page.size, .perm = rx });
+    try std.testing.expectError(error.TooMany, s.addSegment(.{ .start = user_base + 100 * page.size, .end = user_base + 101 * page.size, .perm = rx }));
 
     // 换成“文件系统里的程序文件”：单元测试里没有挂载文件系统，读不出来，分配的页还回去；堆、.bss 这些清零的页照常分配
     s.backing = .{ .file = 1234 };
@@ -899,7 +949,7 @@ test "按需分页：段不能重叠，最多 max_segments 个；程序文件的
     var buf: [4]u8 = undefined;
     try std.testing.expectError(error.BadAddress, copyFromUser(&s, &buf, user_base));
     try fault(&s, user_base + 3 * page.size, .write); // .bss
-    try copyToUser(&s, s.heap_start, "heap");
+    try copyToUser(&s, s.heapStart(), "heap");
     s.backing = .none; // 没有真的占用程序文件
     destroyUserSpace(&s);
     try std.testing.expectEqual(before, page.freePages());
@@ -971,7 +1021,7 @@ test "cloneUserSpace 之后，两边没访问过的页各自按需分配，内�
     var src = try testSpace();
     try copyToUser(&src, user_base + 2 * page.size, "parent"); // 数据段第 1 页：父进程改过
     var dst = try cloneUserSpace(&src);
-    try std.testing.expectEqual(src.nsegments, dst.nsegments);
+    try std.testing.expectEqual(src.nregions, dst.nregions);
     try std.testing.expectEqual(src.brk, dst.brk);
     var buf: [6]u8 = undefined;
     try copyFromUser(&dst, &buf, user_base + 2 * page.size);
@@ -1026,12 +1076,12 @@ test "按需分配的堆：shrinkUser 只释放分配过的页和空出来的页
     testInit();
     kernel_root = @ptrCast(try page.alloc());
     var s = try testSpace();
-    const heap = s.heap_start;
+    const heap = s.heapStart();
     _ = try copyToUser(&s, stack_top - 1, "s"); // 栈占着第 1 级页表
     const start = page.freePages();
 
     // 长 4 MiB（只是挪 brk），碰其中几页：只分配这几页和它们的第 0 级页表
-    s.brk = heap + (4 << 20);
+    s.setBrk(heap + (4 << 20));
     try copyToUser(&s, heap, "a");
     try copyToUser(&s, heap + (3 << 20), "b");
     try copyToUser(&s, heap + (3 << 20) + 1, "c");
@@ -1040,22 +1090,22 @@ test "按需分配的堆：shrinkUser 只释放分配过的页和空出来的页
 
     // 缩到 1 MiB：后面那一页和它的页表释放了，前面那一页还在
     shrinkUser(s.root, s.brk, heap + (1 << 20));
-    s.brk = heap + (1 << 20);
+    s.setBrk(heap + (1 << 20));
     try std.testing.expect(page.freePages() > touched);
     var buf: [1]u8 = undefined;
     try copyFromUser(&s, &buf, heap);
     try std.testing.expectEqualStrings("a", &buf);
     try std.testing.expectError(error.BadAddress, copyFromUser(&s, &buf, heap + (3 << 20)));
     // 再长回来：重新分配的页是清零的
-    s.brk = heap + (4 << 20);
+    s.setBrk(heap + (4 << 20));
     try copyFromUser(&s, &buf, heap + (3 << 20));
     try std.testing.expectEqual(0, buf[0]);
     shrinkUser(s.root, s.brk, heap);
-    s.brk = heap;
+    s.setBrk(heap);
     try std.testing.expectEqual(start, page.freePages());
 
     // 内存不够：缺页失败，一页都不留
-    s.brk = heap + 10 * page.size;
+    s.setBrk(heap + 10 * page.size);
     var hoard: std.SinglyLinkedList = .{};
     while (page.freePages() > 0) hoard.prepend(@ptrCast(try page.alloc()));
     try std.testing.expectError(error.OutOfMemory, fault(&s, heap, .write));

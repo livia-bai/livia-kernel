@@ -2,7 +2,7 @@
 //! proc.exec、proc.userinit 用它。这里只依赖 vm.Space 和读文件的那一点（Source），不碰进程表，
 //! 所以整个可以在主机上测（文件末尾的单元测试加载真正的用户程序）。
 //!
-//! 按需分页：这里不分配页、不读段的内容，只记下每个段在文件里的位置（vm.Segment），页在第一次被访问时才分配、
+//! 按需分页：这里不分配页、不读段的内容，只记下每个段在文件里的位置（vm.Region，区域表的一项），页在第一次被访问时才分配、
 //! 从程序文件读进来（vm.fault）。栈也一样，只有 pushArgs 写参数的最顶上一页。
 
 const std = @import("std");
@@ -107,12 +107,11 @@ pub fn load(space: *vm.Space, src: Source) LoadError!usize {
         brk = @max(brk, std.mem.alignForward(usize, phdr.vaddr + phdr.memsz, page.size));
     }
     // 入口要在一个可执行的段里：不然第一条指令就缺页，与其让它运行起来再被结束，不如 exec 时就拒绝
-    const entry_ok = for (space.segments[0..space.nsegments]) |seg| {
+    const entry_ok = for (space.segments()) |seg| {
         if (ehdr.entry >= seg.start and ehdr.entry < seg.end and seg.perm.x) break true;
     } else false;
     if (!entry_ok) return error.BadElf;
-    space.heap_start = brk;
-    space.brk = brk;
+    space.setHeap(brk);
     return ehdr.entry;
 }
 
@@ -131,8 +130,7 @@ fn loadSegment(space: *vm.Space, src: Source, phdr: elf.Elf64.Phdr) LoadError!vo
         .start = phdr.vaddr,
         .end = std.mem.alignForward(usize, end, page.size),
         .perm = .{ .r = phdr.flags.R, .w = phdr.flags.W, .x = phdr.flags.X },
-        .file_off = phdr.offset,
-        .file_size = phdr.filesz,
+        .source = .{ .file = .{ .off = phdr.offset, .size = phdr.filesz } },
     }) catch return error.BadElf; // 两个段重叠了，或者段太多
 }
 
@@ -158,14 +156,14 @@ fn testLoad(image: []const u8) !usize {
     var buf: [2]u8 = undefined;
     try std.testing.expect(entry >= vm.user_base and entry < vm.heap_limit);
     vm.copyFromUser(&space, &buf, entry) catch return error.BadElf;
-    for (space.segments[0..space.nsegments]) |seg| {
+    for (space.segments()) |seg| {
         var va = seg.start;
         while (va < seg.end) : (va += page.size) vm.copyFromUser(&space, &buf, va) catch return error.BadElf;
     }
     vm.copyFromUser(&space, &buf, vm.stack_limit) catch return error.BadElf;
     vm.copyFromUser(&space, &buf, vm.stack_top - 2) catch return error.BadElf;
     try std.testing.expectError(error.BadAddress, vm.copyFromUser(&space, &buf, vm.stack_limit - 2));
-    try std.testing.expectError(error.BadAddress, vm.copyFromUser(&space, &buf, space.heap_start));
+    try std.testing.expectError(error.BadAddress, vm.copyFromUser(&space, &buf, space.heapStart()));
     return entry;
 }
 
@@ -180,12 +178,16 @@ test "加载真正的用户程序 hello：按需分页读到的段和 ELF 文件
     space.backing = .{ .bytes = image };
     defer vm.destroyUserSpace(&space);
     _ = try load(&space, .{ .bytes = image });
-    try std.testing.expect(space.nsegments >= 2);
-    for (space.segments[0..space.nsegments]) |seg| {
-        if (seg.file_size == 0) continue;
+    try std.testing.expect(space.segments().len >= 2);
+    for (space.segments()) |seg| {
+        const f = switch (seg.source) {
+            .file => |f| f,
+            .zero => continue,
+        };
+        if (f.size == 0) continue;
         var b: [1]u8 = undefined;
         try vm.copyFromUser(&space, &b, seg.start);
-        try std.testing.expectEqual(image[seg.file_off], b[0]);
+        try std.testing.expectEqual(image[f.off], b[0]);
     }
 }
 
@@ -219,8 +221,8 @@ test "命令行参数复制到栈顶，Arg 数组 16 字节对齐，指向栈上
     const empty = try loadImage(&empty_space, hello, &.{});
     try std.testing.expectEqual(vm.stack_top, empty.sp);
     // 堆从最后一个段之后的页边界开始，一开始是空的
-    try std.testing.expect(space.heap_start % page.size == 0 and space.heap_start > vm.user_base and space.heap_start <= vm.heap_limit);
-    try std.testing.expectEqual(space.heap_start, space.brk);
+    try std.testing.expect(space.heapStart() % page.size == 0 and space.heapStart() > vm.user_base and space.heapStart() <= vm.heap_limit);
+    try std.testing.expectEqual(space.heapStart(), space.brk);
 }
 
 test "ELF 加载器拒绝坏文件" {

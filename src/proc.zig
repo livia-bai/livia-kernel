@@ -17,7 +17,7 @@
 //!
 //! 用户地址空间（都在 vm.user_base..vm.user_end 之内，vm.Space）：
 //!   0x4000_0000 起    程序的各个段（user/linker.ld），按段设置 R/W/X，都带 U 位
-//!   紧接着            堆：从最后一个段之后的页边界（heap_start）到 brk，sbrk 调整，可读写
+//!   紧接着            堆：从最后一个段之后的页边界（堆的起点）到 brk，sbrk 调整，可读写
 //!   ...              没有页
 //!   栈底下面一页      保护页，永远没有页：栈溢出时触发缺页异常，而不是悄悄写进堆里
 //!   0x8000_0000 往下  用户栈，最多 1 MiB（vm.stack_max），可读写。最顶上放着 exec 传进来的命令行参数
@@ -377,14 +377,14 @@ pub fn sbrk(increment: isize) SbrkError!usize {
         std.math.add(usize, old, @intCast(increment)) catch return error.OutOfMemory
     else
         std.math.sub(usize, old, @abs(increment)) catch return error.InvalidArgument;
-    if (new < s.heap_start) return error.InvalidArgument;
+    if (new < s.heapStart()) return error.InvalidArgument;
     if (new > vm.heap_limit) return error.OutOfMemory;
-    if (new > old and (new - s.heap_start) / page.size > page.total_pages) return error.OutOfMemory;
+    if (new > old and (new - s.heapStart()) / page.size > page.total_pages) return error.OutOfMemory;
     if (new < old) {
         vm.shrinkUser(s.root, old, new);
         vm.flushUserTlb(); // 释放的页可能还在 TLB 里
     }
-    s.brk = new;
+    s.setBrk(new);
     return old;
 }
 

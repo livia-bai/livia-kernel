@@ -191,13 +191,18 @@ QEMU `virt` 上 `0x4000_0000..0x8000_0000` 其实是 PCIe 的 32 位 MMIO 窗口
 ```zig
 pub const Space = struct {
     root: *PageTable,
-    segments: [max_segments]Segment = undefined,   // 程序的各个段（最多 8 个）
-    nsegments: usize = 0,
+    regions: [2 + max_segments]Region,             // 区域表：[0] 栈，[1] 堆，[2..] 程序的段（最多 8 个）
+    nregions: usize,
     backing: Backing = .none,                      // 段的内容从哪读
-    heap_start: usize = 0,                         // 堆：[heap_start, brk)
-    brk: usize = 0,
+    brk: usize = 0,                                // 堆的末尾（字节）；堆那一项的 end 是它向上对齐到页
+    pub fn addSegment(s: *Space, r: Region) error{ Overlap, TooMany }!void
+    pub fn setHeap(s: *Space, start: usize) void   // 加载完程序：堆从这里开始，空的
+    pub fn setBrk(s: *Space, brk: usize) void      // sbrk
 };
-pub const Segment = struct { start: usize, end: usize, perm: Perm, file_off: u64, file_size: u64 };
+pub const Region = struct {
+    start: usize, end: usize, perm: Perm,
+    source: union(enum) { zero, file: struct { off: u64, size: u64 } },
+};
 pub const Backing = union(enum) { none, bytes: []const u8, file: u64 };
 
 pub const stack_max = 1 << 20;                     // 用户栈最多 1 MiB
@@ -206,15 +211,15 @@ pub const stack_limit = stack_top - stack_max;     // 0x7ff0_0000：栈最低能
 pub const heap_limit = stack_limit - page.size;    // 0x7fef_f000：堆最多长到这里，中间一页是保护页
 ```
 
-一个进程的用户地址空间（`Process.space`）：根页表，加上按需分页要知道的“哪些地址可以有页、页从哪来”。页表里只有已经访问过的页；用户区里别的地址按顺序看是不是落在这些区域里（`Space.regionOf`）：
+一个进程的用户地址空间（`Process.space`）：根页表，加上按需分页要知道的“哪些地址可以有页、页从哪来”：一张区域表。页表里只有已经访问过的页；用户区里别的地址在区域表里查（`Space.regionOf`）：
 
 | 区域 | 权限 | 一页的内容 |
 | --- | --- | --- |
-| `segments` 里的每个段 `[start, end)` | 段的权限（ELF 的 `p_flags`） | 开头最多 4096 字节来自 `backing` 的 `file_off + 页在段里的偏移`，到 `file_size` 为止；其余是 0（`.bss`） |
-| 堆 `[heap_start, alignForward(brk))` | `RW-` | 全是 0 |
-| 栈 `[stack_limit, stack_top)` | `RW-` | 全是 0 |
+| `regions[0]`：栈 `[stack_limit, stack_top)` | `RW-` | 全是 0（`.zero`） |
+| `regions[1]`：堆 `[堆的起点, alignForward(brk))` | `RW-` | 全是 0（`.zero`） |
+| `regions[2..]`：程序的每个段 `[start, end)` | 段的权限（ELF 的 `p_flags`） | `.file`：开头最多 4096 字节来自 `backing` 的 `off + 页在段里的偏移`，到 `size` 为止；其余是 0（`.bss`） |
 
-都不是的地址（包括 `[heap_limit, stack_limit)` 这一页保护页、堆末尾之后）不该有页。段由 ELF 加载器记下（`addSegment`：按页对齐、不重叠、最多 8 个，[process.md](process.md#elf-加载器)），堆由 `sbrk` 挪，栈的范围是固定的。`backing` 是 `.bytes`（嵌在内核里的 init，单元测试）或者 `.file`（程序文件的 inode，`exec`）。
+都不在的地址（包括 `[heap_limit, stack_limit)` 这一页保护页、堆末尾之后）不该有页。栈和一个空的堆在 `createUserSpace` 时就放进表里；段由 ELF 加载器加（`addSegment`：按页对齐、不和任何区域重叠、最多 8 个，[process.md](process.md#elf-加载器)），加完之后 `setHeap` 把堆的起点放在所有段之后；`sbrk` 只改堆那一项的末尾（`setBrk`）。原来 `regionOf` 先查段的数组、再特判堆和栈，加一种映射（匿名映射、文件映射）就要改它、`fork` 和 `sbrk`；现在是往表里加一项，`regionOf` 和 `fork`（照抄整张表）都不用动。`backing` 是 `.bytes`（嵌在内核里的 init，单元测试）或者 `.file`（程序文件的 inode，`exec`）。
 
 ```zig
 pub fn createUserSpace() error{OutOfMemory}!Space

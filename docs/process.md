@@ -113,7 +113,7 @@ pub fn current() ?*Process              // cpus[hart.id()].proc
 | 用户地址 | 内容 | 权限 |
 | --- | --- | --- |
 | `0x4000_0000` 起 | ELF 的各个 PT_LOAD 段（代码 / 只读数据 / 数据和 `.bss`） | 按程序头：`R-X` / `R--` / `RW-`，都带 U |
-| 紧接着最后一个段之后的页边界（`heap_start`）到 `brk` | 堆，`sbrk` 调整（[sbrk](#sbrk堆)），一开始是空的 | `RW-`，带 U |
+| 紧接着最后一个段之后的页边界（堆的起点，`space.heapStart()`）到 `brk` | 堆，`sbrk` 调整（[sbrk](#sbrk堆)），一开始是空的 | `RW-`，带 U |
 | …… | 没有页 | |
 | `0x7fef_f000..0x7ff0_0000`（`vm.heap_limit..vm.stack_limit`） | 保护页，永远没有页 | 栈溢出时触发缺页异常（结束进程），而不是悄悄写进堆里；堆也不能长进来 |
 | `0x7ff0_0000..0x8000_0000`（`vm.stack_limit..vm.stack_top`） | 用户栈，最多 1 MiB（`vm.stack_max`）。最顶上是 `exec` 传进来的命令行参数（[命令行参数](#命令行参数)） | `RW-`，带 U |
@@ -156,7 +156,7 @@ ELF 来自文件系统，任何人都能往里写一个文件再去运行它，�
 | 段必须可读（`p_flags.R`） | R/W/X 全为 0 的页表项会被 CPU 当成指向下一级页表的指针；W 无 R 是保留组合。见下面的说明 |
 | 和已经记下的段重叠（按页算）、段超过 `vm.max_segments`（8）个 → `BadElf` | `vm.Space.addSegment` 返回 `Overlap`、`TooMany` 时转换过来 |
 
-检查通过的段只是**记下来**（`vm.Space.addSegment`：`[p_vaddr, alignForward(p_vaddr + p_memsz))`、权限、`p_offset`、`p_filesz`），不分配页、不读内容。程序访问到段里的某一页时缺页，`vm.fault` 才分配一页清零的物理内存，把文件里对应的部分（`[p_offset + 页在段里的偏移, ...)`，最多 `p_filesz` 为止）读进去，`p_filesz` 之后的部分（`.bss`）保持清零，再按段的权限映射上（[按需分页](#按需分页)）。所以上面的检查必须在 `exec` 时做完：之后缺页时读的范围都是这里检查过的。
+检查通过的段只是**记下来**（`vm.Space.addSegment`，区域表里的一项：`[p_vaddr, alignForward(p_vaddr + p_memsz))`、权限、`p_offset`、`p_filesz`），不分配页、不读内容。程序访问到段里的某一页时缺页，`vm.fault` 才分配一页清零的物理内存，把文件里对应的部分（`[p_offset + 页在段里的偏移, ...)`，最多 `p_filesz` 为止）读进去，`p_filesz` 之后的部分（`.bss`）保持清零，再按段的权限映射上（[按需分页](#按需分页)）。所以上面的检查必须在 `exec` 时做完：之后缺页时读的范围都是这里检查过的。
 
 最后检查**入口地址落在一个可执行的段里**，不然是 `BadElf`：以前加载器把每一页都映射好，入口不对的程序运行起来第一条指令就缺页；现在在 `exec` 时就拒绝它。
 
@@ -164,7 +164,7 @@ ELF 来自文件系统，任何人都能往里写一个文件再去运行它，�
 
 栈也不在这里分配（[命令行参数](#命令行参数)写参数时分配最顶上那一页）。
 
-堆的起点（`space.heap_start`，`brk` 一开始也是它）是**所有段的末尾按页向上取整后的最大值**。段的最后一页整页属于段（权限是那个段的，比如只读），堆从下一页开始，堆里的页都是 `RW-`，不会和段的权限混在一起。
+堆的起点（`space.setHeap`，`brk` 一开始也是它）是**所有段的末尾按页向上取整后的最大值**。段的最后一页整页属于段（权限是那个段的，比如只读），堆从下一页开始，堆里的页都是 `RW-`，不会和段的权限混在一起。
 
 单元测试（`src/loader.zig` 末尾）加载真正的 `hello`：加载完只多用了根页表这一页；再把每个段的每一页都读一遍（按需分配），读到的第一个字节和 ELF 文件里 `p_offset` 处的一样；栈的两端读得到，保护页、空的堆读不到；释放后不漏页。
 
@@ -258,7 +258,7 @@ pub fn fork() ForkError!usize {
 - **地址空间写时复制**（`vm.cloneUserSpace`，[paging.md](paging.md#复制用户地址空间)）：子进程只新分配页表，用户页和父进程共用（引用数加 1）；可写的页两边都改成只读、标上 `cow`，谁先写哪一页，谁在写缺页里复制一份（`vm.breakCow`，[paging.md](paging.md#写时复制)），所以之后仍然各改各的。shell 运行程序是 `fork` 之后马上 `exec`，子进程的旧地址空间一页都不用复制。
 - **`TrapFrame` 原样复制**，只把 `a0` 改成 0。`fork` 是在系统调用里调用的，这时 `handleTrap` 已经把父进程 `TrapFrame` 的 `sepc` 加过 4 了，所以子进程第一次被调度时，经 `forkret` → `trapExit` 回到 U 模式，正好从 `ecall` 的下一条指令继续，看到 `fork` 返回了 0。父进程照常从系统调用返回，`a0` 是子进程的 pid。
 - **打开的文件和父进程共用**：fd 表逐项复制，每个 `File` 的引用数加 1（`file.dup`），所以父子进程的 fd 指向同一个串口、同一个管道的同一端。shell 运行管道就靠这个（[shell.md](shell.md#管道)）。`dup` 只加引用数，不会失败。
-- 段、堆（`space` 里的 `heap_start`、`brk`）、程序文件也照抄（程序文件多占一份，`fsys.dup`），已经有的页随地址空间一起共用（写时复制）；父进程还没访问过的页，子进程访问时自己按需分配，从同一个程序文件读（[paging.md](paging.md#复制用户地址空间)）。
+- 区域表（段、堆、栈）、`brk`、程序文件也照抄（程序文件多占一份，`fsys.dup`），已经有的页随地址空间一起共用（写时复制）；父进程还没访问过的页，子进程访问时自己按需分配，从同一个程序文件读（[paging.md](paging.md#复制用户地址空间)）。
 - 进程表满了是 `TooManyProcesses`，`fork` 系统调用返回 `-EAGAIN`；内存不够（页表都分配不出来）是 `OutOfMemory`（`-ENOMEM`），`cloneUserSpace` 自己释放已经建好的部分。
 - pid 用原子变量 `next_pid.fetchAdd` 分配：几个 hart 同时 `fork` 也不会拿到同一个 pid。
 
@@ -332,11 +332,11 @@ pub fn sbrk(increment: isize) SbrkError!usize   // 返回原来的 brk
 pub const SbrkError = error{ OutOfMemory, InvalidArgument };
 ```
 
-照 xv6 的 `growproc`：堆是 `[heap_start, brk)`（都在 `p.space` 里），`brk` 按字节记，页按页分配。和 xv6 的 lazy allocation 实验一样，**按需分配**：
+照 xv6 的 `growproc`：堆是 `[堆的起点, brk)`（区域表的第 1 项，在 `p.space` 里），`brk` 按字节记，页按页分配。和 xv6 的 lazy allocation 实验一样，**按需分配**：
 
 - **变大**：只挪 `brk`，一页都不分配。新跨进来的页第一次被访问时缺页，`vm.fault` 才分配一页清零的 `RW-` 页（[按需分页](#按需分页)）。所以 `sbrk(4 MiB)` 之后只碰两页，只多用两页和装它们的页表。
 - **变小**：`vm.shrinkUser` 把整个落在新 `brk` 之后、已经分配了的页释放掉（没访问过的本来就没有），空出来的第 0 级页表也释放（[paging.md](paging.md#堆的增长和缩小)），然后 `vm.flushUserTlb`：这些页可能还在 TLB 里，不刷的话进程还能访问已经还给页分配器的页。
-- **边界**：不能小于 `heap_start`（`InvalidArgument`，`-EINVAL`），不能长进栈下面的保护页（`vm.heap_limit`，超出是 `OutOfMemory`）。堆一共比整个物理内存（`page.total_pages`）还大时也是 `OutOfMemory`：肯定用不上，和 Linux 默认的 overcommit 检查一个意思。别的时候不看还有多少空闲的页，比空闲内存大的堆也能长成功，真的都用上时，访问它的进程因为没内存被结束（内核替它写的时候返回 `-EFAULT`）。`increment` 是有符号的，加减都检查溢出。
+- **边界**：不能小于堆的起点（`InvalidArgument`，`-EINVAL`），不能长进栈下面的保护页（`vm.heap_limit`，超出是 `OutOfMemory`）。堆一共比整个物理内存（`page.total_pages`）还大时也是 `OutOfMemory`：肯定用不上，和 Linux 默认的 overcommit 检查一个意思。别的时候不看还有多少空闲的页，比空闲内存大的堆也能长成功，真的都用上时，访问它的进程因为没内存被结束（内核替它写的时候返回 `-EFAULT`）。`increment` 是有符号的，加减都检查溢出。
 - 回归测试 `t_sbrk` 检查了：新内存清零、按页分配（`brk` 所在页的页尾能写，下一页缺页）、缩小后被释放的页缺页、`fork` 复制堆、各种越界、超过物理内存时失败；按需分配：`sbrk(4 MiB)` 不用页，碰两页用 2～5 页（加页表），缩回去全部还回来；比空闲内存大的堆，子进程一页页写满时被结束（`qemu_test.py` 检查 `out of memory (demand paging)` 那一行），内核替进程写（读 `/dev/zero`）写到没内存时返回 `-EFAULT`。
 
 ## 调度
