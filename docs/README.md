@@ -13,6 +13,7 @@ livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 
 5. `src/proc.zig` 里的 `scheduler`、`sched`、`WaitQueue`、`fork`、`finish`、`wait`（[process.md](process.md)）。
 6. `src/vm.zig` 的 `fault`、`breakCow`、`pinSrc`/`pinDst`（[paging.md](paging.md#按需分页)）。
 7. [btree.md](btree.md)，再看 `src/ctree.zig` 的 `commit`、`abort` 和文件末尾的掉电、读写失败测试。
+8. [invariants.md](invariants.md)：把上面读到的几条规矩放在一起看，它们是怎么从注释变成断言和类型的。
 
 `src/fs.zig` 的目录和文件内容、`src/file.zig`、`src/syscall.zig` 的各个处理函数、shell 和用户程序可以跳过；`src/abi.zig` 的 `params` 和 `syscall.zig` 的 `dispatch` 值得看一眼，系统调用的签名是怎么在编译期核对的。
 
@@ -41,6 +42,7 @@ livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 
 | --- | --- |
 | [architecture.md](architecture.md) | 总体结构：特权级、多核、物理内存布局、虚拟地址空间、模块关系、主要控制流、全局不变量 |
 | [design.md](design.md) | 关键的设计决定（选了什么、放弃了什么、代价）和有意的简化（和主流内核的差别） |
+| [invariants.md](invariants.md) | 同一个不变量的三种写法（注释约定、运行时断言、类型约束）：pin、锁等级、系统调用的签名、tagged union、等待队列，改动前后的代码对照 |
 | [build.md](build.md) | 构建系统：目标平台、优化模式、用户程序的编译和嵌入、QEMU 运行步骤 |
 | [boot.md](boot.md) | 启动流程：OpenSBI 交接、链接脚本、`_start`、每个 hart 的启动栈、`kmain` 的初始化顺序、启动其他 hart、交给调度器、panic 时让所有 hart 停下 |
 | [riscv-sbi.md](riscv-sbi.md) | CSR 访问和 SBI 调用 |
