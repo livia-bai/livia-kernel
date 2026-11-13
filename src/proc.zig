@@ -25,10 +25,10 @@
 //! 页在第一次被访问时才分配，段里的页那时才从程序文件读进来。
 //!
 //! 锁（照 xv6 的 proc.c，详见 docs/process.md 的“锁”一节）：
-//! - 每个进程的 lock 保护它的 state、hart、killed、xstatus、pid、ticks、name。调度器拿着它切到进程，
+//! - 每个进程的 lock 保护它的 state、hart、killed、xstatus、pid、cpu_time、name。调度器拿着它切到进程，
 //!   进程拿着它切回调度器，所以“改状态 + 切换”在别的 hart 看来是一步完成的。
 //! - wait_lock 保护所有进程的 parent，wait 拿着它睡在自己身上。加锁顺序：wait_lock 在前，进程锁在后；
-//!   别的锁（管道、串口、ticks）也都在进程锁前面拿，进程锁之后只会再拿页分配器、文件表这种不再往下拿锁的。
+//!   别的锁（管道、串口、timer.lock）也都在进程锁前面拿，进程锁之后只会再拿页分配器、文件表这种不再往下拿锁的。
 //! - 其他字段（space、context、files、sleeplocks、cwd）只有进程自己会读写（没有线程），不用加锁；
 //!   父进程 wait 回收 zombie 时它已经不再运行了。
 
@@ -50,6 +50,7 @@ const canary = @import("canary.zig");
 const kstack = @import("kstack.zig");
 const loader = @import("loader.zig");
 const kstat = @import("kstat.zig");
+const timer = @import("timer.zig");
 const sleeplock = @import("sleeplock.zig");
 const Spinlock = spinlock.Spinlock;
 
@@ -105,8 +106,8 @@ pub const Process = struct {
     killed: ?[]const u8 = null,
     /// lock。zombie 的结束状态，父进程 wait 时取走：正常退出时是退出码，被杀时是 abi.killed_status
     xstatus: u32 = 0,
-    /// lock。在 U 模式运行期间来过的时钟中断数，大致就是用掉的 CPU 时间（单位 10 ms）
-    ticks: u64 = 0,
+    /// lock。用掉的 CPU 时间（time CSR 的单位）：调度器每次切到它、它切回来时累加中间的差值，U 模式和内核里的都算
+    cpu_time: u64 = 0,
     /// 打开的文件，下标就是 fd
     files: [abi.max_fds]?*file.File = @splat(null),
     /// 拿着每一级的睡眠锁各几把（sleeplock.zig，检查加锁顺序）。只有自己改；回到 U 模式时必须都是 0
@@ -297,7 +298,7 @@ pub const ExecError = error{ NoSuchProgram, OutOfMemory, BadElf, IoError, NoDevi
 /// 用文件系统里的程序 path 替换当前进程的地址空间（对应 xv6 的 exec），args 是命令行参数（在内核内存里，
 /// 个数和总长度由调用方检查过）。path 里没有 '/' 时在 /bin 里找，有的话按路径找（相对路径从当前目录开始）。
 /// 成功时 TrapFrame 已经改成从新程序的入口开始，系统调用返回后就进入新程序；
-/// 失败时原来的地址空间和 TrapFrame 都不变，系统调用照常返回错误。pid、父进程、ticks、打开的文件、当前目录不变。
+/// 失败时原来的地址空间和 TrapFrame 都不变，系统调用照常返回错误。pid、父进程、CPU 时间、打开的文件、当前目录不变。
 ///
 /// 只读 ELF 的文件头和程序头，记下各个段（vm.Space），段的内容等程序访问到时才读（按需分页）。
 /// 所以新程序运行期间要一直能从这个文件读到同一个版本：先占住它（fsys.holdText，之后改它、删它的一方
@@ -455,14 +456,21 @@ pub fn scheduler(boot_stack: []u8) noreturn {
             c.proc = p;
             vm.activate(p.space.root);
             kstat.inc(.context_switches);
+            timer.startSlice();
+            const start = timer.now();
             switchContext(&c.context, &p.context);
+            p.cpu_time += timer.now() - start;
+            timer.endSlice();
             // 进程让出了 CPU，切回来时又拿着它的锁。先切回内核页表再放开锁：它可能已经结束，
             // 父进程拿到它的锁才能回收它、释放它的页表，那时这个 hart 不能还在用这张页表
             vm.activate(vm.kernel_root);
             c.proc = null;
             found = true;
         }
-        if (!found) riscv.wfi();
+        if (!found) {
+            timer.stopSlice(); // 没有 sleeper 的话不预约时钟中断，wfi 一直睡到别的中断
+            riscv.wfi();
+        }
     }
 }
 
@@ -492,11 +500,10 @@ pub fn yield() void {
     p.lock.release();
 }
 
-/// 时钟中断打断了 U 模式的当前进程：记一个 tick，让出 CPU。由陷阱处理程序调用（关着中断）。
+/// 时钟中断打断了 U 模式的当前进程，它的时间片用完了：让出 CPU。由陷阱处理程序调用（关着中断）。
 pub fn yieldTimeslice() void {
     const p = current().?;
     p.lock.acquire();
-    p.ticks += 1;
     p.state = .runnable;
     sched();
     p.lock.release();
@@ -580,7 +587,7 @@ pub const WaitQueue = struct {
 
 /// 把一个不在运行的进程（睡着的、刚建好的）改成 runnable，叫一个登记为空闲的 hart 马上来运行它（ipi.wakeIdle）。
 /// 让别的进程变成 runnable 都经过这里（wakeup、markKilled、fork、userinit）：原来是一条约定，“改成 runnable 的地方
-/// 要调用 ipi.wakeIdle”，漏了的话空闲的 hart 要等 10 ms 的时钟中断才会来。调用方拿着 p.lock。
+/// 要调用 ipi.wakeIdle”，漏了的话空闲的 hart 不会来：没有 sleeper 时它不预约时钟中断（timer.zig）。调用方拿着 p.lock。
 /// 进程自己让出 CPU（yield）时不用：它在自己的 hart 上切回调度器，这个调度器接着扫描就会看到它。
 fn makeRunnable(p: *Process) void {
     std.debug.assert(p.lock.holding() and p.state != .running);
@@ -809,7 +816,7 @@ pub fn info(i: usize) ?abi.ProcInfo {
     return .{
         .pid = p.pid,
         .ppid = if (p.parent) |q| q.pid else 0,
-        .ticks = p.ticks,
+        .cpu_ms = timer.toMs(p.cpu_time),
         .state = p.state,
         .name_len = p.name.len,
         .name = p.name.buf,
@@ -1009,11 +1016,11 @@ test "wait 只找自己的子进程，按 pid 挑；子进程结束时交给 ini
 }
 
 test "fill 换掉除了锁以外的所有字段" {
-    var p: Process = .{ .state = .zombie, .pid = 7, .name = .init("x"), .ticks = 3, .sleeplocks = .{ .counts = .{ 0, 1, 2 } } };
+    var p: Process = .{ .state = .zombie, .pid = 7, .name = .init("x"), .cpu_time = 3, .sleeplocks = .{ .counts = .{ 0, 1, 2 } } };
     p.lock.acquire();
     fill(&p, .{});
     try std.testing.expect(p.lock.holding());
     try std.testing.expectEqual(.unused, p.state);
-    try std.testing.expectEqual(0, p.pid + p.ticks + p.sleeplocks.total());
+    try std.testing.expectEqual(0, p.pid + p.cpu_time + p.sleeplocks.total());
     p.lock.release();
 }

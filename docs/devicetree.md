@@ -9,7 +9,7 @@
 | 信息 | 来源 | 用在哪里 |
 | --- | --- | --- |
 | 物理内存的起点和大小 | `device_type = "memory"` 节点的 `reg` | 页分配器的范围、内核页表映射的范围 |
-| `time` CSR 的频率 | `/cpus` 的 `timebase-frequency` | 定时器换算 10 ms 是多少个计数 |
+| `time` CSR 的频率 | `/cpus` 的 `timebase-frequency` | 计时（`time` 换算成毫秒）、时间片和 `sleep` 的到期时刻 |
 | 不能分配的内存 | 设备树自身、内存保留块、`/reserved-memory` 的子节点 | 页分配器跳过这些页 |
 | 有哪些 hart | `/cpus` 下 `device_type = "cpu"` 的节点的 `reg` | `kmain` 启动其他 hart（[boot.md](boot.md#启动其他-hart)） |
 

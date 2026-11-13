@@ -200,7 +200,7 @@ const from_user = frame.sstatus.spp == .user;
 
 | 条件 | 处理 |
 | --- | --- |
-| 中断 5（时钟） | `timer.onInterrupt()`：预约这个 hart 的下一次时钟中断；在启动 hart 上还给 `timer.ticks` 加 1、叫醒 `sleep` 系统调用里的进程（[devices.md](devices.md#定时器timerzig)）。`from_user` 时 `proc.yieldTimeslice()`：当前进程的 `ticks` 加 1，时间片用完，让出 CPU，下次轮到这个进程时（可能在别的 hart 上）返回（[process.md](process.md#schedyield)） |
+| 中断 5（时钟） | `timer.onInterrupt()`：叫醒到期的 `sleep`，重新预约这个 hart 的下一次时钟中断，返回这一片用完了没有（[devices.md](devices.md#定时器timerzig)）。`from_user` 而且这一片用完了时 `proc.yieldTimeslice()`：让出 CPU，下次轮到这个进程时（可能在别的 hart 上）返回（[process.md](process.md#schedyield)） |
 | 中断 9（外部） | `handleExternal()`：PLIC claim → 串口（收字符；按过 Ctrl-C 就 `proc.interruptForeground()`；拿着 `uart.rx_lock` `uart.rx_waiters.wakeAll` 叫醒在 `read` 里等输入的进程）或者磁盘（`virtio_disk.onInterrupt()`：叫醒等请求做完的进程，[disk.md](disk.md#中断oninterrupt)）→ complete（[devices.md](devices.md#claim--complete)）。串口中断发给所有 hart，claim 到 0 的 hart 什么也不做 |
 | 中断 1（软件中断） | 核间中断：`ipi.onInterrupt()` 清掉 `sip.SSIP`，别的什么都不做。它只是让这个 hart 进一次陷阱处理程序：空闲的调度器因此醒过来去扫进程表；被打断的 U 模式进程如果被杀了，末尾的 `checkKilled` 结束它（[process.md](process.md#核间中断)） |
 | 其他中断 | `std.debug.panic("unexpected interrupt N")` |
@@ -212,7 +212,7 @@ const from_user = frame.sstatus.spp == .user;
 | 来自 S 模式的其他异常 | `std.debug.panic("unhandled exception: ...")`：内核自己的错，停机 |
 | 最后，`from_user` 时 | `proc.checkStack()`：内核栈底的金丝雀还在（[process.md](process.md#进程表)）；`proc.checkKilled()`：被 kill 了就在这里结束，不再回到 U 模式（[process.md](process.md#结束进程)）；`proc.assertNoLocksHeld()`：没有拿着自旋锁，当前进程也没有拿着睡眠锁 |
 
-和 xv6 的 `usertrap` 末尾一样：先处理陷阱，只在时钟中断时 `yield`，回到用户态之前检查 `killed`。
+和 xv6 的 `usertrap` 末尾一样：先处理陷阱，只在时钟中断、而且时间片用完时 `yield`，回到用户态之前检查 `killed`。
 
 几个细节：
 

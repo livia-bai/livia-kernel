@@ -52,7 +52,7 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 - `trap.TrapFrame` 的布局（大小是 16 的倍数，含 `kernel_tp`、`kernel_sscratch`） ↔ `trap.trapEntry`、`trap.trapExit` 的汇编 ↔ `proc.startFrame` 构造初始 `TrapFrame`（`a0`/`a1`/`sp` 传命令行参数；`exec` 成功时 `dispatch` 返回 null，不覆盖 `a0`） ↔ `syscall.dispatch` 读参数的下标（[docs/trap.md](docs/trap.md#trapframe)）。
 - `proc.Context` ↔ `proc.contextAsm`（[docs/process.md](docs/process.md#保存的上下文)）。
 - `linker.ld` 里各段的 4 KiB 对齐和 `__text_start`、`__rodata_start`、`__data_start`、`__kernel_end` ↔ `vm.init` 设置的页权限（和跳过的保护页）（[docs/boot.md](docs/boot.md#链接脚本)）。
-- `hart.max` ↔ `kstack.boot`（`main.zig` 导出成 `boot_stacks`，`enter_asm` 按 `@sizeOf(kstack.Boot)` 算栈顶、`_start` 里的编号检查）、`kstack.trap` ↔ 各处按 hart 编号下标的数组（`proc.cpus`、`spinlock.held`、`timer.deadline`、`page.pools`）。启动栈的大小是实测的：关机时内核打印每种栈用到过的最深处，`qemu_test.py` 检查余量（[docs/boot.md](docs/boot.md#每个-hart-的启动栈)）。
+- `hart.max` ↔ `kstack.boot`（`main.zig` 导出成 `boot_stacks`，`enter_asm` 按 `@sizeOf(kstack.Boot)` 算栈顶、`_start` 里的编号检查）、`kstack.trap` ↔ 各处按 hart 编号下标的数组（`proc.cpus`、`spinlock.held`、`timer.slice_end`、`page.pools`）。启动栈的大小是实测的：关机时内核打印每种栈用到过的最深处，`qemu_test.py` 检查余量（[docs/boot.md](docs/boot.md#每个-hart-的启动栈)）。
 - 内核的栈（`src/kstack.zig`：启动栈、陷阱栈、进程内核栈）每块下面一页保护页 ↔ `kstack.guardPages` ↔ `vm.init` 不映射它们 ↔ `trap.handleTrap` 认出撞到保护页的缺页 ↔ `qemu_test.py` 检查的 `80 stack guard pages unmapped`。新加内核栈要放进 `kstack.zig`（[docs/trap.md](docs/trap.md#内核栈溢出)）。
 - 全局的初始化（启动 hart 的 `kmain`） ↔ 每个 hart 一份的初始化（`kmainSecondary`：`trap.init`、`vm.initHart`、`plic.initHart`、`timer.initHart`、`ipi.initHart`，以及清 `sstatus.FS`）：新加的每个 hart 的 CSR 设置两边都要做（[docs/boot.md](docs/boot.md#启动其他-hart)）。
 - `user/linker.ld` 的页对齐、可读的段 ↔ `loader.loadSegment` 的检查。
@@ -67,9 +67,9 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 - `tp`：在内核里是当前 hart 的编号（`hart.id()`）；从 U 模式陷入时 `trapEntry` 换回内核的值，回到 U 模式时 `trapExit` 换成用户的。内核不能把 `tp` 挪作他用（[docs/trap.md](docs/trap.md#tp-约定)）。
 - `sstatus.FS` 保持 Off：`kmain`、`kmainSecondary` 一开始就清掉 OpenSBI 留下的 Dirty，进入 U 模式的 `sstatus` 从内核当前的值派生，所以用户程序也不能用浮点（[docs/riscv-sbi.md](docs/riscv-sbi.md#位定义)）。
 - 内核代码（陷阱处理、系统调用、调度器扫描进程表）全程关中断执行；只有调度器每一轮开头开一下中断（[docs/trap.md](docs/trap.md#中断开关不变量)）。
-- 调度器先关中断再扫描进程表、再 `wfi`，下一轮开头才开中断；扫描之前先 `ipi.setIdle(true)` 登记成空闲，挑中进程时清掉（[docs/process.md](docs/process.md#调度器)）。让别的进程变成 `runnable` 只能经过 `proc.makeRunnable`（它调用 `ipi.wakeIdle`，否则空闲的 hart 要等 10 ms 才来运行它）（[docs/process.md](docs/process.md#核间中断)）。
-- 进程切换只在关中断、拿着这个进程的锁时进行，并且总是调度器 ↔ 进程：`proc.scheduler` 拿着进程锁切到进程，进程拿上自己的锁、改掉自己的状态后只通过 `proc.sched`（`yield`/`yieldTimeslice`/`sleep`/`finish`）切回，切回来之后由调用方放开锁；新进程在 `forkretC` 里放开（[docs/process.md](docs/process.md#调度器)）。调度器先换回内核页表再放开进程锁。`startFrame` 构造的 `TrapFrame`（init、`exec`）的 `sstatus` 必须清掉 `SIE`。
-- 进程的 `state`、`hart`、`pid`、`name`、`killed`、`xstatus`、`ticks` 只在拿着它的锁时读写，`parent`、`child_exit` 只在拿着 `wait_lock` 时读写，`wait_next`、`queued` 归它排着的那个等待队列的锁；新进程拿着锁一次填好再放开（`fill` 不覆盖锁）（[docs/process.md](docs/process.md#锁)）。
+- 调度器先关中断再扫描进程表、再 `wfi`，下一轮开头才开中断；扫描之前先 `ipi.setIdle(true)` 登记成空闲，挑中进程时清掉（[docs/process.md](docs/process.md#调度器)）。让别的进程变成 `runnable` 只能经过 `proc.makeRunnable`（它调用 `ipi.wakeIdle`，否则空闲的 hart 不会来运行它：空闲的 hart 没有 sleeper 时不预约时钟中断，`wfi` 一直睡到别的中断）（[docs/process.md](docs/process.md#核间中断)）。
+- 进程切换只在关中断、拿着这个进程的锁时进行，并且总是调度器 ↔ 进程：`proc.scheduler` 拿着进程锁切到进程，进程拿上自己的锁、改掉自己的状态后只通过 `proc.sched`（`yield`/`yieldTimeslice`/`WaitQueue.wait`/`finish`）切回，切回来之后由调用方放开锁；新进程在 `forkretC` 里放开（[docs/process.md](docs/process.md#调度器)）。调度器先换回内核页表再放开进程锁。`startFrame` 构造的 `TrapFrame`（init、`exec`）的 `sstatus` 必须清掉 `SIE`。
+- 进程的 `state`、`hart`、`pid`、`name`、`killed`、`xstatus`、`cpu_time` 只在拿着它的锁时读写，`parent`、`child_exit` 只在拿着 `wait_lock` 时读写，`wait_next`、`queued` 归它排着的那个等待队列的锁；新进程拿着锁一次填好再放开（`fill` 不覆盖锁）（[docs/process.md](docs/process.md#锁)）。
 - 进程的 `TrapFrame` 总在它内核栈的最顶端（`proc.frameOf`）：`trapEntry`、`trapExit` 设 `sscratch`、`fork` 复制父进程的 `TrapFrame` 都依赖这一点。
 - 结束的进程只由父进程 `wait` 回收（`proc.reap`），父进程先结束的交给 init；init（pid 1）不能结束，结束内核就 panic（[docs/process.md](docs/process.md#结束进程)）。
 - 等待用 `proc.WaitQueue`：每个等待条件旁边放一个队列，`q.wait(lock)` 睡下、`q.wakeAll(lock)` 叫醒，`lock` 是保护等待条件和这个队列的锁（两边都要拿着它调用，会检查），醒来后在循环里重新检查条件（[docs/process.md](docs/process.md#等待队列waitqueue)）；`proc.kill` 只做标记，被杀的进程在回到 U 模式之前（`handleTrap` 末尾、`forkret`）由 `checkKilled` 结束（[docs/process.md](docs/process.md#结束进程)）。

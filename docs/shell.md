@@ -183,7 +183,7 @@ fn runPipeline(stages: []Stage, background: bool) void {
 }
 ```
 
-- 第一个命令开头的 **`time`**：运行完打印 `real 0.03s`（`uptime` 的差，精度一个 tick）。
+- 第一个命令开头的 **`time`**：运行完打印 `real 0.03s`（`uptime` 的差）。
 - 开头的 **`run`**：后面一定是程序，不当内置命令（`/bin` 里要是有个叫 `kill` 的程序，写 `run kill` 才能运行它）；找不到时打印 `no such program: NAME` 和程序列表（不写 `run` 时打印 `unknown command: NAME (try 'help')`）。`run` 单独一个时列出 `/bin` 里的程序。
 - 只有一个命令、在前台、不是 `run`：全是 `NAME=值` 的话设变量；是内置命令的话在 shell 自己里运行（[内置命令](#内置命令)）。
 - 别的情况（程序，或者在管道里、在后台的内置命令）`fork`：内置命令在子进程里运行完以它的退出码结束，程序 `exec`。先确认每个程序都有（`programExists`：和内核的 `exec` 一样，名字里没有 `/` 的看 `/bin/名字`，有的按路径看，要能打开、是文件），没有就报错、`$?` 是 127，不 `fork`。
@@ -314,10 +314,10 @@ fn replaceFd(target: sys.Fd, path: []const u8, flags: sys.OpenFlags, saved: ?*[2
 | `help` | 列出命令和语法 | |
 | `cd [DIR]` | 换 shell 的当前目录（`chdir`），之后启动的程序继承它；不给 `DIR` 时回到 `/`；`cd -` 回到上一个目录并打印它。出错时打印 `cd: DIR: NotFound`（或 `NotDir`、`SymlinkLoop`） | |
 | `pwd` | 当前目录的绝对路径（`getcwd`）。经过符号链接 `cd` 进来的，是真实的路径（没有 bash 的“逻辑路径”） | `/bin` |
-| `uptime` | 开机时长（`uptime` 系统调用，精度一个 tick） | `up 3.26s` |
+| `uptime` | 开机时长（`uptime` 系统调用） | `up 3.26s` |
 | `mem` | 物理页的使用情况（`meminfo`，[page-allocator.md](page-allocator.md)） | `31600 of 31676 pages free (126400 KiB), 4 KiB each` |
 | `disk` | 磁盘的原始区域（文件系统之后的块）有多大（`blockcount`，[disk.md](disk.md#系统调用)）；没有磁盘时打印 `no disk` | `1024 blocks of 4 KiB (4 MiB)` |
-| `ps` | 列出进程（`procinfo`）：pid、父进程、状态、用掉的时钟 tick 数、名字 | 见下文 |
+| `ps` | 列出进程（`procinfo`）：pid、父进程、状态、用掉的 CPU 时间（毫秒）、名字 | 见下文 |
 | `jobs` | 这个 shell 的还没结束的子进程（后台进程），从 `procinfo` 里按父进程挑出来 | `[19] running  spin` |
 | `kill PID...` | 结束进程，可以给几个 | `[proc] pid 4 (spin) killed: kill()` |
 | `wait [PID]` | 等后台进程 `PID` 结束并回收，`$?` 是它的退出码；不给时等所有子进程结束 | |
@@ -329,18 +329,18 @@ fn replaceFd(target: sys.Fd, path: []const u8, flags: sys.OpenFlags, saved: ?*[2
 
 说明：
 
-- `uptime` 显示 `ms / 1000` 秒和 `ms % 1000 / 10` 百分之一秒（补零到两位），所以 `up 3.05s` 不会显示成 `3.5s`。内核按 tick 计时，百分之一秒正好是 tick 数。`time` 也是这样显示。
+- `uptime` 显示 `ms / 1000` 秒和 `ms % 1000 / 10` 百分之一秒（补零到两位），所以 `up 3.05s` 不会显示成 `3.5s`。内核给的是毫秒，只显示到百分之一秒。`time` 也是这样显示。
 - `cd` 必须是 shell 自己的命令：子进程 `chdir` 改不了父进程的当前目录。所以内置命令只有在单独运行、前台时才在 shell 自己里运行；在管道里、后台的在子进程里运行，`cd`、`exit`、变量赋值这些就不起作用了（和 sh 一样）。
 - `ps` 的输出（单核，一个后台的 `spin` 在死循环）：
 
   ```
-    PID  PPID STATE     TICKS NAME
-      1     0 sleeping      0 init
-      2     1 running       3 sh
-     17     2 runnable      2 spin
+    PID  PPID STATE    CPU_MS NAME
+      1     0 sleeping      8 init
+      2     1 running      10 sh
+      3     2 running     494 spin
   ```
 
-  `ps` 是 shell 执行的，所以 shell 自己总是 `running`；init 总在 `wait` 里睡着。单核时 shell 占着唯一的 hart，`spin` 只能是 `runnable`；多核时它在别的 hart 上跑，显示 `running`。`TICKS` 是进程在 U 模式运行期间来过的时钟中断数，大致等于它用掉的 CPU 时间（单位 10 ms）。按槽位顺序列出，不一定按 pid 排序。结束了还没被回收的进程显示为 `zombie`。
+  `ps` 是 shell 执行的，所以 shell 自己总是 `running`；init 总在 `wait` 里睡着。单核时 shell 占着唯一的 hart，`spin` 只能是 `runnable`；多核时它在别的 hart 上跑，显示 `running`。`CPU_MS` 是进程用掉的 CPU 时间（毫秒，U 模式和内核里的都算：调度器切到它、它切回来时读 `time` 累加的，[process.md](process.md#schedyield)）。上面是 4 核时 `spin` 在后台转了约 0.5 秒。按槽位顺序列出，不一定按 pid 排序。结束了还没被回收的进程显示为 `zombie`。
 - `kill PID`：没有参数、`PID` 不是数字时打印 `usage: kill PID...`，没有这个进程时打印 `kill: no such process: PID`，杀 init 打印 `kill: cannot kill pid 1: permission denied`；有一个失败 `$?` 就是 1。`kill` 系统调用只做标记（[process.md](process.md#kill只做标记)），所以 shell 接着 `wait(pid)`：是自己的子进程的话，等它真的结束、回收它，`killed: kill()` 那一行就在下一个提示符之前；不是自己的子进程时 `wait` 立刻返回 `NoChildren`。
 - `kill` shell 自己（它的 pid）也可以：shell 结束，init 打印 `init: sh exited, restarting it` 并启动一个新的 shell。
 - **列程序**（`run` 单独一个，`listPrograms`）：`readdir` 给的是名字的散列的顺序，shell 把名字收进全局的数组再排序。用的是插入排序：`std.mem.sort` 是块排序，栈上有一个 512 项的缓存（512 个切片，8 KiB），Debug 模式下把 shell 那时 16 KiB 的用户栈撑爆过（`store_page_fault`，`stval` 在保护页里，init 重启了 shell；现在用户栈最多 1 MiB）。glob、Tab 补全也用同一个数组和排序。

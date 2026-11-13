@@ -239,15 +239,10 @@ const handlers = struct {
         proc.yield();
     }
 
-    /// 睡至少 ms 毫秒，按 tick 向上取整（乘法和加法都是饱和的，ms 再大也不溢出）。
-    /// 和 xv6 的 sys_sleep 一样：拿着 timer.lock 排在 timer.waiters 里睡下，每个 tick 叫醒一次，醒来自己数够了没有。
+    /// 睡至少 ms 毫秒（饱和，ms 再大也不溢出）：按到期时刻排进 timer 的 sleepers，到期时的时钟中断叫醒（timer.sleepUntil）。
     /// 被 kill 了就提前返回，回到陷阱处理程序后结束。
     pub fn sleep(ms: usize) void {
-        const n = (ms *| timer.tick_hz +| 999) / 1000;
-        timer.lock.acquire();
-        defer timer.lock.release();
-        const start = timer.ticks;
-        while (timer.ticks - start < n and !proc.isKilled()) timer.waiters.wait(&timer.lock);
+        timer.sleepUntil(timer.now() +| timer.fromMs(ms));
     }
 
     /// 写 fd。中途遇到坏地址就停下，返回已经写出的字节数；一个字节都没写出才返回错误（见 file.write）。

@@ -1137,13 +1137,13 @@ fn ps(only_children: bool) void {
     var buf: [abi.max_procs]abi.ProcInfo = undefined;
     const n = @min(sys.procinfo(&buf), buf.len);
     const me = sys.getpid();
-    if (!only_children) sys.print("  PID  PPID STATE     TICKS NAME\n", .{});
+    if (!only_children) sys.print("  PID  PPID STATE    CPU_MS NAME\n", .{});
     for (buf[0..n]) |p| {
         if (only_children) {
             if (p.ppid != me or p.state == .zombie) continue;
             sys.print("[{d}] {s:<8} {s}\n", .{ p.pid, @tagName(p.state), p.name[0..p.name_len] });
         } else {
-            sys.print("{d:>5} {d:>5} {s:<8} {d:>6} {s}\n", .{ p.pid, p.ppid, @tagName(p.state), p.ticks, p.name[0..p.name_len] });
+            sys.print("{d:>5} {d:>5} {s:<8} {d:>6} {s}\n", .{ p.pid, p.ppid, @tagName(p.state), p.cpu_ms, p.name[0..p.name_len] });
         }
     }
 }

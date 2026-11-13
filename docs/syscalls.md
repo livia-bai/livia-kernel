@@ -83,7 +83,7 @@ pub const wait_nohang: usize = 1;     // wait 的 options：不阻塞
 pub const killed_status: u32 = 0x100; // wait 拿到的“被杀”状态（正常退出是 0..255）
 
 pub const ProcState = enum(u8) { unused, runnable, running, sleeping, zombie };
-pub const ProcInfo = extern struct { pid: u64, ppid: u64, ticks: u64, state: ProcState, name_len: u8, name: [16]u8 };
+pub const ProcInfo = extern struct { pid: u64, ppid: u64, cpu_ms: u64, state: ProcState, name_len: u8, name: [16]u8 };
 pub const MemInfo = extern struct { free_pages: u64, total_pages: u64, page_size: u64 };
 pub const FileKind = enum(u8) { file = 1, dir = 2, console = 3, pipe = 4, device = 5, symlink = 6, _ };
 pub const Stat = extern struct { ino: u64, size: u64, kind: FileKind, _pad: u8, major: u16, nlink: u32 };
@@ -106,9 +106,9 @@ pub fn errnoOf(ret: usize) ?Errno      // 返回值在 [-4095, -1] 内时取出�
 | 0 | `exit` | `a0` = 退出码 | 不返回 | 只取低 8 位（`@truncate` 成 `u8`）。打印 `[proc] pid N (NAME) exited with code C`，变成 zombie 等父进程回收（[process.md](process.md#结束进程)） |
 | 1 | `write` | `a0` = fd，`a1` = 用户缓冲区地址，`a2` = 长度 | 写出的字节数；`-EBADF`、`-EFAULT`、`-EPIPE`；文件：`-ENOSPC`、`-EFBIG`、`-EIO`、`-ENOENT`（文件被删了）、`-ETXTBSY`（文件是正在运行的程序） | 写进串口、管道或文件，详见下文 |
 | 2 | `getpid` | 无 | 进程号 | 每创建一个进程加 1，不复用。init 是 1，shell 是 2 |
-| 3 | `uptime` | 无 | 开机以来的毫秒数 | `timer.uptimeMs()`，精度 10 ms（一个时钟 tick） |
+| 3 | `uptime` | 无 | 开机以来的毫秒数 | `timer.uptimeMs()`：直接读 `time` CSR 换算 |
 | 4 | `yield` | 无 | 0 | 让出 CPU：回到调度器，别的 runnable 进程先运行，轮到它时返回。没有别的 runnable 进程时很快就会返回 |
-| 5 | `sleep` | `a0` = 毫秒数 | 0 | 睡至少 `a0` 毫秒（按 10 ms 的 tick 向上取整），期间不被调度、不占 CPU。`0` 立刻返回 |
+| 5 | `sleep` | `a0` = 毫秒数 | 0 | 睡至少 `a0` 毫秒（按到期时刻排进 `timer.sleepers`，到期的时钟中断叫醒），期间不被调度、不占 CPU。`0` 立刻返回 |
 | 6 | `read` | `a0` = fd，`a1` = 缓冲区地址，`a2` = 长度 | 读到的字节数，0 表示读到结尾；`-EBADF`、`-EFAULT`；文件：`-EISDIR`、`-EIO`、`-ENOENT` | 从串口、管道或文件读，详见下文 |
 | 7 | `fork` | 无 | 父进程得到子进程的 pid，子进程得到 0；或 `-EAGAIN`、`-ENOMEM` | 复制当前进程（[process.md](process.md#fork)） |
 | 8 | `exec` | `a0` = 路径地址，`a1` = 路径长度，`a2` = `Arg` 数组的地址，`a3` = 参数个数 | 成功时不返回（新程序的 `a0` = 参数个数）；`-ENOENT`、`-ENOEXEC`、`-ENOMEM`、`-EFAULT`、`-E2BIG`、`-ENAMETOOLONG`、`-ENOTDIR`、`-ELOOP`、`-EIO`、`-ENODEV`、`-ETXTBSY`（程序文件正在被改） | 换成文件系统里的程序运行（名字里没有 `/` 时在 `/bin` 里找，跟着符号链接走），打开的文件不变，详见下文 |

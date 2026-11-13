@@ -1,4 +1,4 @@
-//! 睡一会儿：`sleep SECONDS`，可以带小数（`sleep 0.25`，精确到毫秒，内核按 10 ms 一个 tick 睡）。
+//! 睡一会儿：`sleep SECONDS`，可以带小数（`sleep 0.25`，精确到毫秒）。
 //! 睡着的时候不占 CPU；按 Ctrl-C 可以提前结束它。
 
 const std = @import("std");

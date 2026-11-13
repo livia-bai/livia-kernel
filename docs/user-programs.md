@@ -73,7 +73,7 @@ pub fn getpid() usize
 pub fn getppid() usize
 pub fn uptime() u64                      // 开机以来的毫秒数
 pub fn yield() void                      // 让出 CPU
-pub fn sleep(ms: u64) void               // 睡至少 ms 毫秒，精度 10 ms
+pub fn sleep(ms: u64) void               // 睡至少 ms 毫秒
 pub fn fork() Error!usize            // 父进程得到子进程的 pid，子进程得到 0
 pub fn exec(name: []const u8, args: []const []const u8) Error!noreturn
 pub fn execRaw(name: []const u8, args: []const abi.Arg) Error!noreturn
@@ -212,7 +212,7 @@ pub fn main() u8 {
 }
 ```
 
-进入死循环，不再做任何系统调用。时钟中断每 10 ms 打断它一次，让它让出 CPU，别的进程和 shell 照样运行。证明用户程序没法霸占 CPU。前台运行时按 Ctrl-C 结束它；后台运行时用 `kill` 结束它，`ps` 能看到它的 `TICKS` 一直在涨。
+进入死循环，不再做任何系统调用。每个时间片（10 ms）用完，时钟中断就打断它，让它让出 CPU，别的进程和 shell 照样运行。证明用户程序没法霸占 CPU。前台运行时按 Ctrl-C 结束它；后台运行时用 `kill` 结束它，`ps` 能看到它的 `CPU_MS` 一直在涨。
 
 ```
 > run spin
@@ -234,7 +234,7 @@ pub fn main() u8 {
 }
 ```
 
-每秒打印一行，共 5 行，然后退出。睡眠期间不被调度，`ps` 里是 `sleeping`、`TICKS` 几乎不涨。适合放到后台（`run ticker &`），和别的程序、shell 一起跑，看输出交错；多开几个，它们的输出间隔仍然是 1 秒：
+每秒打印一行，共 5 行，然后退出。睡眠期间不被调度，`ps` 里是 `sleeping`、`CPU_MS` 几乎不涨。适合放到后台（`run ticker &`），和别的程序、shell 一起跑，看输出交错；多开几个，它们的输出间隔仍然是 1 秒：
 
 ```
 > run ticker &
@@ -357,7 +357,7 @@ shell 没有 `if`、`while`、算术，也没有 `$(...)`（[shell.md](shell.md)
 | `test`（`user/test.zig`） | `test EXPR` | 检查条件，成立以 0 结束、不成立以 1、写错了以 2。文件：`-e`（存在）、`-f`（普通文件）、`-d`（目录）、`-L`（符号链接，不跟着走）、`-s`（存在且不空）；字符串：`-z`、`-n`、`S`（不空）、`=`、`!=`；整数（可以是负数）：`-eq -ne -lt -le -gt -ge`；`!`、`-a`（先算）、`-o`、括号 `(` `)`（shell 不把括号当运算符，直接写，前后要有空格）。没有参数时不成立；`test ! = !` 是比较字符串 `!`。没有 `[`（文件名不好起） |
 | `expr` | `expr 1 + 2 '*' 3` | 64 位有符号整数运算，打印结果。优先级从低到高：`\|`、`&`、`= != < <= > >=`、`+ -`、`* / %`，括号。每个数、运算符是单独的参数；`*` 要写成 `'*'`（不然被当成文件名匹配），`<`、`>` 要加引号（不然是重定向）。结果不是 0 以 0 结束、是 0 以 1、出错（除以 0、溢出、不是数）以 2 |
 | `seq` | `seq [FIRST [STEP]] LAST` | 一行一个数，`STEP` 可以是负数，不能是 0 |
-| `sleep` | `sleep SECONDS` | 可以带小数（`sleep 0.25`），精确到毫秒，内核按 10 ms 一个 tick 睡（[syscalls.md](syscalls.md#调用列表)） |
+| `sleep` | `sleep SECONDS` | 可以带小数（`sleep 0.25`），精确到毫秒（[syscalls.md](syscalls.md#调用列表)） |
 | `head` | `head [-n N] [FILE...]` | 前 N 行（默认 10），带着换行原样输出（`LineReader.nextRaw`）。几个文件时每个前面打印 `==> 名字 <==` |
 | `tail` | `tail [-n N] [FILE...]` | 后 N 行（默认 10）。要读到结尾才知道哪些是最后几行，所以整个输入读进堆里：每次 `sbrk` 1 MiB（只挪 `brk`，按需分配，读了多少才用多少内存），一次最多 `read` 64 KiB（`read` 先检查、分配好整个目标范围，[syscalls.md](syscalls.md#read)），读完再把堆缩回去 |
 | `grep` | `grep [-vincq] PATTERN [FILE...]` | 打印匹配的行。模式照 xv6 的 `grep`（出自 Kernighan、Pike 的《程序设计实践》）：`^`、`$`、`.`、`c*`、`\c`（字符本身），没有 `[...]`、`+`、`?`。`-v` 反过来、`-i` 不分大小写、`-n` 加行号、`-c` 只打印行数、`-q` 不打印。几个文件时每行前面加 `文件名:`。有匹配以 0 结束、没有以 1、出错以 2。输出的一行（文件名、行号、内容、换行）拼好了一次写出去 |

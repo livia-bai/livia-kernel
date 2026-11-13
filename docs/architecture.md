@@ -101,7 +101,7 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 
 **启动**（[boot.md](boot.md)）：OpenSBI → `_start`（清 `.bss`、`tp` = hart 编号、设栈）→ `kmain`：关浮点单元 → 串口 → 陷阱向量 → 设备树 → 页分配器 → 内核页表、开分页 → PLIC 和定时器 → 逐个启动其他 hart（它们从 `secondaryEntry` → `kmainSecondary` 做自己那份初始化，进入自己的调度器）→ 创建 init（`proc.userinit`，打开串口作为 0、1、2 号 fd）→ `proc.scheduler()`，不再返回（全局中断开关由调度器打开）。init 被某个 hart 调度后 `fork` + `exec` 出 shell。
 
-**调度器**（[process.md](process.md#调度)，结构照搬 xv6）：每个 hart 一个，在这个 hart 的启动栈上永远循环：开一下中断（处理挂起的中断）再关上 → 依次扫描进程表，每个槽位拿着进程锁看状态，`runnable` 的进程：切到它的地址空间，`switchContext` 换到它的内核栈，等它调用 `sched()` 切回来 → 一个都没有就 `wfi`。别的 hart 把进程改成 `runnable`、或者杀了在这个 hart 上运行的进程时，发核间中断叫醒或打断它（`ipi.zig`），不用等 10 ms 一次的时钟中断。新进程从 `forkret` → `trapExit` 进入 U 模式，老进程从上次 `sched()` 的地方继续（可能在另一个 hart 上）。
+**调度器**（[process.md](process.md#调度)，结构照搬 xv6）：每个 hart 一个，在这个 hart 的启动栈上永远循环：开一下中断（处理挂起的中断）再关上 → 依次扫描进程表，每个槽位拿着进程锁看状态，`runnable` 的进程：切到它的地址空间，`switchContext` 换到它的内核栈，等它调用 `sched()` 切回来 → 一个都没有就 `wfi`。别的 hart 把进程改成 `runnable`、或者杀了在这个 hart 上运行的进程时，发核间中断叫醒或打断它（`ipi.zig`），空闲的 hart 没有固定的时钟中断，只能靠它叫醒。新进程从 `forkret` → `trapExit` 进入 U 模式，老进程从上次 `sched()` 的地方继续（可能在另一个 hart 上）。
 
 **进程让出 CPU**：时钟中断打断 U 模式（时间片用完）→ `proc.yieldTimeslice`，`yield` 系统调用 → `proc.yield`；要等某件事（`sleep` 系统调用等时钟，`read` 等键盘输入或管道里的数据，`write` 等管道腾出空间，`wait` 等子进程结束）→ 排进条件旁边的等待队列（`q.wait(lock)`，`proc.WaitQueue`），等中断处理程序或别的进程 `q.wakeAll(lock)`。两者都经 `proc.sched` 切回调度器。
 
@@ -109,7 +109,7 @@ user/start.zig ─┬─ user/sys.zig ─── src/abi.zig（与内核共用的
 
 **文件**（[files.md](files.md)）：`read`/`write`/`close`/`dup` 的 fd 是当前进程 fd 表的下标，指向全局文件表里的 `File`（串口或管道的一端，带引用计数）；`fork` 复制 fd 表，进程结束时全部关掉。
 
-**中断**（[trap.md](trap.md)、[devices.md](devices.md)）：硬件跳到 `trap.trapEntry` → 压 `TrapFrame`（来自 U 模式时换回内核的 `tp`）→ `handleTrap` 按 `scause` 分发：时钟中断预约这个 hart 的下一次（启动 hart 上还让 `ticks` 加 1、叫醒等时钟的进程），打断的是 U 模式就让出 CPU；外部中断向 PLIC 领取中断号，串口中断把字符搬进环形缓冲区、处理 Ctrl-C、叫醒在 `read` 里等的进程 → 回到 U 模式之前检查 `killed` → `trapExit` 恢复寄存器、`sret`。
+**中断**（[trap.md](trap.md)、[devices.md](devices.md)）：硬件跳到 `trap.trapEntry` → 压 `TrapFrame`（来自 U 模式时换回内核的 `tp`）→ `handleTrap` 按 `scause` 分发：时钟中断叫醒到期的 `sleep`、重新预约这个 hart 的下一次，打断的是 U 模式而且时间片用完了就让出 CPU；外部中断向 PLIC 领取中断号，串口中断把字符搬进环形缓冲区、处理 Ctrl-C、叫醒在 `read` 里等的进程 → 回到 U 模式之前检查 `killed` → `trapExit` 恢复寄存器、`sret`。
 
 **创建进程**（[process.md](process.md#创建进程)）：`fork` 系统调用 → `proc.fork`：写时复制地址空间（只建页表，用户页和父进程共用，谁先写谁在写缺页里复制一份）、复制 `TrapFrame`（子进程的 `a0` 改成 0）→ 拿着 `wait_lock` 和新槽位的锁一次填好，状态 `runnable`，父进程是调用者。`exec` 系统调用 → 把命令行参数复制进内核 → `proc.exec`：占住程序文件（运行期间不能改、不能删）、新建地址空间、读 ELF 的程序头记下各个段、参数放到栈顶（分配栈最顶上那一页）→ 换掉旧的地址空间 → `TrapFrame` 改成从新程序的入口开始（`a0` = argc，`a1` = argv）。
 

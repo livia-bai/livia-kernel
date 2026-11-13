@@ -2,6 +2,11 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-13 时钟不再固定 100 Hz（tickless）
+
+- 改动：计时直接读 `time` CSR（`timer.uptimeMs`），去掉了 `ticks` 和“只由启动 hart 加 1”的特殊角色。`sleep` 系统调用按到期时刻排进 `timer.sleepers`（`timer.sleepUntil`），只为最早的那个预约时钟中断，精度不再是 10 ms。时间片由调度器切到进程时开始（`timer.startSlice`），过了 10 ms 的时钟中断才让 U 模式的进程让出 CPU。空闲的 hart 没有 sleeper 时不预约时钟中断：4 个 hart 空闲 5 秒，时钟中断从约 2000 次变成 4 次。
+- 改动：进程的 CPU 时间改成调度器切到它、它切回来时读 `time` 累加（`Process.cpu_time`，U 模式和内核里的都算）。`abi.ProcInfo.ticks` 换成 `cpu_ms`，`ps` 的 `TICKS` 列换成 `CPU_MS`。启动日志的时钟那一行改成 `timer (10 ms slices, tickless)`。
+
 ## 2026-11-13 拿锁、放锁时随机空转（-Dlock-jitter）
 
 - 新增：构建选项 `-Dlock-jitter=true`：`Spinlock.acquire` 之前、`release` 之后随机空转一会儿，拉大竞争窗口，启动时打印一行说明。默认关着，关着时不生成任何代码。`qemu_test.py` 加了 `--jitter`、`--repeat N`。

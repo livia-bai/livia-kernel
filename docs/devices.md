@@ -171,23 +171,25 @@ pub fn initHart() void {           // 每个 hart 调用一次
 ## 定时器（`timer.zig`）
 
 ```zig
-pub const tick_hz = 100;                  // 每秒 100 次，也就是每 10 ms 一次
-var timebase_hz: u64 = undefined;         // time CSR 每秒增加多少，来自设备树
-var deadline: [hart.max]u64 = undefined;  // 每个 hart 的下一次中断预约在 time CSR 的哪个值
-var timekeeper: usize = undefined;        // 由哪个 hart 给 ticks 加 1
-pub var lock: Spinlock = .init("ticks", .cond);  // 保护 ticks（xv6 的 tickslock）
-pub var ticks: u64 = 0;
+pub const slice_ms = 10;                          // 时间片的长度
+var timebase_hz: u64 = undefined;                 // time CSR 每秒增加多少，来自设备树
+var boot_time: u64 = undefined;                   // 打开时钟时的 time，uptime 从这里算
+var slice_end: [hart.max]?u64 = @splat(null);     // 每个 hart 正在运行的进程的这一片在哪结束
+pub var lock: Spinlock = .init("timer", .cond);   // 保护 sleepers
+var sleepers: ?*Sleeper = null;                   // sleep 里的进程，按到期时刻排好
+var earliest: std.atomic.Value(u64);              // 最早的 sleeper 的到期时刻，没有是 maxInt
 ```
 
-- **时钟频率**：`time` CSR 以 timebase 频率递增，QEMU `virt` 上是 10 MHz，所有 hart 读到的是同一个时钟。这个值来自设备树 `/cpus` 节点的 `timebase-frequency`（[devicetree.md](devicetree.md)），`kmain` 把它传给 `timer.init`。
-- **每个 hart 有自己的定时器**：SBI 的 `set_timer` 只设置调用它的那个 hart 的下一次时钟中断，所以每个 hart 各自预约、各自的 `deadline[hart.id()]`，各自每 10 ms 被打断一次。每个 hart 上的进程都靠自己 hart 的时钟中断被抢占。
-- **预约**：`arm()` 把当前 hart 的 `deadline` 加上一个周期 `timebase_hz / tick_hz`（10 MHz 下是 100000 个计数），通过 `sbi.setTimer(deadline)` 让 OpenSBI 在那时产生 S 模式时钟中断。下一次的预约时刻以**上一次的预约时刻**为基准，而不是以“现在”为基准，原因见下面的“为什么”。
-- **初始化**：`init(hz)` 由启动 hart 调用一次，记下频率，并把自己定为 `timekeeper`；`initHart()` 每个 hart 调用一次，把自己的 `deadline` 设成当前的 `time`，预约第一次（一个周期之后），再打开自己的 `sie.STIE`。
-- **中断处理**：`onInterrupt()` 先预约这个 hart 的下一次（`setTimer` 同时清除了当前挂起的时钟中断，不预约的话处理程序返回后会立刻再次进来）。只有 `timekeeper`（启动 hart）接着拿 `lock`、让 `ticks` 加 1、`waiters.wakeAll(&lock)` 叫醒 `sleep` 系统调用里的进程（xv6 的 `clockintr` 也只在 cpu 0 上做）。每个 hart 都加的话，4 个 hart 时 `ticks` 就会快 4 倍。
-- **计时**：`ticks` 从打开时钟中断开始计数，`uptimeMs()` 拿着 `lock` 读它，返回 `ticks * 1000 / tick_hz` 毫秒，是 `uptime` 系统调用的返回值，shell 的 `uptime` 命令显示它。误差在一个 tick（10 ms）以内，不随时间累积。
-- **`lock`**：`sleep` 系统调用拿着它检查睡够了没有、排在 `waiters` 里睡下（[process.md](process.md#等待队列waitqueue)），时钟中断拿着它加 `ticks`、叫醒，所以不会丢唤醒。
-- **为什么以上一次的预约时刻为基准**：中断从到期到被处理总有一段延迟。以前 `arm()` 按“处理中断时读到的 `time` + 一个周期”预约，每个 tick 都把这段延迟丢掉，误差越积越多。实测 `uptime` 比 `time` 慢 2%～3%，shell 空闲 20 秒就慢了 543 ms。现在每个周期的边界是固定的，延迟不累积，同样空闲 20 秒只差 4 ms。
-- **处理晚了超过一个周期时**：新的预约时刻已经过去。按 SBI 规范，这时中断会立刻挂起，连续来几次之后 `ticks` 就追上了。这种情况没有实测过。
+没有固定频率的 tick（tickless）。原来照 xv6，每个 hart 每 10 ms 一次时钟中断，启动 hart 给全局的 `ticks` 加 1，`sleep` 的进程每个 tick 都被叫醒、自己数时间到了没有；空闲的 hart 也每秒被打断 100 次。现在时钟中断只在有事要做的时候来：
+
+- **计时**：`time` CSR 以 timebase 频率递增，QEMU `virt` 上是 10 MHz，所有 hart 读到的是同一个时钟（频率来自设备树 `/cpus` 的 `timebase-frequency`，[devicetree.md](devicetree.md)）。`uptimeMs()` 直接用 `time` 减去 `boot_time` 换算成毫秒，不数中断，不用锁，也就没有“中断处理晚了、计时慢下来”的问题。
+- **时间片**：调度器切到一个进程之前调用 `startSlice()`，记下 `slice_end = 现在 + 10 ms`。时钟中断来了、而且已经过了这个时刻，`onInterrupt()` 返回 true，陷阱处理程序让 U 模式的进程让出 CPU（[trap.md](trap.md#分发)）。进程切回调度器之后 `endSlice()` 清掉。用完了的这一片在 `onInterrupt` 里也马上清掉：不然重新预约的时刻已经过去，进程让出之后调度器一开中断就又来一次中断，处理完又预约这个过去的时刻，调度器就卡在开中断的那一条指令上（开发时真的这样卡住过）。
+- **sleep**：`sleepUntil(deadline)` 在调用者的内核栈上放一个 `Sleeper`（到期时刻、链表指针、一个只有它自己的 `WaitQueue`），按到期时刻插进 `sleepers`，排在自己的队列里睡下。到期时 `onInterrupt()` 拿着 `lock` 从头摘下所有到期的，叫醒它们。被 `kill` 叫醒的自己从 `sleepers` 里摘掉。精度不再是 10 ms，而是从到期到中断被处理的那段延迟。
+- **预约**：`arm()` 通过 `sbi.setTimer` 预约这个 hart 的下一次时钟中断：在运行进程的话是 `slice_end` 和 `earliest` 中早的那个；空闲的话只看 `earliest`；都没有就预约 `maxInt`，也就是不要时钟中断（`setTimer` 同时清掉已经挂起的时钟中断）。调度器每一轮都重新预约：切到进程之前（`startSlice`），`wfi` 之前（`stopSlice`）；时钟中断处理完也重新预约。
+- **为什么不会漏掉一个 sleeper**：`arm` 不拿锁读 `earliest`，可能读到旧的值。但新的 sleeper 是它所在的 hart 排进去的，这个 hart 接着就切回调度器、重新预约，读到的一定是自己写的新值，所以至少它的定时器盖住了新的最早时刻。到期时处理它的 hart 叫醒它之后重新预约，带上下一个最早的。几个 hart 可能都预约了同一个时刻，先拿到 `lock` 的叫醒，别的发现没有到期的、各自重新预约。
+- **空闲的 hart 靠核间中断叫醒**：空闲的 hart 没有 sleeper 时不预约时钟中断，`wfi` 一直睡到别的中断。原来别的 hart 叫醒进程时漏发核间中断，空闲的 hart 最多 10 ms 后也会被时钟中断叫醒；现在不会了，所以“让进程变成 runnable 只经过 `makeRunnable`（它发核间中断）”更是不能破坏（[process.md](process.md#核间中断)）。
+- **初始化**：`init(hz)` 由启动 hart 调用一次，记下频率和 `boot_time`；`initHart()` 每个 hart 调用一次，打开自己的 `sie.STIE`，先不预约。
+- **实测**：4 个 hart、shell 空闲 5 秒，`kstat` 的 `timer_interrupts` 从 2004 次（每个 hart 100 Hz）变成 4 次。`t_sleep` 的 `sleep(200)` 前后都量到约 200 ms。
 
 时钟中断在 U 模式下同样会发生（`sret` 进入 U 模式时 `SPIE = 1`），这是内核能从死循环的用户程序手里拿回 CPU 的原因。
 

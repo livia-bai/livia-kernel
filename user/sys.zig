@@ -129,7 +129,7 @@ pub fn yield() void {
     _ = call(.yield, .{});
 }
 
-/// 睡至少 ms 毫秒（精度 10 ms），期间不占 CPU。
+/// 睡至少 ms 毫秒，期间不占 CPU。
 pub fn sleep(ms: u64) void {
     _ = call(.sleep, .{ms});
 }

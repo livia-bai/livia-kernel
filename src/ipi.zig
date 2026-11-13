@@ -4,8 +4,8 @@
 //! 目标 hart 收到的是 S 模式软件中断（scause = 中断 1），sip.SSIP 被置 1，处理时自己清掉。
 //! 软件中断不带任何信息，只是让目标 hart 进一次陷阱处理程序。两种用途：
 //!
-//! - 叫醒空闲的 hart：调度器扫完一圈没有可运行的进程就 wfi，原来要等自己的下一个时钟中断（最多 10 ms）
-//!   才会再扫。wakeup、kill、fork 让一个进程变成 runnable 时，给一个空闲的 hart 发核间中断，
+//! - 叫醒空闲的 hart：调度器扫完一圈没有可运行的进程就 wfi，没有 sleeper 时不预约时钟中断（timer.zig），
+//!   不叫醒它就一直睡下去。wakeup、kill、fork 让一个进程变成 runnable 时，给一个空闲的 hart 发核间中断，
 //!   它的 wfi 立刻返回、马上去运行这个进程（wakeIdle）。
 //! - 催正在运行被杀进程的 hart：kill 一个正在别的 hart 的 U 模式里运行的进程时，给那个 hart 发核间中断，
 //!   它马上陷入内核，回到 U 模式之前在 checkKilled 里结束这个进程（send）。

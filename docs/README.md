@@ -29,9 +29,8 @@ livia-kernel 的详细文档，按功能组织，讲这个用 Zig 写的 RISC-V 
 | 范本 | `riscv.zig`、`abi.zig`、`syscall.zig` 的 `dispatch` | CSR 的位、系统调用的签名和错误码都只写一次，别的地方在编译期和它核对 |
 | 够用 | `proc.zig` | 结构照 xv6；哪个字段归哪把锁管还只写在注释里，没有交给类型 |
 | 够用 | `vm.zig` | 按需分页、写时复制、pin 都清楚；`Space.regionOf` 写死了段、堆、栈三种区域，加新的映射种类要改好几处 |
-| 够用 | `file.zig`、`pipe.zig`、`sleeplock.zig`、`bio.zig`、`fsys.zig`、`loader.zig`、`dtb.zig`、`kstat.zig`、`main.zig`、`sbi.zig`、`plic.zig` | 清楚、有测试，没有特别值得学的写法 |
+| 够用 | `timer.zig`、`file.zig`、`pipe.zig`、`sleeplock.zig`、`bio.zig`、`fsys.zig`、`loader.zig`、`dtb.zig`、`kstat.zig`、`main.zig`、`sbi.zig`、`plic.zig` | 清楚、有测试，没有特别值得学的写法 |
 | 待重构 | `fs.zig` | 一千七百多行，路径解析、目录、文件内容、检查放在一起，可以按这几块拆开 |
-| 待重构 | `timer.zig` | 每个 hart 固定 100 Hz，`sleep` 的进程每个 tick 都被叫醒；可以改成按到期时间排队 |
 | 待重构 | `uart.zig`、`virtio_disk.zig` | 外设地址按 QEMU `virt` 写死；串口输出拿着锁忙等发送寄存器 |
 
 ## 按功能

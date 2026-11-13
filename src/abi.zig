@@ -17,7 +17,7 @@ pub const Syscall = enum(usize) {
     uptime = 3,
     /// yield() 让出 CPU，让别的就绪进程先运行，返回 0
     yield = 4,
-    /// sleep(ms) 睡至少 ms 毫秒（按 10 ms 的 tick 向上取整），期间不占 CPU，返回 0
+    /// sleep(ms) 睡至少 ms 毫秒，期间不占 CPU，返回 0
     sleep = 5,
     /// read(fd, ptr, len) 从文件 fd（串口或管道）读最多 len 个字节到用户内存，返回读到的字节数。
     /// 一个字节都没有时阻塞；返回 0 表示读到了结尾（管道的写端都关了，或者在串口上按了 Ctrl-D）
@@ -389,8 +389,8 @@ pub const ProcState = enum(u8) {
 pub const ProcInfo = extern struct {
     pid: u64,
     ppid: u64,
-    /// 在 U 模式运行期间来过的时钟中断数
-    ticks: u64,
+    /// 用掉的 CPU 时间（毫秒），U 模式和内核里的都算
+    cpu_ms: u64,
     state: ProcState,
     /// name 里有效的字节数（名字超过 16 字节时截断）
     name_len: u8,

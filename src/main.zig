@@ -147,8 +147,8 @@ fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
     timer.init(info.timebase_hz);
     timer.initHart();
     ipi.initHart();
-    uart.print("[ok] interrupt sources enabled: timer at {d} Hz, keyboard via UART + PLIC, IPIs{s}\n", .{
-        timer.tick_hz, if (virtio_disk.irq != 0) ", disk" else "",
+    uart.print("[ok] interrupt sources enabled: timer ({d} ms slices, tickless), keyboard via UART + PLIC, IPIs{s}\n", .{
+        timer.slice_ms, if (virtio_disk.irq != 0) ", disk" else "",
     });
 
     startHarts(hartid, info.harts(), info.timebase_hz);

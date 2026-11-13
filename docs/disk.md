@@ -32,7 +32,7 @@ QEMU 的 virtio-blk 设备 → 磁盘镜像文件
 
 ```
 [ok] virtio disk: 8192 blocks of 4 KiB (32 MiB), irq 1, flush
-[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs, disk
+[ok] interrupt sources enabled: timer (10 ms slices, tickless), keyboard via UART + PLIC, IPIs, disk
 [ok] file system: 6840 of 7168 blocks free, generation 27
 ```
 

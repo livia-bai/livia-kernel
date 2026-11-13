@@ -29,7 +29,7 @@ SBI: OpenSBI, spec v1.0 | hart 0 | device tree at 0x87e00000
 [ok] Sv39 paging enabled: kernel mapped 1:1, text r-x, rodata r--, data rw-, 80 stack guard pages unmapped
 [ok] stack overflow check: hitting a guard page traps onto the trap stack
 [ok] virtio disk: 8192 blocks of 4 KiB (32 MiB), irq 1, flush
-[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs, disk
+[ok] interrupt sources enabled: timer (10 ms slices, tickless), keyboard via UART + PLIC, IPIs, disk
 [ok] 4 harts running, booted on hart 0
 [ok] file system: 6422 of 7168 blocks free, generation 59
 Type 'help' for commands.
@@ -78,10 +78,10 @@ dev   1        1 console
 [proc] pid 15 (spin) started in the background
 > pid 15 spinning in U-mode without making syscalls
 ps
-  PID  PPID STATE     TICKS NAME
-    1     0 sleeping      0 init
-    2     1 running       5 sh
-   15     2 running      48 spin
+  PID  PPID STATE    CPU_MS NAME
+    1     0 sleeping      8 init
+    2     1 running      10 sh
+   15     2 running     494 spin
 > run spin
 pid 16 spinning in U-mode without making syscalls
 ^C
@@ -117,7 +117,7 @@ shell 是用户程序（`user/sh.zig`），由 init 启动。
 | 命令 | 作用 |
 | --- | --- |
 | `help` | 列出命令 |
-| `uptime` | 开机时长，精度 10 ms |
+| `uptime` | 开机时长 |
 | `mem` | 物理页的使用情况 |
 | `disk` | 磁盘的原始区域（文件系统之后的块）有多大 |
 | `cd [DIR]`、`cd -` | 换当前目录，不给时回到 `/`，`-` 回到上一个目录 |
@@ -132,7 +132,7 @@ shell 是用户程序（`user/sh.zig`），由 init 启动。
 | `*`、`?` | 匹配文件名（`echo /bin/t_*`） |
 | `time A` | 运行 A，打印用了多久 |
 | `sh FILE [ARGS...]`、`sh -c CMDS` | 执行脚本里的命令（`$1`、`$2`... 是参数）、执行 CMDS |
-| `ps`、`jobs` | 列出进程：pid、父进程、状态、用掉的时钟 tick 数；只列这个 shell 的后台进程 |
+| `ps`、`jobs` | 列出进程：pid、父进程、状态、用掉的 CPU 时间（毫秒）；只列这个 shell 的后台进程 |
 | `kill PID...`、`wait [PID]` | 结束进程（init 不能杀；杀掉 shell 的话 init 会重新启动一个）；等后台进程结束 |
 | `history`、↑、↓、Tab | 最近的命令；方向键翻历史；Tab 补全程序名和路径 |
 | `true`、`false`、`exit [N]` | 以 0、1 结束；shell 以 N 结束（init 再启动一个） |

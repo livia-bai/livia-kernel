@@ -102,7 +102,7 @@ export fn _start() linksection(".text.boot") callconv(.naked) noreturn {
 - 必须是裸函数（`callconv(.naked)`）：普通函数的序言会用 `sp` 压栈，而此时还没有栈。
 - `linksection(".text.boot")` 配合链接脚本把它放在 `0x8020_0000`。
 - 启动 hart 的编号不小于 `hart.max`（8）的话没有启动栈可用，停在最后的 `wfi` 循环里。QEMU `virt` 的 hart 从 0 开始编号，不会走到这里。
-- 先以 8 字节为单位清零 `[__bss_start, __bss_end)`（链接脚本保证 `__bss_end` 8 字节对齐）。所有初值为 0 的全局变量（例如 `timer.ticks`、页分配器的链表头）都在 `.bss` 里，不清零就是 QEMU 留下的随机内容。清零只用 `t0`、`t1`，不需要栈；启动栈也在 `.bss` 里，所以先清零、再用栈。这时还没开分页，保护页也照样被清零（之后不再访问它们）。
+- 先以 8 字节为单位清零 `[__bss_start, __bss_end)`（链接脚本保证 `__bss_end` 8 字节对齐）。所有初值为 0 的全局变量（例如 `timer.sleepers`、页分配器的链表头）都在 `.bss` 里，不清零就是 QEMU 留下的随机内容。清零只用 `t0`、`t1`，不需要栈；启动栈也在 `.bss` 里，所以先清零、再用栈。这时还没开分页，保护页也照样被清零（之后不再访问它们）。
 - `enter_asm` 把 hart 编号放进 `tp`、让 `sp` 指向这个 hart 的启动栈顶，见下一节。
 - 全程没碰 `a0`、`a1`，`tail` 跳到 `kmain` 时它们原样成为 `kmain(hartid, dtb_addr)` 的两个参数。`tail` 不保存返回地址，`kmain` 也是 `noreturn`。
 
@@ -136,7 +136,7 @@ comptime {                                      // src/main.zig：导出要写�
 | 6 | `page.init(vm.kernelEnd(), info.memory.end(), info.reserved())` | `[ok] page allocator: N free pages (... KiB)` | 建页表需要分配页 |
 | 7 | `vm.init(info.memory, &kstack.guardPages())` | `[ok] Sv39 paging enabled: kernel mapped 1:1, text r-x, rodata r--, data rw-, 80 stack guard pages unmapped` | 写 `satp` 打开分页。恒等映射保证这一刻前后地址不变；内核栈下面的保护页不映射 |
 | 7.1 | `trap.probeGuard(启动栈的底)` | `[ok] stack overflow check: hitting a guard page traps onto the trap stack` | 自检：模拟一次内核栈溢出（`sp` 越过启动栈的底再写），确认保护页没有映射、缺页在陷阱栈上处理完能回来（[trap.md](trap.md#内核栈溢出)）。要在开分页之后 |
-| 8 | `virtio_disk.init()`、`bio.init(...)`、`plic.init(virtio_disk.irq)`、`plic.initHart()`、`timer.init(info.timebase_hz)`、`timer.initHart()`、`ipi.initHart()` | `[ok] virtio disk: 8192 blocks of 4 KiB (32 MiB), irq 1, flush`、`[ok] interrupt sources enabled: timer at 100 Hz, keyboard via UART + PLIC, IPIs, disk` | 先找磁盘（要访问 MMIO，所以在开分页之后；只是协商、配置队列，不读写：`kmain` 不是进程，不能睡着等磁盘，[disk.md](disk.md)），PLIC 要知道它的中断号。然后是全局的设置（串口中断的优先级、时钟频率、由哪个 hart 计时）和这个 hart 自己的（PLIC 上下文、第一次时钟中断、`sie` 里时钟、外部、软件中断的使能位）。全局开关 `sstatus.SIE` 不在这里开，见下文 |
+| 8 | `virtio_disk.init()`、`bio.init(...)`、`plic.init(virtio_disk.irq)`、`plic.initHart()`、`timer.init(info.timebase_hz)`、`timer.initHart()`、`ipi.initHart()` | `[ok] virtio disk: 8192 blocks of 4 KiB (32 MiB), irq 1, flush`、`[ok] interrupt sources enabled: timer (10 ms slices, tickless), keyboard via UART + PLIC, IPIs, disk` | 先找磁盘（要访问 MMIO，所以在开分页之后；只是协商、配置队列，不读写：`kmain` 不是进程，不能睡着等磁盘，[disk.md](disk.md)），PLIC 要知道它的中断号。然后是全局的设置（串口中断的优先级、时钟频率和开始计时的时刻）和这个 hart 自己的（PLIC 上下文、`sie` 里时钟、外部、软件中断的使能位；时钟中断先不预约，调度器第一轮再说）。全局开关 `sstatus.SIE` 不在这里开，见下文 |
 | 9 | `startHarts(hartid, info.harts(), info.timebase_hz)` | `[ok] 4 harts running, booted on hart 0` | 启动设备树里列出的其他 hart，等它们都进了调度器（[启动其他 hart](#启动其他-hart)）。要在全局的初始化都做完之后：它们直接用页表、页分配器 |
 | 10 | `proc.userinit()` + `proc.scheduler()` | `Type 'help' for commands.`、`> ` | 和 xv6 的 `main` 一样：建好第一个进程 init，启动栈交给调度器，`kmain` 不再返回。之后的两行是 shell（init 启动的）打印的，init 和 shell 可能在任何一个 hart 上运行 |
 

@@ -32,7 +32,7 @@ BOOT_TIMEOUT = 60  # 秒：从启动 QEMU 到出现第一个提示符
 COMMAND_TIMEOUT = 60  # 秒：每条命令从发出到出现下一个提示符
 PROMPT = "\n> "  # 串口把 \n 输出成 \r\n，比较前统一换成 \n
 SPIN_SECONDS = 0.5  # 让 spin 转多久再按 Ctrl-C
-MIN_SPIN_TICKS = 10  # 这段时间里至少要有多少次时钟中断（100 Hz 下理论上约 50 次）
+MIN_SPIN_MS = 100  # 这段时间里 uptime 至少要走多少毫秒；每个后台的 spin 至少要分到它的一半的 CPU 时间
 TIMEBASE_HZ = 10_000_000  # QEMU virt 的 time CSR 频率
 
 # 下面这些在 Zig 里已经定义了，从 zig build 生成的 config.json 读（build.zig 的 Config），见 load_config
@@ -292,14 +292,14 @@ def shell_jobs(q, c):
 
 
 def case_interrupts(q, c, mode):
-    # spin 在 U 模式里死循环。这段时间里内核只能靠中断拿回 CPU，
-    # 所以前后两次 uptime（精度是一个 tick，10 ms）的差说明时钟中断在 U 模式下照常发生；Ctrl-C 靠串口中断送进来
-    before = uptime_ticks(q, c)
+    # spin 在 U 模式里死循环，内核只能靠中断拿回 CPU：Ctrl-C 靠串口中断送进来。
+    # uptime 直接读 time CSR，前后两次的差大致是真实经过的时间（时间片轮转见 case_sched）
+    before = uptime_ms(q, c)
     run_and_interrupt(q, c, SPIN_SECONDS)
-    after = uptime_ticks(q, c)
+    after = uptime_ms(q, c)
     if before is not None and after is not None:
-        c.expect(after - before >= MIN_SPIN_TICKS,
-                 f"uptime: only {after - before} timer interrupts while spin ran for {SPIN_SECONDS}s")
+        c.expect(after - before >= MIN_SPIN_MS,
+                 f"uptime: only {after - before} ms passed while spin ran for {SPIN_SECONDS}s")
     # 在 shell 里按的 Ctrl-C 不应该影响之后运行的程序
     q.send("\x03")
     exited(c, q.command("run hello"), "hello", 0)
@@ -319,10 +319,10 @@ def run_and_interrupt(q, c, seconds):
     return pid
 
 
-def uptime_ticks(q, c):
-    """uptime 显示到 1/100 秒，正好是 tick 数。"""
+def uptime_ms(q, c):
+    """uptime 显示到 1/100 秒，换成毫秒。"""
     m = c.contains(q.command("uptime"), r"up (\d+)\.(\d\d)s", "uptime")
-    return int(m.group(1)) * 100 + int(m.group(2)) if m else None
+    return int(m.group(1)) * 1000 + int(m.group(2)) * 10 if m else None
 
 
 def case_user(q, c, mode):
@@ -358,9 +358,9 @@ def start_background(q, c, name):
 
 
 def ps_table(q, c):
-    """运行 ps，返回 {pid: (状态, ticks, 名字)}，不含 init 和 sh（检查它们的父进程和状态）。"""
+    """运行 ps，返回 {pid: (状态, CPU 毫秒数, 名字)}，不含 init 和 sh（检查它们的父进程和状态）。"""
     out = q.command("ps")
-    c.contains(out, r"PID +PPID STATE +TICKS NAME", "ps")
+    c.contains(out, r"PID +PPID STATE +CPU_MS NAME", "ps")
     rows = [(int(m.group(1)), int(m.group(2)), m.group(3), int(m.group(4)), m.group(5))
             for m in re.finditer(r"^ *(\d+) +(\d+) (\w+) +(\d+) (\w+)$", out, re.M)]
     init = [r for r in rows if r[4] == "init"]
@@ -398,7 +398,7 @@ def case_sched(q, c, mode):
     c.contains(out, r"yield ok", "run t_sleep")
     exited(c, out, "t_sleep", 0)
 
-    # 两个后台进程都分到了 CPU：0.5 秒里各自至少拿到几个 tick。单核时靠时间片轮转，状态是 runnable；
+    # 两个后台进程都分到了 CPU：0.5 秒里各自至少拿到几十毫秒。单核时靠时间片轮转，状态是 runnable；
     # 多核时它们可能正在别的 hart 上运行
     before = ps_table(q, c)
     time.sleep(SPIN_SECONDS)
@@ -407,7 +407,7 @@ def case_sched(q, c, mode):
         c.expect(after.get(pid, ("", 0, ""))[0] in ("runnable", "running"),
                  f"ps: spin (pid {pid}) not listed as runnable or running: {after}")
         got = after.get(pid, ("", 0, ""))[1] - before.get(pid, ("", 0, ""))[1]
-        c.expect(got >= MIN_SPIN_TICKS // 2, f"ps: spin (pid {pid}) got only {got} ticks in {SPIN_SECONDS}s")
+        c.expect(got >= MIN_SPIN_MS // 2, f"ps: spin (pid {pid}) got only {got} ms of CPU in {SPIN_SECONDS}s")
 
     # Ctrl-C 只结束前台进程，后台的还在
     fg = run_and_interrupt(q, c, 0.2)
@@ -984,8 +984,8 @@ def case_smp(q, c, mode):
     check_counts(c, q.command("run t_smp"), "t_smp")
     if q.smp < 3:
         return
-    # 真的在并行：两个死循环的后台进程在不同的 hart 上同时运行，0.5 秒里加起来拿到的 tick
-    # 比一个 hart 能给的（100 Hz × 0.5 秒 = 50 个）多得多。单核时两个加起来最多 50 个
+    # 真的在并行：两个死循环的后台进程在不同的 hart 上同时运行，0.5 秒里加起来拿到的 CPU 时间
+    # 比一个 hart 能给的（500 ms）多得多。单核时两个加起来最多 500 ms
     spinners = [start_background(q, c, "spin") for _ in range(2)]
     if None in spinners:
         return
@@ -993,8 +993,8 @@ def case_smp(q, c, mode):
     time.sleep(SPIN_SECONDS)
     after = ps_table(q, c)
     got = sum(after.get(pid, ("", 0, ""))[1] - before.get(pid, ("", 0, ""))[1] for pid in spinners)
-    one_hart = int(SPIN_SECONDS * 100)
-    c.expect(got >= one_hart * 1.3, f"ps: two spinners got {got} ticks in {SPIN_SECONDS}s on {q.smp} harts, "
+    one_hart = int(SPIN_SECONDS * 1000)
+    c.expect(got >= one_hart * 1.3, f"ps: two spinners got {got} ms of CPU in {SPIN_SECONDS}s on {q.smp} harts, "
              f"expected well over {one_hart}")
     for pid in spinners:
         q.command(f"kill {pid}")
@@ -1123,7 +1123,7 @@ def check_boot(q, c, smp):
         r"\[ok\] stack overflow check: hitting a guard page traps onto the trap stack\n",
         rf"\[ok\] virtio disk: {FS_BLOCKS + RAW_BLOCKS} blocks of 4 KiB \({(FS_BLOCKS + RAW_BLOCKS) * BLOCK_SIZE >> 20} MiB\), irq 1, flush\n",
         rf"\[ok\] file system: \d+ of {FS_BLOCKS} blocks free, generation \d+\n",
-        r"\[ok\] interrupt sources enabled: timer at 100 Hz, keyboard via UART \+ PLIC, IPIs, disk\n",
+        r"\[ok\] interrupt sources enabled: timer \(10 ms slices, tickless\), keyboard via UART \+ PLIC, IPIs, disk\n",
         rf"\[ok\] {smp} harts? running, booted on hart \d+\n",
     ]:
         c.contains(text, pattern, "boot log")

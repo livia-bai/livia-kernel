@@ -194,8 +194,9 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
         const interrupt: Interrupt = @fromBackingInt(code);
         switch (interrupt) {
             .supervisor_timer => {
-                timer.onInterrupt();
-                if (from_user) {
+                // 叫醒到期的 sleep；这一片用完了的话，打断的是 U 模式时让它让出 CPU
+                const expired = timer.onInterrupt();
+                if (from_user and expired) {
                     // 时间片用完了，让出 CPU（xv6 的 usertrap 也是这样）。用户程序就算在 U 模式里死循环，
                     // 时钟中断也会把 CPU 交回内核。下次轮到它时（可能在别的 hart 上）返回，经 trapExit 回到 U 模式。
                     // 放在中断处理全部完成之后：可能很久以后才返回。
