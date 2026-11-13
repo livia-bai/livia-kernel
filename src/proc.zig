@@ -178,7 +178,7 @@ fn fill(p: *Process, new: Process) void {
 
 /// 进程从 U 模式陷入时的 TrapFrame，总在它的内核栈最顶端（trapEntry 从 sscratch = 栈顶开始压栈，
 /// trapExit 回到 U 模式时也按这个位置设置 sscratch）。
-fn frameOf(p: *Process) *trap.TrapFrame {
+pub fn frameOf(p: *Process) *trap.TrapFrame {
     const stack = stackOf(p);
     return @ptrCast(@alignCast(stack[stack.len - @sizeOf(trap.TrapFrame) ..]));
 }
@@ -447,6 +447,7 @@ pub fn scheduler(boot_stack: []u8) noreturn {
         riscv.disableInterrupts();
         hart.checkPanic();
         canary.check(boot_stack, "boot stack of hart {d}", .{hart.id()});
+        trap.checkIdle();
         ipi.setIdle(true);
         var found = false;
         for (&table) |*p| {

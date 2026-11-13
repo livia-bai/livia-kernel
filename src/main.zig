@@ -117,8 +117,9 @@ fn kmain(hartid: usize, dtb_addr: usize) callconv(.c) noreturn {
 
     trap.init();
     uart.write("[ok] trap vector installed\n");
-    // 自检：主动触发一次断点异常，确认陷阱能进能出
+    // 自检：主动触发一次断点异常，确认陷阱能进能出；出来之后 sscratch、tp、sp 都还对（trap.checkBoot）
     asm volatile ("ebreak");
+    trap.checkBoot(hartid);
 
     const info = dtb.parse(dtb_addr) catch |err| {
         std.debug.panic("cannot parse device tree at 0x{x}: {s}", .{ dtb_addr, @errorName(err) });
@@ -199,6 +200,7 @@ fn startHarts(self: usize, ids: []const u32, timebase_hz: u64) void {
 fn kmainSecondary() callconv(.c) noreturn {
     riscv.clear(.sstatus, .{ .fs = 3 }); // 见 kmain
     trap.init();
+    trap.checkBoot(hart.id());
     vm.initHart();
     plic.initHart();
     timer.initHart();

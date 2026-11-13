@@ -70,6 +70,53 @@ pub fn init() void {
     riscv.write(.sscratch, kstack.trap[hart.id()].top());
 }
 
+// ---- sscratch、tp 约定的检查 ----
+//
+// 这两个约定（见 docs/trap.md）原来只写在注释里：trapEntry、trapExit 的汇编哪里换错了一个寄存器，
+// 多半要等到另一个 hart、另一个进程上才出事，症状离原因很远。现在三个地方各检查一次，违反了马上 panic：
+// 启动时每个 hart（checkBoot）、每次进陷阱处理程序（checkEntry）、调度器每一轮（checkIdle）。
+// 都只读一两个 CSR、比几个地址，代价可以忽略。tp 没法直接核对（hart.id() 就是读它），
+// 就核对靠它找到的东西：启动栈、陷阱栈、当前进程的 TrapFrame 都得是这个 hart 的。
+
+fn conventionBroken(comptime what: []const u8, args: anytype) noreturn {
+    std.debug.panic("trap convention broken: " ++ what, args);
+}
+
+/// 启动时（trap.init 之后）：tp 是固件给的 hart 编号，sscratch 是这个 hart 的陷阱栈顶，sp 在这个 hart 的启动栈里。
+/// hartid 是固件交过来的编号（kmain 的参数）；别的 hart 上没有独立的来源，传 hart.id()，只核对 sp 和 sscratch。
+pub fn checkBoot(hartid: usize) void {
+    const h = hart.id();
+    if (h != hartid or h >= hart.max) conventionBroken("tp is {d}, the firmware says hart {d}", .{ h, hartid });
+    checkIdle();
+    const sp = asm volatile ("mv %[sp], sp"
+        : [sp] "=r" (-> usize),
+    );
+    const stack = &kstack.boot[h].stack;
+    if (sp <= @intFromPtr(stack) or sp > @intFromPtr(stack) + stack.len) conventionBroken("sp 0x{x} is not on the boot stack of hart {d}", .{ sp, h });
+}
+
+/// 在内核里、不在处理陷阱时（调度器每一轮）：sscratch 是这个 hart 的陷阱栈顶。
+pub fn checkIdle() void {
+    const h = hart.id();
+    const ss = riscv.read(.sscratch);
+    if (ss != kstack.trap[h].top()) conventionBroken("sscratch is 0x{x} on hart {d}, expected its trap stack top 0x{x}", .{ ss, h, kstack.trap[h].top() });
+}
+
+/// 刚进陷阱处理程序：来自 S 模式的，sscratch 是 0（处理期间再陷入就压在当时的栈上）；来自 U 模式的，trapEntry 已经把
+/// sscratch 换回这个 hart 的陷阱栈顶、tp 换回内核的，TrapFrame 就是这个 hart 上当前进程的（proc.frameOf）。
+fn checkEntry(frame: *TrapFrame, from_user: bool) void {
+    const h = hart.id();
+    if (h >= hart.max) conventionBroken("tp is {d}, not a hart id", .{h});
+    if (!from_user) {
+        const ss = riscv.read(.sscratch);
+        if (ss != 0) conventionBroken("sscratch is 0x{x} while handling a trap from S-mode on hart {d}", .{ ss, h });
+        return;
+    }
+    checkIdle();
+    const p = proc.current() orelse conventionBroken("trap from U-mode on hart {d} with no current process", .{h});
+    if (frame != proc.frameOf(p)) conventionBroken("trap from U-mode on hart {d}: TrapFrame at 0x{x}, the current process's is at 0x{x}", .{ h, @intFromPtr(frame), @intFromPtr(proc.frameOf(p)) });
+}
+
 /// 在编译期生成保存/恢复 x1、x3..x31 的 30 条指令（x0 恒为 0 不用存，sp 单独处理）。
 fn regsAsm(comptime op: []const u8) []const u8 {
     var s: []const u8 = "";
@@ -189,6 +236,7 @@ fn handleTrap(frame: *TrapFrame) callconv(.c) void {
     const scause = riscv.read(.scause);
     const code = scause.code;
     const from_user = frame.sstatus.spp == .user;
+    checkEntry(frame, from_user);
 
     if (scause.interrupt) {
         const interrupt: Interrupt = @fromBackingInt(code);

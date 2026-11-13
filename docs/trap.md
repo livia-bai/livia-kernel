@@ -89,6 +89,14 @@ pub const TrapFrame = extern struct {
 - 来自 U 模式的陷阱：`trapExit` 回到 U 模式时把当时（内核里）的 `sscratch`，也就是这个 hart 的陷阱栈顶，存进 `kernel_sscratch`；下次陷入时 `trapEntry` 再从这里取回来写进 `sscratch`，和 `kernel_tp` 一样（进程在 U 模式里不会换 hart）。
 - 来自 S 模式的陷阱：`trapEntry` 在 `kernel_sscratch` 里记下陷入前的 `sscratch`：`TrapFrame` 压在陷阱栈顶的（`frame + 288` 不等于被打断的 `sp`）是陷阱栈顶，嵌套的（`frame + 288` 就是被打断的 `sp`）是 0；`trapExit` 回去时恢复它。
 
+**检查**：这两个约定原来只写在注释里，`trapEntry`、`trapExit` 的汇编哪里换错了一个寄存器，多半要等到另一个 hart、另一个进程上才出事。现在三个地方各检查一次，违反了马上 panic（`trap convention broken: ...`）：
+
+- `checkBoot`：每个 hart 启动、`trap.init` 之后（启动 hart 在 `ebreak` 自检之后）：`tp` 是固件给的 hart 编号（别的 hart 没有独立的来源，只核对下面两条），`sscratch` 是这个 hart 的陷阱栈顶，`sp` 在这个 hart 的启动栈里。
+- `checkEntry`：每次进 `handleTrap`：来自 S 模式的，`sscratch` 是 0；来自 U 模式的，`sscratch` 已经换回这个 hart 的陷阱栈顶，`TrapFrame` 就是这个 hart 上当前进程的（`proc.frameOf`）。
+- `checkIdle`：调度器每一轮：`sscratch` 是这个 hart 的陷阱栈顶。
+
+`tp` 没法直接核对（`hart.id()` 就是读它），就核对靠它找到的东西：启动栈、陷阱栈、当前进程都得是这个 hart 的。每次检查只读一两个 CSR、比几个地址。验证过它有用：把 `trapEntry` 里来自 U 模式时恢复 `sscratch` 的那条 `csrw` 换成 `nop`，第一次从 U 模式陷入就 panic：`sscratch is 0x0 on hart 0, expected its trap stack top 0x8029f000`。没有这个检查时，这个错误要等到系统调用里内核自己再出一个异常才会显出来。
+
 ## tp 约定
 
 内核用 `tp` 存当前 hart 的编号（`hart.id()` 直接读 `tp`，[boot.md](boot.md#每个-hart-的启动栈)）：S 模式读不到自己的编号（`mhartid` 只有 M 模式能读），xv6 也是这样做的。可 `tp` 是普通的通用寄存器，用户程序可以随便改它，所以：

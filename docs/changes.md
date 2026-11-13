@@ -2,6 +2,10 @@
 
 每次改了内核（`src/`、`user/`、`build.zig`、链接脚本），在最上面加几行：新增了什么功能，修了什么 bug。最新的在前面。
 
+## 2026-11-13 检查 sscratch、tp 约定
+
+- 新增：`trap.checkBoot`（每个 hart 启动时）、`checkEntry`（每次进陷阱处理程序）、`checkIdle`（调度器每一轮）核对 `sscratch` 和 `tp` 的约定，违反了 panic（`trap convention broken: ...`）。`proc.frameOf` 改成 `pub`。
+
 ## 2026-11-13 保存的快照（snap）
 
 - 新增：文件系统的快照。`snapshot`（40）把最后一次提交的样子存下来，返回编号（事务号）；`snaplist`（41）、`snapdel`（42）列出、删掉。快照只是超级块里的一个根，最多 4 个，存的时候不复制块；之后事务号不大于最新的快照的块不释放，删掉快照之后重走一遍树才收回。磁盘格式换成 `LBFS0005`。

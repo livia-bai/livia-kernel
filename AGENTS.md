@@ -63,7 +63,7 @@ python3 tools/qemu_test.py --list      # 列出 QEMU 测试的用例和它们覆
 
 不能破坏的不变量：
 
-- `sscratch`：在 U 模式运行时存进程内核栈顶；在内核里是这个 hart 的陷阱栈顶（`kstack.trap`，S 模式的陷阱都在陷阱栈上处理，`trap.init` 设、`kernel_sscratch` 记着）；正在处理 S 模式的陷阱时为 0。处理 S 模式陷阱的代码不能切换进程（[docs/trap.md](docs/trap.md#sscratch-约定)）。
+- `sscratch`：在 U 模式运行时存进程内核栈顶；在内核里是这个 hart 的陷阱栈顶（`kstack.trap`，S 模式的陷阱都在陷阱栈上处理，`trap.init` 设、`kernel_sscratch` 记着）；正在处理 S 模式的陷阱时为 0。处理 S 模式陷阱的代码不能切换进程。启动时、每次进陷阱处理程序、调度器每一轮都检查这个约定和 `tp`（`trap.checkBoot`/`checkEntry`/`checkIdle`），改了 `trapEntry`、`trapExit` 跑一遍 QEMU 测试就知道（[docs/trap.md](docs/trap.md#sscratch-约定)）。
 - `tp`：在内核里是当前 hart 的编号（`hart.id()`）；从 U 模式陷入时 `trapEntry` 换回内核的值，回到 U 模式时 `trapExit` 换成用户的。内核不能把 `tp` 挪作他用（[docs/trap.md](docs/trap.md#tp-约定)）。
 - `sstatus.FS` 保持 Off：`kmain`、`kmainSecondary` 一开始就清掉 OpenSBI 留下的 Dirty，进入 U 模式的 `sstatus` 从内核当前的值派生，所以用户程序也不能用浮点（[docs/riscv-sbi.md](docs/riscv-sbi.md#位定义)）。
 - 内核代码（陷阱处理、系统调用、调度器扫描进程表）全程关中断执行；只有调度器每一轮开头开一下中断（[docs/trap.md](docs/trap.md#中断开关不变量)）。
